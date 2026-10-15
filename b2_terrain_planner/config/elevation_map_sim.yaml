@@ -1,0 +1,45 @@
+# elevation_mapping_cupy 공통 맵 설정 (sim/real launch에서 입력·프레임 override)
+#
+# elevation_mapping_cupy의 config/core/core_param.yaml 위에 덧씌워지는 robot-specific
+# 설정. MuJoCo sim_sensor_bridge가 발행하는 /lidar/points(frame=lidar_link)와
+# TF 트리(odom→base_link→lidar_link)를 입력으로 로봇 중심 elevation map을 만든다.
+#
+# core_param.yaml의 프레임 기본값(map_frame=odom, base_frame=base_link,
+# initialize_frame_id=[base_link])이 우리 sim TF와 이미 일치하므로 프레임은
+# 재정의하지 않는다. 아래는 지오메트리 override와 입력/출력 토픽만 정의한다.
+/elevation_mapping_node:
+  ros__parameters:
+    # robot-centric 맵 지오메트리 (core 기본 0.1/20.0을 덮어씀).
+    # 정책 입력 크롭(1.6×1.0 m)에 여유를 둔 4 m 정사각, 0.05 m 해상도 → 80×80 셀.
+    resolution: 0.05
+    map_length: 4.0
+
+    # === Phase 4: handoff 3수정 ===
+    # 수정1: protection zone — base 아래 박스 셀은 시간 무효화 skip(발밑 기억).
+    enable_protection_zone: true
+    protection_zone_x: 0.5
+    protection_zone_y: 0.3
+    # 수정2: 모서리 보존. 우선 옵션A(파라미터)로 시도 → max_fusion은 off로 두고
+    #        테스트2(계단 모서리) 미통과 시 enable_max_fusion:true로 전환.
+    enable_max_fusion: false
+    max_fusion_edge_thresh: 0.03
+    # 수정3: 정책 입력 크롭(H_filled/M) 50Hz 발행. inpaint/smooth 플러그인은
+    #        아래 publisher에서 요청하지 않으므로 계산/발행되지 않음.
+    enable_policy_crop: true
+    policy_crop_length_x: 1.6
+    policy_crop_length_y: 1.0
+    policy_crop_resolution: 0.05
+    policy_crop_fps: 50.0
+
+    # 입력: MuJoCo LiDAR 점군. sensor_data QoS(best_effort)로 구독됨(퍼블리셔와 일치).
+    subscribers:
+      lidar:
+        topic_name: '/lidar/points'
+        data_type: pointcloud
+
+    # 출력: RViz(grid_map) 확인용 raw 맵. 수정3대로 elevation + is_valid 포함.
+    publishers:
+      elevation_map_raw:
+        layers: ['elevation', 'is_valid', 'variance']
+        basic_layers: ['elevation']
+        fps: 5.0

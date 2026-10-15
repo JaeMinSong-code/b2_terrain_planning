@@ -1,0 +1,313 @@
+diff --git a/elevation_mapping_cupy/elevation_mapping_cupy/elevation_mapping.py b/elevation_mapping_cupy/elevation_mapping_cupy/elevation_mapping.py
+index 6ce7f4a..25dcff9 100644
+--- a/elevation_mapping_cupy/elevation_mapping_cupy/elevation_mapping.py
++++ b/elevation_mapping_cupy/elevation_mapping_cupy/elevation_mapping.py
+@@ -137,6 +137,11 @@ class ElevationMap:
+         self.mean_error = 0.0
+         self.additive_mean_error = 0.0
+ 
++        # B2 확장(handoff 3수정)용 캐시: protection zone 셀 오프셋, 정책 크롭 base-frame 격자.
++        self._pz_dx = None
++        self._pz_dy = None
++        self._crop_cache = None  # (len_x, len_y, res) -> (nx, ny, bx, by) base-frame 좌표
++
+         self.compile_kernels()
+ 
+         # No shell substitutions in research code: param.weight_file is expected to be a real path.
+@@ -309,6 +314,8 @@ class ElevationMap:
+             self.param.ramped_height_range_c,
+             self.param.enable_edge_sharpen,
+             self.param.enable_visibility_cleanup,
++            self.param.enable_max_fusion,
++            self.param.max_fusion_edge_thresh,
+         )
+         self.error_counting_kernel = error_counting_kernel(
+             self.resolution,
+@@ -462,9 +469,101 @@ class ElevationMap:
+         """
+         return self.additive_mean_error
+ 
++    def _base_yaw(self):
++        """base_rotation에서 yaw[rad] 추출."""
++        R = self.base_rotation
++        return float(cp.arctan2(R[1, 0], R[0, 0]))
++
++    def _protection_zone_mask(self):
++        """수정1: base 프레임(yaw만) 박스 안 셀 = True 인 (cell_n, cell_n) bool 마스크.
++
++        맵은 world-축 정렬이라 셀 오프셋(맵 중심 기준)은 고정. 매 호출 시 현재
++        yaw로만 회전시켜 base 프레임 좌표를 얻는다. 맵 중심 ≈ base xy.
++        """
++        if self._pz_dx is None:
++            off = (cp.arange(self.cell_n, dtype=self.data_type)
++                   - (self.cell_n - 1) / 2.0) * self.resolution
++            self._pz_dy = off.reshape(self.cell_n, 1)  # rows = Y (axis 1)
++            self._pz_dx = off.reshape(1, self.cell_n)  # cols = X (axis 2)
++        yaw = self._base_yaw()
++        c = math.cos(yaw)
++        s = math.sin(yaw)
++        x_base = c * self._pz_dx + s * self._pz_dy
++        y_base = -s * self._pz_dx + c * self._pz_dy
++        return (cp.abs(x_base) <= self.param.protection_zone_x) & (
++            cp.abs(y_base) <= self.param.protection_zone_y
++        )
++
+     def update_variance(self):
+-        """Adds the time variacne to the valid cells."""
+-        self.elevation_map[1] += self.param.time_variance * self.elevation_map[2]
++        """Adds the time variacne to the valid cells.
++
++        수정1(protection zone): base 아래 박스 안 셀은 time_variance 증가를
++        건너뛰어 발밑 기억이 시간 경과로 무효화되지 않게 한다.
++        """
++        inc = self.param.time_variance * self.elevation_map[2]
++        if self.param.enable_protection_zone:
++            inc = inc * (~self._protection_zone_mask())
++        self.elevation_map[1] += inc
++
++    def get_policy_crop(self, base_x, base_y, base_z, yaw, length_x, length_y, resolution):
++        """수정3: 정책 입력용 로컬 heightmap 크롭을 GPU 맵에서 직접 잘라온다.
++
++        base_link 위치 + yaw(roll/pitch 제거) 기준의 length_x(앞뒤)×length_y(좌우)
++        직사각 영역을 resolution 격자로 최근접 샘플링한다. 맵이 world-축 정렬이므로
++        yaw 회전된 격자를 world 셀 인덱스로 변환해 gather 한다(모서리 보존을 위해
++        bilinear 금지, 최근접만).
++
++        Returns:
++            H        (nx, ny) float32: 셀 높이 − base_z (무효 셀 0)
++            M        (nx, ny) float32: 유효 1 / 무효 0
++            H_filled (nx, ny) float32: H의 무효 셀을 최근접 유효값으로 채움(선형보간 금지)
++            축: axis0 = 전방(+x), axis1 = 좌측(+y)
++        """
++        nx = int(round(length_x / resolution))
++        ny = int(round(length_y / resolution))
++
++        key = (nx, ny, float(resolution))
++        if self._crop_cache is None or self._crop_cache[0] != key:
++            xb = (cp.arange(nx, dtype=self.data_type) - (nx - 1) / 2.0) * resolution
++            yb = (cp.arange(ny, dtype=self.data_type) - (ny - 1) / 2.0) * resolution
++            XB, YB = cp.meshgrid(xb, yb, indexing="ij")  # (nx, ny)
++            self._crop_cache = (key, XB, YB)
++        _, XB, YB = self._crop_cache
++
++        c = math.cos(yaw)
++        s = math.sin(yaw)
++        cx = float(self.center[0])
++        cy = float(self.center[1])
++        # base-frame 격자 → world 좌표
++        wx = base_x + c * XB - s * YB
++        wy = base_y + s * XB + c * YB
++        # world → 맵 셀 인덱스 (col=x=axis2, row=y=axis1)
++        col = cp.rint((wx - cx) / self.resolution + (self.cell_n - 1) / 2.0).astype(cp.int32)
++        row = cp.rint((wy - cy) / self.resolution + (self.cell_n - 1) / 2.0).astype(cp.int32)
++        in_bounds = (col >= 0) & (col < self.cell_n) & (row >= 0) & (row < self.cell_n)
++        colc = cp.clip(col, 0, self.cell_n - 1)
++        rowc = cp.clip(row, 0, self.cell_n - 1)
++
++        with self.map_lock:
++            elev = self.elevation_map[0][rowc, colc]
++            is_valid = self.elevation_map[2][rowc, colc]
++        valid = in_bounds & (is_valid > 0.5)
++        H = cp.where(valid, elev - base_z, cp.asarray(0.0, dtype=self.data_type))
++        M = valid.astype(self.data_type)
++
++        H_np = cp.asnumpy(H).astype(np.float32)
++        M_np = cp.asnumpy(M).astype(np.float32)
++        valid_np = M_np > 0.5
++
++        # 최근접 유효값 채움(선형보간 금지). 셀 수가 작아 CPU scipy로 충분.
++        H_filled = H_np.copy()
++        if valid_np.any() and not valid_np.all():
++            from scipy import ndimage as _ndi
++            _, (ir, ic) = _ndi.distance_transform_edt(
++                ~valid_np, return_indices=True
++            )
++            H_filled = H_np[ir, ic]
++        return H_np, M_np, H_filled
+ 
+     def update_time(self):
+         """adds the time interval to the time layer."""
+diff --git a/elevation_mapping_cupy/elevation_mapping_cupy/elevation_mapping_node.py b/elevation_mapping_cupy/elevation_mapping_cupy/elevation_mapping_node.py
+index f9478fa..0ba7506 100755
+--- a/elevation_mapping_cupy/elevation_mapping_cupy/elevation_mapping_node.py
++++ b/elevation_mapping_cupy/elevation_mapping_cupy/elevation_mapping_node.py
+@@ -314,6 +314,28 @@ class ElevationMappingNode(Node):
+         self.save_map_storage_id = storage_param
+         self.service_namespace = self._normalize_namespace(service_ns_param)
+ 
++        self._set_b2_extension_params()
++
++    def _b2_param(self, name, default):
++        """YAML에 있으면 그 값을, 없으면 default로 선언 후 읽는다(vanilla 호환)."""
++        if not self.has_parameter(name):
++            self.declare_parameter(name, default)
++        return self.get_parameter(name).value
++
++    def _set_b2_extension_params(self) -> None:
++        """handoff 3수정용 파라미터(protection zone / max-fusion / policy crop)."""
++        p = self.param
++        p.enable_protection_zone = bool(self._b2_param('enable_protection_zone', False))
++        p.protection_zone_x = float(self._b2_param('protection_zone_x', 0.5))
++        p.protection_zone_y = float(self._b2_param('protection_zone_y', 0.3))
++        p.enable_max_fusion = bool(self._b2_param('enable_max_fusion', False))
++        p.max_fusion_edge_thresh = float(self._b2_param('max_fusion_edge_thresh', 0.03))
++        p.enable_policy_crop = bool(self._b2_param('enable_policy_crop', False))
++        p.policy_crop_length_x = float(self._b2_param('policy_crop_length_x', 1.6))
++        p.policy_crop_length_y = float(self._b2_param('policy_crop_length_y', 1.0))
++        p.policy_crop_resolution = float(self._b2_param('policy_crop_resolution', 0.05))
++        p.policy_crop_fps = float(self._b2_param('policy_crop_fps', 50.0))
++
+     def register_subscribers(self) -> None:
+         self._pointcloud_subs = {}
+         self._image_syncs = {}
+@@ -436,6 +458,25 @@ class ElevationMappingNode(Node):
+                 self.trim_cupy_memory_pool
+             )
+ 
++        # 수정3: 정책 입력 크롭 (H_filled / M) 50Hz 발행.
++        self.timer_policy_crop = None
++        if self.param.enable_policy_crop:
++            self._policy_heightmap_pub = self.create_publisher(
++                Float32MultiArray, f"/{self.get_name()}/policy_heightmap", 1)
++            self._policy_mask_pub = self.create_publisher(
++                Float32MultiArray, f"/{self.get_name()}/policy_mask", 1)
++            self.timer_policy_crop = self.create_timer(
++                1.0 / max(1.0, self.param.policy_crop_fps),
++                self.publish_policy_crop
++            )
++            self.get_logger().info(
++                "[policy_crop] enabled: %.2fx%.2f m @ %.3f m -> %dx%d, %.1f Hz"
++                % (self.param.policy_crop_length_x, self.param.policy_crop_length_y,
++                   self.param.policy_crop_resolution,
++                   int(round(self.param.policy_crop_length_x / self.param.policy_crop_resolution)),
++                   int(round(self.param.policy_crop_length_y / self.param.policy_crop_resolution)),
++                   self.param.policy_crop_fps))
++
+     def register_services(self) -> None:
+         service_masked = self._resolve_service_name('masked_replace')
+         service_save = self._resolve_service_name('save_map')
+@@ -994,8 +1035,20 @@ class ElevationMappingNode(Node):
+             t_np = np.array([t.x, t.y, t.z], dtype=np.float32)
+             R = quaternion_matrix([q.x, q.y, q.z, q.w])[:3, :3].astype(np.float32)
+ 
++        # T3(지연 계측): 스캔 수신→맵 반영까지 처리 시간. 크롭은 policy_crop_fps
++        # 타이머로 발행되므로 scan→crop 최대 지연 ≈ 처리시간 + 크롭 주기.
++        import time as _time
++        import cupy as _cp
++        _t0 = _time.perf_counter()
+         self._map.input_pointcloud(pts, channels, R, t_np, 0, 0)
++        _cp.cuda.runtime.deviceSynchronize()
+         self._pointcloud_process_counter += 1
++        if self.param.enable_policy_crop and (self._pointcloud_process_counter % 20 == 0):
++            _proc_ms = (_time.perf_counter() - _t0) * 1000.0
++            _crop_ms = 1000.0 / max(1.0, self.param.policy_crop_fps)
++            self.get_logger().info(
++                "[T3] scan processing %.2f ms; scan->crop <= %.1f ms (crop period %.0f ms)"
++                % (_proc_ms, _proc_ms + _crop_ms, _crop_ms))
+ 
+     def pose_update(self) -> None:
+         if self._last_t is None:
+@@ -1016,6 +1069,38 @@ class ElevationMappingNode(Node):
+         self._map_t = t
+         self._map_q = q
+ 
++    def _pack_2d_f32(self, arr: np.ndarray) -> Float32MultiArray:
++        """(nx, ny) float32 배열을 라벨 붙은 Float32MultiArray(row-major)로 포장."""
++        nx, ny = arr.shape
++        msg = Float32MultiArray()
++        msg.layout = MAL(dim=[
++            MAD(label="x", size=int(nx), stride=int(nx * ny)),
++            MAD(label="y", size=int(ny), stride=int(ny)),
++        ], data_offset=0)
++        msg.data = np.ascontiguousarray(arr, dtype=np.float32).reshape(-1).tolist()
++        return msg
++
++    def publish_policy_crop(self) -> None:
++        """수정3: base 위치+yaw 기준 로컬 크롭 H_filled / M 발행 (정책 입력용)."""
++        if self._map_t is None or self._map_q is None:
++            return
++        if (self._policy_heightmap_pub.get_subscription_count() == 0
++                and self._policy_mask_pub.get_subscription_count() == 0):
++            return
++        q = self._map_q
++        # yaw only (roll/pitch 제거)
++        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
++                         1.0 - 2.0 * (q.y * q.y + q.z * q.z))
++        _H, M, H_filled = self._map.get_policy_crop(
++            float(self._map_t.x), float(self._map_t.y), float(self._map_t.z),
++            yaw,
++            self.param.policy_crop_length_x,
++            self.param.policy_crop_length_y,
++            self.param.policy_crop_resolution,
++        )
++        self._policy_heightmap_pub.publish(self._pack_2d_f32(H_filled))
++        self._policy_mask_pub.publish(self._pack_2d_f32(M))
++
+     def update_variance(self) -> None:
+         self._map.update_variance()
+ 
+diff --git a/elevation_mapping_cupy/elevation_mapping_cupy/kernels/custom_kernels.py b/elevation_mapping_cupy/elevation_mapping_cupy/kernels/custom_kernels.py
+index 87d1b7b..a0baee1 100644
+--- a/elevation_mapping_cupy/elevation_mapping_cupy/kernels/custom_kernels.py
++++ b/elevation_mapping_cupy/elevation_mapping_cupy/kernels/custom_kernels.py
+@@ -169,6 +169,8 @@ def add_points_kernel(
+     ramped_height_range_c,
+     enable_edge_shaped=True,
+     enable_visibility_cleanup=True,
++    enable_max_fusion=False,
++    max_fusion_edge_thresh=0.03,
+ ):
+     add_points_kernel = cp.ElementwiseKernel(
+         in_params="raw U center_x, raw U center_y, raw U R, raw U t, raw U map, raw U norm_map",
+@@ -211,6 +213,13 @@ def add_points_kernel(
+                         if (${enable_edge_shaped} && (num_points > ${wall_num_thresh}) && (z < map_h - map_v * ${mahalanobis_thresh} / num_points)) {
+                           // continue;
+                         }
++                        else if (${enable_max_fusion} && (z > map_h + ${max_fusion_edge_thresh})) {
++                            // 수정2 옵션B(모서리 보존): 새 측정이 기존보다 뚜렷이 높으면
++                            // Kalman 평균으로 뭉개지 말고 새 값으로 덮어쓰고 variance를 새 측정 노이즈로 초기화.
++                            atomicAdd(&newmap[get_map_idx(idx, 0)], z);
++                            atomicAdd(&newmap[get_map_idx(idx, 1)], v);
++                            atomicAdd(&newmap[get_map_idx(idx, 2)], 1.0);
++                        }
+                         else {
+                             T new_h = (map_h * v + z * map_v) / (map_v + v);
+                             T new_v = (map_v * v) / (map_v + v);
+@@ -331,6 +340,8 @@ def add_points_kernel(
+             cleanup_cos_thresh=cleanup_cos_thresh,
+             enable_edge_shaped=int(enable_edge_shaped),
+             enable_visibility_cleanup=int(enable_visibility_cleanup),
++            enable_max_fusion=int(enable_max_fusion),
++            max_fusion_edge_thresh=max_fusion_edge_thresh,
+         ),
+         name="add_points_kernel",
+     )
+diff --git a/elevation_mapping_cupy/elevation_mapping_cupy/parameter.py b/elevation_mapping_cupy/elevation_mapping_cupy/parameter.py
+index 059fbb4..d3ece5c 100644
+--- a/elevation_mapping_cupy/elevation_mapping_cupy/parameter.py
++++ b/elevation_mapping_cupy/elevation_mapping_cupy/parameter.py
+@@ -203,6 +203,24 @@ class Parameter(Serializable):
+     position_noise_thresh: float = 0.1  # if the position change is bigger than this value, the drift compensation happens.
+     orientation_noise_thresh: float = 0.1  # if the orientation change is bigger than this value, the drift compensation happens.
+ 
++    # --- B2 quadruped 확장 (handoff 3수정, 기본값은 vanilla 유지 위해 off) ---
++    # 수정1: protection zone — base 프레임(yaw만) 박스 안 셀은 update_variance에서
++    #        time_variance 증가를 건너뛴다(발밑 기억 보존).
++    enable_protection_zone: bool = False
++    protection_zone_x: float = 0.5   # base 앞뒤 반폭 [m]
++    protection_zone_y: float = 0.3   # base 좌우 반폭 [m]
++    # 수정2 옵션B: 모서리 보존 max-fusion — 새 측정 z가 기존 elevation보다
++    #        max_fusion_edge_thresh 이상 높으면 Kalman 평균 대신 새 값으로 덮어쓴다.
++    enable_max_fusion: bool = False
++    max_fusion_edge_thresh: float = 0.03   # [m]
++    # 수정3: 정책 입력 크롭 — base 위치+yaw 기준 로컬 heightmap을 GPU에서 직접 잘라
++    #        H/M/H_filled로 발행한다.
++    enable_policy_crop: bool = False
++    policy_crop_length_x: float = 1.6  # 앞뒤 [m]
++    policy_crop_length_y: float = 1.0  # 좌우 [m]
++    policy_crop_resolution: float = 0.05  # [m]
++    policy_crop_fps: float = 50.0
++
+     plugin_config_file: str = "config/plugin_config.yaml"  # configuration file for the plugin
+     weight_file: str = "config/weights.dat"  # weight file for traversability filter
+ 

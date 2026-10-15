@@ -1,0 +1,11 @@
+build/
+build-*/
+install/
+log/
+.perception/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.log
+.venv/
+.vscode/

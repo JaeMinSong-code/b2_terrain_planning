@@ -1,0 +1,12 @@
+# WBC home 관절 자세. 모든 발 원점의 평균 z가 0이 되도록 base만 수직 이동.
+model_path: ../model/unitree_b2/b2.urdf
+model_state:
+  base_position: [0, 0, 0.5120594969245082]
+  base_quaternion_xyzw: [0, 0, 0, 1]
+  base_linear_velocity_world: [0, 0, 0]
+  base_angular_velocity_body: [0, 0, 0]
+  joint_positions: [0, 0.773180858633488, -1.4999359591639267, 0, 0.773180858633488, -1.4999359591639267, 0, 0.773180858633488, -1.4999359591639267, 0, 0.773180858633488, -1.4999359591639267]
+  joint_velocities: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+command: [0.1, 0, 0]
+gait_time: 0
+fixed: [false, false, false, false]

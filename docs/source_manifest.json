@@ -1,0 +1,9 @@
+{
+  "tamols_base": "cecde1a540b1503a93a6af6b00a6f516a288c584",
+  "cupy_base": "8fd49565f622ae1481c0a22d6c8897441f7e2b7e",
+  "cupy_patch_sha256": "819ceb6033f0dea6b139baa50c848ce49e755f25ae14d4bfa42ee9709da6fe62",
+  "cupy_origin": "https://github.com/leggedrobotics/elevation_mapping_cupy.git",
+  "ros2_numpy_origin": "https://github.com/Box-Robotics/ros2_numpy.git",
+  "ros2_numpy_base": "d5ebf723e1d2457d36fa89bf021b212e340c3c11",
+  "tamols_base_note": "계획기 최초 반입 기준 커밋. 이후 변경은 이 저장소의 Git 이력에서 관리한다."
+}

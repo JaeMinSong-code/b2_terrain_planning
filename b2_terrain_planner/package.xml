@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>b2_terrain_planner</name>
+  <version>0.0.1</version>
+  <description>B2 맵 실행과 생성 미분 코드 기반 C++ SQP/OSQP 상위 계획.</description>
+  <maintainer email="flswlrhkd1@gmail.com">Jaesoon-Lee</maintainer>
+  <license>GPL-3.0-only</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>eigen</depend>
+  <depend>liblapack-dev</depend>
+  <depend>yaml-cpp</depend>
+  <depend>rbdl</depend>
+  <depend>tinyxml2</depend>
+  <!-- OSQP 0.6.3 C ABI는 README의 시스템 의존성 절차로 준비한다. -->
+  <!-- C++ 플래너 ROS 노드 + LocomotionPlan 메시지 생성. -->
+  <depend>rclcpp</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>grid_map_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <build_depend>rosidl_default_generators</build_depend>
+  <exec_depend>rosidl_default_runtime</exec_depend>
+  <member_of_group>rosidl_interface_packages</member_of_group>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>tf2_msgs</exec_depend>
+  <exec_depend>elevation_mapping_cupy</exec_depend>
+  <exec_depend>grid_map_rviz_plugin</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

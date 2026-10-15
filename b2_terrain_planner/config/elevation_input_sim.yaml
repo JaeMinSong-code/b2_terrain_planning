@@ -1,0 +1,8 @@
+elevation_input_adapter:
+  ros__parameters:
+    cloud_topic: /lidar/points
+    odom_topic: /odom
+    body_frame: base_link
+    max_odom_gap: 0.3
+    max_age: 1.0
+    queue_wait: 0.5

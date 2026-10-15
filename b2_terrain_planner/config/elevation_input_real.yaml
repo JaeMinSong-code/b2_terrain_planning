@@ -1,0 +1,19 @@
+elevation_input_adapter:
+  ros__parameters:
+    cloud_topic: /rslidar_points
+    odom_topic: /dog_odom
+    # URDF 몸통 기준. Odometry.child_frame_id가 다르면 해당 프레임↔base_link TF 필요.
+    body_frame: base_link
+    max_odom_gap: 0.3
+    max_age: 1.0
+    queue_wait: 0.35
+    reset_distance: 1.0
+    reset_angle: 1.2
+    # 사용자 확인(2026-10-08): 실기 장착은 b2.urdf의 joint_lidar와 동일.
+    # 기존 TF 우선, 없으면 이 고정 장착값 사용. 점군은 LiDAR 좌표 기준으로 가정.
+    # 센서 프레임 이름은 /rslidar_points.header.frame_id에서 읽는다.
+    extrinsic_parent: base_link
+    extrinsic_child: ''
+    extrinsic_child_from_cloud: true
+    extrinsic_xyz: [0.34218, 0.0, 0.17851]
+    extrinsic_xyzw: [0.0, 0.0, 0.0, 1.0]

@@ -1,0 +1,2 @@
+# 복구 patch의 공백은 원본 diff의 일부이므로 그대로 보존한다.
+patches/*.patch -whitespace

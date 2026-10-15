@@ -1,0 +1,24 @@
+{
+  "casadi_version": "3.7.2",
+  "z_size": 31,
+  "parameter_size": 54,
+  "evaluation_modes": [
+    "full",
+    "values",
+    "constraint_jacobian"
+  ],
+  "kernels": {
+    "tamols_diagonal_a": {
+      "residuals": 20,
+      "constraints": 17
+    },
+    "tamols_diagonal_b": {
+      "residuals": 20,
+      "constraints": 17
+    },
+    "tamols_full_support": {
+      "residuals": 28,
+      "constraints": 26
+    }
+  }
+}
