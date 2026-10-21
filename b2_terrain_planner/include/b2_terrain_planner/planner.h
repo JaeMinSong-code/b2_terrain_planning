@@ -1,9 +1,9 @@
 /**
  * @file planner.h
  * @brief 평지·지형 trot의 SQP 입력·출력 및 시간 구간 계획 계약.
- * @version 0.0.21
- * @update 2026-10-15: 제약 해제 실험과 상세 탐색 추적 전용 계약을 제거함.
- * @update 2026-10-14: 폐기한 추가 접촉력 검증기의 결과·시간 계약을 제거함.
+ * @version 0.0.26
+ * @update 2026-10-21: 착지 대기 중 몸통 시간 진행과 유한 재계획·보행 재개 연속성을 반영함.
+ * @update 2026-10-19: 몸통 연결과 제어 발행 자격에서 분리한 재시도 초기값 계약을 추가함.
  */
 #ifndef B2_TERRAIN_PLANNER_PLANNER_H_
 #define B2_TERRAIN_PLANNER_PLANNER_H_
@@ -43,9 +43,18 @@ struct Robot {
   Robot();
 };
 
+struct Result;
+
 struct Input {
   Vector6 position = Vector6::Zero();  // CoM XYZ, yaw/pitch/roll (ZYX).
   Vector6 velocity = Vector6::Zero();  // XYZ derivative and Euler derivative.
+  // 현재 WBC 기준 곡선의 고정 앞부분과 연결 경계. 측정 상태는 발 배치·명령 좌표에 사용한다.
+  std::shared_ptr<const Result> reference_prefix;
+  double prefix_duration = 0.0;
+  // 몸통 시각과 발 위상은 착지 대기에만 분리된다. 없으면 기존 단일 시각 계약.
+  std::optional<double> body_time;
+  double gait_hold_duration = 0.0;
+  std::optional<std::array<bool, 4>> hold_contacts;
   Feet feet = Feet::Zero();
   Eigen::Vector3d command = Eigen::Vector3d::Zero();  // Body vx/vy, yaw rate.
   double gait_time = 0.0;
@@ -53,6 +62,10 @@ struct Input {
   Eigen::Matrix<double, 4, 2, Eigen::RowMajor> nominal =
       Eigen::Matrix<double, 4, 2, Eigen::RowMajor>::Zero();
   std::array<bool, 4> fixed{false, false, false, false};
+  // 이미 이륙한 발의 확정 착지점. 현재 실측 feet와 분리하여 XYZ를 하드 제약으로 유지한다.
+  std::array<std::optional<Eigen::Vector3d>, 4> committed_footholds;
+  // 초기 지면 검사 전용. 없으면 gait 접촉을 사용하며 미래 접촉 스케줄은 바꾸지 않는다.
+  std::optional<std::array<bool, 4>> contact_estimated;
   std::string frame = "odom";
   std::optional<HeightMap> terrain;  // 없으면 기존 평지 계산 경로를 사용한다.
 };
@@ -184,7 +197,7 @@ struct TerrainValidation {
   std::string reason;
 };
 
-// 동일한 모델 스냅샷·정적 지형의 재계획에 사용한다. 실패한 계획은 재사용하지 않는다.
+// 동일한 모델·좌표계의 재계획 초기 추정값. 갱신 지형에서 다시 검증하며 실패한 계획은 재사용하지 않는다.
 struct SeedContext {
   double gait_time = 0.0;
   double period = 0.0;
@@ -194,7 +207,14 @@ struct SeedContext {
   bool terrain = false;
   Feet initial_feet = Feet::Zero();
   std::string terrain_signature;
+  std::optional<double> body_time;
+  double gait_hold_duration = 0.0;
+  std::optional<std::array<bool, 4>> hold_contacts;
 };
+
+// 연속 몸통의 warm start/인계에는 body time, 발 위상에는 gait time을 사용한다.
+template <typename T>
+double BodyTime(const T& input) { return input.body_time.value_or(input.gait_time); }
 
 struct WarmStartDiagnostic {
   bool requested = false;
@@ -218,6 +238,9 @@ struct TerrainAttempt {
 };
 
 struct Result {
+  // 수치 반복의 초기값으로만 사용 가능. success가 아니면 제어 계획으로 발행할 수 없다.
+  bool seed_available = false;
+  double seed_penalty = 10.0;
   SeedContext seed_context;
   WarmStartDiagnostic warm_start;
   std::vector<TerrainAttempt> terrain_attempts;
@@ -244,12 +267,16 @@ struct Result {
   std::vector<double> margins;  // 구간별 GIAC margin, 해당 변수가 없으면 0.
 };
 
-std::vector<Phase> MakeHorizon(double time, double period, double duty);
+std::vector<Phase> MakeHorizon(double time, double period, double duty,
+    double hold_duration = 0.0,
+    const std::optional<std::array<bool, 4>>& hold_contacts = std::nullopt);
 Result Solve(const Robot& robot, const Input& input, const Settings& settings = {},
              const Result* previous = nullptr);
 // 이전 계획과 현재 입력의 모델·지형 스냅샷 호환성을 확인하는 식별값.
 std::string RobotSignature(const Robot& robot);
 std::string TerrainSignature(const std::optional<HeightMap>& terrain);
 Vector6 Evaluate(const Result& result, double elapsed, int derivative = 0);
+// 원래 다항식을 정확히 이동·절단한다. 새 보간 곡선을 만들지 않는다.
+Result SpliceBody(const Result& previous, double shift, const Result& next, double join);
 }  // namespace b2_terrain_planner
 #endif  // B2_TERRAIN_PLANNER_PLANNER_H_

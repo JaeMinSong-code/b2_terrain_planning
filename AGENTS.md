@@ -44,18 +44,12 @@
 - 이 저장소에는 pRbLibrary 서브모듈을 등록하지 않는다.
 - 원본 갱신 시 기준 커밋을 기록하고 폴더 구조와 공통 제어 계약을 유지한다.
 - `pRbLibrary` 내부 폴더를 분해해 패키지 상위 `src/`, `include/`, `runtime/`, `threads/`로 따로 빼내지 않는다.
-- `pRbLibrary` 수정은 반드시 `pRbLibrary` 저장소에서 커밋/푸시 후, 각 패키지에서 서브모듈 포인터를 업데이트한다.
 - 로봇별 런타임 설정, 시뮬레이터 연동 정보, Isaac Sim 관련 메타데이터는 가급적 각 패키지 상위 단의 YAML에서 관리한다.
 - 패키지 특화 요구를 해결하기 위해 `pRbLibrary`를 먼저 수정하는 접근은 지양하고, 우선 패키지 상위 단 설정/YAML로 흡수 가능한지 검토한다.
 - `pRbLibrary` 수정은 여러 로봇/패키지에 공통으로 필요한 범용 기능, 공통 계약, 공통 버그 수정에 한해 최소 범위로 수행한다.
-- 로봇 패키지 작업을 시작하기 전에 해당 패키지의 `pRbLibrary` 서브모듈 상태를 먼저 확인한다.
-- 확인 항목은 최소 다음을 포함한다:
-  - 현재 서브모듈 포인터 SHA
-  - 현재 체크아웃 브랜치와 upstream 추적 상태
-  - 로컬 수정 유무
-- `pRbLibrary`에 원격 최신 변경이 반영돼야 하는 작업이라면, 먼저 `pRbLibrary` 저장소 최신 상태를 반영한 뒤 그 기준으로 패키지 작업을 시작한다.
-- 패키지 작업 중 `pRbLibrary` 변경 필요가 확인되면, 패키지 내부에서 임시 수정하지 말고 `pRbLibrary` 저장소에서 먼저 수정/커밋/푸시한 뒤 서브모듈 포인터를 갱신한다.
-- `pRbLibrary` 수정 작업을 시작하기 전에는 반드시 `pRbLibrary/docs/01. RBLIBRARY_GUIDE.md`를 먼저 읽고, 이어서 `pRbLibrary/docs/02. PACKAGE_STRUCTURE.md`를 확인해 상세 운영 원칙과 package glue code 경계를 재확인한다.
+- `pRbLibrary`는 이 저장소에 일반 소스로 포함하므로 서브모듈 상태·포인터 확인 절차는 사용하지 않는다.
+- `pRbLibrary` 변경이 필요하면 제자리에서 수정하고 이 저장소에 함께 커밋한다. 폴더 구조와 공통 제어 계약을 유지하고 소비 패키지의 빌드·입출력·제어 회귀를 확인한다. 기준 원본 커밋은 루트 README에 기록한다.
+- `pRbLibrary` 수정 작업을 시작하기 전에는 반드시 `pRbLibrary/CONVENTIONS.md`를 읽고 운영 원칙과 package glue code 경계를 재확인한다.
 
 ## 제어 프로파일 네이밍 규칙
 - 목적별 제어 프로파일은 각 로봇 패키지 루트의 `config/profiles/` 하위에 저장한다.
@@ -102,7 +96,7 @@
 - 각 로봇 패키지 루트에도 `AGENTS.md` 복제본을 유지한다.
 - 루트 `AGENTS.md`가 수정되면 각 패키지 루트 `AGENTS.md`도 동일 내용으로 즉시 동기화한다.
 - `pRbLibrary` 하위에는 `AGENTS.md`를 두지 않는다.
-- `pRbLibrary` 관련 상세 운영 지침은 각 `pRbLibrary/docs/01. RBLIBRARY_GUIDE.md`와 `pRbLibrary/docs/02. PACKAGE_STRUCTURE.md`에서 관리한다.
+- `pRbLibrary` 관련 운영 규약은 `pRbLibrary/CONVENTIONS.md`에서 관리한다.
 
 ## GUI 계약 동기화 규칙
 - `pKIRO_Humanoids`와 `pKIRO_PongBotR`의 `RB_GUI`, `RB_GUI_QML`은 GUI 종류와 무관하게 동일한 ROS2 통신 계약을 유지한다.
@@ -124,6 +118,6 @@
 
 ## 문서 반영 규칙
 - 구조, 설정 계약, 운영 원칙, 실행 절차를 수정하면 관련 `md` 문서도 같은 변경 단위에서 함께 갱신한다.
-- 최소 반영 대상은 변경 성격에 따라 `README.md`, `pRbLibrary/docs/01. RBLIBRARY_GUIDE.md`, `pRbLibrary/docs/02. PACKAGE_STRUCTURE.md` 중 해당 문서다.
+- 최소 반영 대상은 변경 성격에 따라 `README.md`, `pRbLibrary/CONVENTIONS.md` 중 해당 문서다.
 - `pRbLibrary`의 package glue code 경계, config 소유권, appendage/RL 계약이 바뀌면 `pRbLibrary` 문서를 반드시 함께 수정한다.
 - 어떤 문서에 반영해야 할지 즉시 판단되지 않으면, 우선 `AGENTS.md`에 운영 규칙으로 기록하고 후속 문서에 승격 반영한다.

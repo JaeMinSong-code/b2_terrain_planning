@@ -100,3 +100,21 @@ def decode_xyz(msg):
                       strides=(msg.row_step, msg.point_step))
     xyz = np.column_stack([data[n].reshape(-1) for n in ('x', 'y', 'z')]).astype('<f4')
     return xyz[np.isfinite(xyz).all(axis=1)]
+
+
+def flat_ground_height(points_world, base_position, half_extent, min_points=20):
+    """평지 시험용: 지도 영역 안 몸통보다 20 cm 아래인 최신 점군의 지면 중앙값."""
+    points = np.asarray(points_world, dtype=float)
+    base = np.asarray(base_position, dtype=float)
+    if (points.ndim != 2 or points.shape[1] != 3 or base.shape != (3,)
+            or not np.isfinite(base).all() or not np.isfinite(half_extent)
+            or half_extent <= 0):
+        raise ValueError('invalid plane geometry')
+    valid = (np.isfinite(points).all(axis=1)
+             & (np.abs(points[:, 0]-base[0]) <= half_extent)
+             & (np.abs(points[:, 1]-base[1]) <= half_extent)
+             & (points[:, 2] < base[2]-.2))
+    heights = points[valid, 2]
+    if len(heights) < min_points:
+        raise ValueError('not enough ground points in current cloud')
+    return float(np.median(heights))

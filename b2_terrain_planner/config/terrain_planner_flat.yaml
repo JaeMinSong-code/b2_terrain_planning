@@ -1,0 +1,21 @@
+# 원본 elevation map의 구조를 유지하고 높이만 첫 접촉 발 평균 높이로 평탄화한다.
+terrain_planner_node:
+  ros__parameters:
+    state_topic: /robot/locomotion_state
+    state_frame: odom
+    frame: elevation_odom
+    map_topic: /terrain_planner/elevation_map_flat
+    plan_topic: /terrain_planner/plan
+    marker_topic: /terrain_planner/markers
+    command: [0.0, 0.0, 0.0]
+    command_topic: /robot/locomotion_command
+    command_timeout: 0.25
+    plan_rate_hz: 10.0
+    time_limit: 0.1
+    sample_dt: 0.02
+    swing_height: 0.10
+    state_max_age: 0.25
+    map_max_age: 1.0
+    require_map: true
+    support_patch.enabled: false
+    publish_markers: true

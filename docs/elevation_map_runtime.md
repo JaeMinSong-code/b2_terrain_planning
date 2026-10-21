@@ -20,14 +20,9 @@
 # 맵·상위 계획 전용 빌드
 ../scripts/build.sh
 
-# MuJoCo도 필요한 경우 (b2_deploy_ws가 시뮬 실행파일을 소유)
-../../b2_deploy_ws/scripts/build_elevation.sh --with-sim-runtime
-
-# GT odometry + MuJoCo + elevation map + RViz
-../../b2_deploy_ws/scripts/run_sim.sh --rviz
-
-# 렌더링 없는 시뮬 / RViz 없는 맵
-../../b2_deploy_ws/scripts/run_sim.sh --headless --elevation-map
+# MuJoCo는 일반 workspace 빌드/설치본을 사용한다.
+# 별도 터미널에서 실행한 뒤 아래 지도만 연결한다.
+../../b2_deploy_ws/scripts/run_robot.sh --flat
 
 # 이미 실행 중인 MuJoCo의 센서에 연결 (새 시뮬을 띄우지 않음)
 ./scripts/run_elevation_sim.sh --rviz
@@ -38,19 +33,17 @@
 ./scripts/run_elevation_real.sh --rviz --config /absolute/path/b2_sensor_input.yaml
 ```
 
-`--xml`, `--model-dir`, `--headless`는 기존 시뮬 옵션과 함께 사용할 수 있다.
-`--rviz`의 철자는 `--rivz`가 아니다. 기존 ROS launch 이름
-`elevation_map_sim.launch.py`도 GT odometry 경로로 연결된다.
+시뮬의 `--xml`, `--headless`는 `run_robot.sh` 옵션이다.
+지도 실행기의 `--start-sim`은 선택한 ROS overlay의 `b2_deploy` 실행파일을 찾는다.
+GT 지도 단독 진단에서만 사용하며 WBC 보행은 두 역할 실행기를 사용한다.
 
 맵 산출물은 상위 저장소의 `.perception/build`, `.perception/install`에 저장한다.
-MuJoCo 산출물은 `b2_deploy_ws/.perception/runtime_build`가 소유한다. 맵 실행 시 별도 빌드된 MuJoCo가 있으면
-그 실행파일을 선택한다. `PKIRO_SIM_EXECUTABLE`로 명시적인 실행파일 선택도 가능하다.
-일반 `run_sim.sh` 실행은 기존 설치본을 사용한다. 맵 없이 실행한 기존 시뮬에 연결할 때도
-`/odom`과 `/lidar/points`가 발행되고 취득 시각이 보존되는 바이너리인지 확인한다.
+제어 저장소의 별도 `.perception/runtime_build` 선택과 지도 래퍼는 제거했다.
+`PKIRO_SIM_EXECUTABLE`로 진단용 실행파일을 명시할 수 있다.
 
-맵 도구만 빌드하려면 `../scripts/build.sh`를 사용한다. 맵 도구에는 PCL 의존성이 없다. `ELEVATION_BUILD_ROOT`로
-산출물 위치를 바꿨다면 실행 시 `ELEVATION_PREFIX=<산출물>/install`을 지정한다.
-전용 MuJoCo 위치도 바뀐 경우 `PKIRO_SIM_EXECUTABLE`을 함께 지정한다.
+맵 도구만 빌드하려면 `../scripts/build.sh`를 사용한다. 맵 도구에는 PCL 의존성이 없다.
+`ELEVATION_BUILD_ROOT`로 산출물 위치를 바꿨다면 실행 시
+`ELEVATION_PREFIX=<산출물>/install`을 지정한다.
 
 CuPy 실행 Python은 기본 `~/miniforge3/envs/elevation_map/bin/python`이며
 `ELEVATION_PYTHON`으로 변경할 수 있다. ROS launch는 시스템 Python, 맵은 지정한

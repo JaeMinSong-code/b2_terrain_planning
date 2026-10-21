@@ -1,0 +1,9 @@
+# 실기/시뮬 공통 KF 좌표. 점군 토픽은 laptop.launch.py의 mode/cloud_topic으로 선택.
+elevation_input_adapter:
+  ros__parameters:
+    cloud_topic: /lidar/points
+    odom_topic: /kf/odom
+    body_frame: base_link
+    max_odom_gap: 0.3
+    max_age: 1.0
+    queue_wait: 0.5

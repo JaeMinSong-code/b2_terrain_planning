@@ -5,9 +5,13 @@ ELEVATION_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ELEVATION_PACKAGE_ROOT="$(cd "${ELEVATION_SCRIPT_DIR}/.." && pwd)"
 if [[ -z "${ELEVATION_PREFIX:-}" ]]; then
     ELEVATION_PREFIX="${ELEVATION_PACKAGE_ROOT}/../.perception/install"
-    # install-only 번들에서도 colcon 루트 overlay를 찾는다.
+    # 소스 workspace의 install 또는 install-only 번들의 colcon 루트를 찾는다.
     ELEVATION_SEARCH="$ELEVATION_PACKAGE_ROOT"
     for _level in 1 2 3 4 5; do
+        if [[ -f "$ELEVATION_SEARCH/install/local_setup.bash" ]]; then
+            ELEVATION_PREFIX="$ELEVATION_SEARCH/install"
+            break
+        fi
         if [[ -f "$ELEVATION_SEARCH/_local_setup_util_sh.py" ]]; then
             ELEVATION_PREFIX="$ELEVATION_SEARCH"
             break
@@ -16,7 +20,17 @@ if [[ -z "${ELEVATION_PREFIX:-}" ]]; then
     done
 fi
 export ELEVATION_PREFIX
-export ELEVATION_PYTHON="${ELEVATION_PYTHON:-${HOME}/miniforge3/envs/elevation_map/bin/python}"
+if [[ -z "${ELEVATION_PYTHON:-}" ]]; then
+    for candidate in "$HOME/miniforge3/envs/elevation_map/bin/python" \
+                     "$HOME/anaconda3/envs/elevation_map/bin/python" \
+                     /usr/bin/python3; do
+        if [[ -x "$candidate" ]]; then
+            ELEVATION_PYTHON="$candidate"
+            break
+        fi
+    done
+fi
+export ELEVATION_PYTHON
 export PYTHONNOUSERSITE=1
 if [[ ! -x "$ELEVATION_PYTHON" ]]; then
     echo "[오류] ELEVATION_PYTHON에 CuPy/ROS 호환 Python을 지정하세요." >&2

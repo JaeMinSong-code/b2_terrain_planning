@@ -1,0 +1,23 @@
+# 노트북 TAMOLS 기본값. 로봇 측 locomotion_bridge.yaml과 같은 토픽/좌표 계약.
+terrain_planner_node:
+  ros__parameters:
+    state_topic: /robot/locomotion_state
+    state_frame: odom
+    frame: elevation_odom
+    map_topic: /elevation_mapping_node/elevation_map_raw
+    plan_topic: /terrain_planner/plan
+    marker_topic: /terrain_planner/markers
+    command: [0.0, 0.0, 0.0]
+    command_topic: /robot/locomotion_command
+    command_timeout: 0.25
+    plan_rate_hz: 10.0
+    time_limit: 0.1
+    sample_dt: 0.02
+    swing_height: 0.10
+    state_max_age: 0.25
+    map_max_age: 1.0
+    require_map: true
+    # 현재 접촉 발 주변만 발 링크 높이와 같은 지면으로 가정한다.
+    support_patch.enabled: true
+    support_patch.half_width: 0.30
+    publish_markers: true

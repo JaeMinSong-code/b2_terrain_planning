@@ -4,11 +4,14 @@ from collections import deque
 import time
 import signal
 import math
+import numpy as np
 import rclpy
 from rclpy.duration import Duration
 from rclpy.executors import ExternalShutdownException
 from tf2_ros import TransformException
 from elevation_mapping_cupy.elevation_mapping_node import ElevationMappingNode
+from geometry_msgs.msg import PointStamped
+from elevation_common import decode_xyz, rotation, flat_ground_height
 
 
 class StrictElevationMappingNode(ElevationMappingNode):
@@ -16,6 +19,7 @@ class StrictElevationMappingNode(ElevationMappingNode):
         self.pending_clouds = deque(maxlen=5)
         self.last_accepted = 0.0
         super().__init__()
+        self.flat_plane_pub = self.create_publisher(PointStamped, '/elevation/observed_plane', 10)
         self.input_timer = self.create_timer(0.01, self.flush_inputs)
 
     def pointcloud_callback(self, msg, sub_key):
@@ -35,7 +39,29 @@ class StrictElevationMappingNode(ElevationMappingNode):
         self._last_t = msg.header.stamp
         self.pose_update()
         super().pointcloud_callback(msg, key)
+        if self.flat_plane_pub.get_subscription_count() > 0:
+            self.publish_observed_plane(msg)
         self.last_accepted = time.monotonic()
+
+    def publish_observed_plane(self, msg):
+        """누적 fusion과 독립적으로 최신 점군/TF의 평면을 같은 source stamp로 보낸다."""
+        sensor = self.safe_lookup_transform(self.map_frame, msg.header.frame_id, msg.header.stamp)
+        base = self.safe_lookup_transform(self.map_frame, self.base_frame, msg.header.stamp)
+        if sensor is None or base is None:
+            return
+        try:
+            t, q = sensor.transform.translation, sensor.transform.rotation
+            world = decode_xyz(msg) @ rotation([q.x, q.y, q.z, q.w]).T + np.array([t.x, t.y, t.z])
+            b = base.transform.translation
+            height = flat_ground_height(world, [b.x, b.y, b.z], self.param.map_length/2)
+            output = PointStamped()
+            output.header.stamp = msg.header.stamp
+            output.header.frame_id = self.map_frame
+            output.point.z = height
+            self.flat_plane_pub.publish(output)
+        except ValueError as error:
+            self.get_logger().warning(f'Flat plane observation unavailable: {error}',
+                                      throttle_duration_sec=2.0)
 
     def publish_map(self, key):
         if time.monotonic() - self.last_accepted <= 1.0:

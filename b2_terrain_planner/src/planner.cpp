@@ -1,9 +1,9 @@
 /**
  * @file planner.cpp
  * @brief 생성된 Jacobian과 지형 비용의 Gauss–Newton QP로 trot을 최적화한다.
- * @version 0.0.27
- * @update 2026-10-15: 제약 해제 분기와 탐색 추적 전용 계산을 제거하고 전체 제약 경로를 유지함.
- * @update 2026-10-14: 최적화 후 2배 조밀 격자 재검증 게이트(dense_validation)를 제거함.
+ * @version 0.0.32
+ * @update 2026-10-21: 착지 대기 중 몸통 시간 진행과 유한 재계획·보행 재개 연속성을 반영함.
+ * @update 2026-10-19: 연속 몸통 연결·초기값 구간 보존·실패 반복값 재검증을 구현함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -256,9 +256,57 @@ class Problem {
           double pitch_weight, double leg_vertical_weight, double orientation_limit,
           double backward_weight, double vz_weight)
       : robot_(robot), input_(input), intervals_(intervals),
-        phases_(MakeHorizon(input.gait_time, robot.period, robot.duty)),
+        phases_(MakeHorizon(input.gait_time, robot.period, robot.duty,
+            input.gait_hold_duration, input.hold_contacts)),
         profile_(profile), full_evaluation_(full_evaluation), terrain_(terrain),
         block_assembly_(block_assembly), polynomial_tail_(polynomial_tail) {
+    if (input_.reference_prefix) {
+      std::vector<double> splits{input_.prefix_duration};
+      const double shift = BodyTime(input_) - BodyTime(input_.reference_prefix->seed_context);
+      for (const auto& phase : input_.reference_prefix->phases) {
+        const double split = phase.start - shift;
+        if (input_.prefix_duration == 0 || split < input_.prefix_duration) splits.push_back(split);
+      }
+      for (double split : splits) {
+        for (std::size_t k = 0; k < phases_.size(); ++k) {
+          const auto old = phases_[k];
+          if (split > old.start + 1e-9 && split < old.start + old.duration - 1e-9) {
+            Phase tail = old;
+            tail.start = split;
+            tail.duration = old.start + old.duration - tail.start;
+            phases_[k].duration = tail.start - old.start;
+            phases_.insert(phases_.begin() + k + 1, tail);
+            break;
+          }
+        }
+      }
+    }
+    fixed_prefix_.resize(phases_.size());
+    if (input_.reference_prefix) {
+      const auto& source = *input_.reference_prefix;
+      const double shift = BodyTime(input_) - BodyTime(source.seed_context);
+      for (std::size_t k = 0; k < phases_.size(); ++k) {
+        const auto& phase = phases_[k];
+        if (phase.start + phase.duration > input_.prefix_duration + 1e-9) continue;
+        const double middle = shift + phase.start + .5 * phase.duration;
+        for (std::size_t i = 0; i < source.phases.size(); ++i) {
+          const auto& old = source.phases[i];
+          if (middle < old.start || middle >= old.start + old.duration) continue;
+          Eigen::Matrix<double, 6, 5> coefficients = Eigen::Matrix<double, 6, 5>::Zero();
+          const double delta = shift + phase.start - old.start;
+          for (int power = 0; power < 5; ++power) {
+            for (int degree = power; degree < 5; ++degree) {
+              double binomial = 1;
+              for (int j = 1; j <= power; ++j) binomial *= double(degree - j + 1) / j;
+              coefficients.col(power) += source.coefficients[i].col(degree) * binomial *
+                  std::pow(delta, degree - power) * std::pow(phase.duration, power);
+            }
+          }
+          fixed_prefix_[k] = coefficients;
+          break;
+        }
+      }
+    }
     feet_offset_ = 30 * static_cast<int>(phases_.size());
     if (terrain_ != nullptr) foot_dimensions_ = 3;
     size_ = feet_offset_ + 4 * foot_dimensions_;
@@ -292,19 +340,39 @@ class Problem {
       direction_ = world_command.head<2>().normalized();
     }
     nominal_ = NominalFootholds(robot, input, phases_);
+    for (int leg = 0; leg < 4; ++leg) {
+      if (input_.committed_footholds[leg]) {
+        nominal_.row(leg) = input_.committed_footholds[leg]->head<2>().transpose();
+      }
+    }
     if (terrain_ != nullptr) {
       if (input_.frame != terrain_->map().frame) {
         throw std::invalid_argument("terrain/input frame mismatch");
       }
       for (int leg = 0; leg < 4; ++leg) {
         const Eigen::Vector2d xy = input_.feet.row(leg).head<2>().transpose();
+        // 스윙 중이거나 실제 접촉이 아직 없으면 현재 Z가 지면과 달라도 된다.
+        // 미래 접촉 스케줄과 착지점의 지형 제약은 별도로 유지한다.
+        bool support = phases_.front().contacts[leg];
+        if (input_.contact_estimated) support = support && (*input_.contact_estimated)[leg];
         if (!terrain_->IsQueryable(xy) ||
-            std::abs(terrain_->Sample(xy).height - input_.feet(leg, 2)) >
-                terrain_->settings().contact_tolerance) {
+            (support &&
+             std::abs(terrain_->Sample(xy).height - input_.feet(leg, 2)) >
+                 terrain_->settings().contact_tolerance)) {
           throw std::invalid_argument("input feet do not match observed terrain height");
         }
+        if (input_.committed_footholds[leg]) {
+          // 지도가 갱신되어도 확정 Z를 지면 샘플로 다시 덮어쓰지 않는다.
+          // 지형 불일치는 기존 지형 제약/최종 검사로 보고한다.
+          const auto& committed = *input_.committed_footholds[leg];
+          if (!terrain_->IsQueryable(committed.head<2>())) {
+            throw std::invalid_argument("committed foothold not queryable");
+          }
+          terrain_initial_.row(leg) = committed.transpose();
+          continue;
+        }
         double limit = 0.30;
-        if (input_.fixed[leg]) limit = 0.0;
+        if (FootFixed(leg)) limit = 0.0;
         const Eigen::Vector2d nominal = nominal_.row(leg).transpose();
         terrain_initial_.row(leg) = terrain_->FindFoothold(
             nominal, nominal.array() - limit, nominal.array() + limit,
@@ -324,7 +392,7 @@ class Problem {
     for (int leg = 0; leg < 4; ++leg) {
       for (int axis = 0; axis < 2; ++axis) {
         double limit = 0.30;
-        if (input_.fixed[leg]) limit = 0.0;
+        if (FootFixed(leg)) limit = 0.0;
         x[feet_offset_ + foot_dimensions_ * leg + axis] = std::clamp(input_.feet(leg, axis),
             nominal_(leg, axis) - limit, nominal_(leg, axis) + limit);
       }
@@ -334,6 +402,7 @@ class Problem {
         x.segment<3>(feet_offset_ + 3 * leg) = terrain_initial_.row(leg).transpose();
       }
     }
+    SetFixedPrefix(&x);
     return x;
   }
 
@@ -347,42 +416,59 @@ class Problem {
       diagnostic->reason = reason;
       return x;
     };
-    if (!old.success) {
+    if (!old.success && !old.seed_available) {
       return reject("previous_plan_not_usable");
     }
-    if (context.terrain != input_.terrain.has_value() ||
-        context.terrain_signature != TerrainSignature(input_.terrain)) {
+    if (context.terrain != input_.terrain.has_value()) {
       return reject("terrain_mismatch");
     }
+    // 지도 영역 이동/관측 갱신은 초기 추정 궤적 전체를 폐기할 이유가 아니다.
+    // 아래에서 착지점을 현재 지도에 재검사하고 전체 제약·IK도 다시 평가한다.
+    const bool terrain_changed = context.terrain_signature != TerrainSignature(input_.terrain);
     if (context.frame != input_.frame || context.robot_signature != RobotSignature(robot_) ||
         context.period != robot_.period || context.duty != robot_.duty) {
       return reject("context_mismatch");
     }
-    const double shift = input_.gait_time - context.gait_time;
+    const double shift = BodyTime(input_) - BodyTime(context);
     if (!std::isfinite(shift) || shift < 0 || shift >= robot_.period) {
       return reject("previous_plan_expired_or_future");
     }
-    const auto expected = MakeHorizon(context.gait_time, context.period, context.duty);
-    if (old.phases.size() != expected.size() || old.coefficients.size() != expected.size() ||
-        old.margins.size() != expected.size() || !old.footholds.allFinite() ||
+    const auto expected = MakeHorizon(context.gait_time, context.period, context.duty,
+        context.gait_hold_duration, context.hold_contacts);
+    if (old.phases.empty() || old.coefficients.size() != old.phases.size() ||
+        old.margins.size() != old.phases.size() || !old.footholds.allFinite() ||
         !context.initial_feet.allFinite()) return reject("invalid_previous_plan");
-    for (size_t k = 0; k < expected.size(); ++k) {
+    double previous_end = 0;
+    std::size_t expected_index = 0;
+    for (size_t k = 0; k < old.phases.size(); ++k) {
       const auto& phase = old.phases[k];
-      if (!std::isfinite(phase.start) || !std::isfinite(phase.duration) ||
-          std::abs(phase.start - expected[k].start) > 1e-10 ||
-          std::abs(phase.duration - expected[k].duration) > 1e-10 ||
-          phase.contacts != expected[k].contacts || phase.landed != expected[k].landed ||
+      while (expected_index + 1 < expected.size() &&
+             phase.start >= expected[expected_index + 1].start - 1e-10) ++expected_index;
+      const auto& nominal = expected[expected_index];
+      if (!std::isfinite(phase.start) || !std::isfinite(phase.duration) || phase.duration <= 0 ||
+          std::abs(phase.start - previous_end) > 1e-10 ||
+          phase.start + phase.duration > nominal.start + nominal.duration + 1e-10 ||
+          phase.contacts != nominal.contacts || phase.landed != nominal.landed ||
           !old.coefficients[k].allFinite() || !std::isfinite(old.margins[k]) ||
-          old.margins[k] < -.10001 || old.margins[k] > 1e-5) {
+          (old.success && (old.margins[k] < -.10001 || old.margins[k] > 1e-5))) {
         return reject("invalid_previous_plan");
       }
+      previous_end = phase.start + phase.duration;
     }
+    if (std::abs(previous_end - context.period) > 1e-10) return reject("invalid_previous_plan");
     double horizon = 0;
     for (const auto& phase : old.phases) horizon += phase.duration;
     const Vector6 end_position = Evaluate(old, horizon);
     const Vector6 end_velocity = Evaluate(old, horizon, 1);
-    const Vector6 position_delta = input_.position - Evaluate(old, shift);
-    const Vector6 velocity_delta = input_.velocity - Evaluate(old, shift, 1);
+    Vector6 seed_position = input_.position;
+    Vector6 seed_velocity = input_.velocity;
+    if (input_.reference_prefix) {
+      const double reference_shift = BodyTime(input_) - BodyTime(input_.reference_prefix->seed_context);
+      seed_position = Evaluate(*input_.reference_prefix, reference_shift);
+      seed_velocity = Evaluate(*input_.reference_prefix, reference_shift, 1);
+    }
+    const Vector6 position_delta = seed_position - Evaluate(old, shift);
+    const Vector6 velocity_delta = seed_velocity - Evaluate(old, shift, 1);
     // 새 측정 상태와의 affine 차이를 전체 구간에 더해 C1 연속성을 보존한다.
     for (size_t k = 0; k < phases_.size(); ++k) {
       const auto& phase = phases_[k];
@@ -392,9 +478,13 @@ class Problem {
       size_t source = 0;
       while (source + 1 < old.phases.size() &&
              start >= old.phases[source + 1].start - 1e-10) ++source;
-      const bool extend_polynomial = polynomial_tail_ && source + 1 == old.phases.size() &&
+      // 연결 계획의 마지막 위상은 수 ms일 수 있다. 그 다항식을 horizon 밖으로
+      // 연장하면 큰 고차 계수가 초기값을 폭주시킨다. 끝 p/v의 선형 연장을 사용한다.
+      const bool extend_polynomial = polynomial_tail_ && !input_.reference_prefix &&
+          source + 1 == old.phases.size() &&
           start < horizon - 1e-10 && phase.contacts == old.phases[source].contacts;
-      if (finish <= horizon + 1e-10 || extend_polynomial) {
+      const double source_end = old.phases[source].start + old.phases[source].duration;
+      if (finish <= source_end + 1e-10 || extend_polynomial) {
         // 4차 다항식을 이항 전개하여 구간의 새 원점으로 정확히 이동한다.
         const double offset = start - old.phases[source].start;
         for (int power = 0; power < 5; ++power) {
@@ -405,7 +495,6 @@ class Problem {
             binomial *= static_cast<double>(power - target) / (target + 1);
           }
         }
-        if (margin_[k] >= 0) x[margin_[k]] = std::clamp(old.margins[source], -.1, 0.0);
         if (finish > horizon + 1e-10) {
           ++diagnostic->extended_phases;
           ++diagnostic->polynomial_extended_phases;
@@ -421,15 +510,23 @@ class Problem {
           p0 = Evaluate(old, start);
           v0 = Evaluate(old, start, 1);
         }
-        const Vector6 p1 = end_position + end_velocity * (finish - horizon);
+        Vector6 p1 = end_position + end_velocity * (finish - horizon);
+        Vector6 v1 = end_velocity;
+        if (finish <= horizon) {
+          p1 = Evaluate(old, finish);
+          v1 = Evaluate(old, finish, 1);
+        }
         const double duration = phase.duration;
         c.col(0) = p0;
         c.col(1) = v0;
         c.col(2) = 3 * (p1 - p0) / (duration * duration) -
-                   (2 * v0 + end_velocity) / duration;
+                   (2 * v0 + v1) / duration;
         c.col(3) = 2 * (p0 - p1) / std::pow(duration, 3) +
-                   (v0 + end_velocity) / (duration * duration);
+                   (v0 + v1) / (duration * duration);
         ++diagnostic->extended_phases;
+      }
+      if (margin_[k] >= 0 && old.phases[source].contacts == phase.contacts) {
+        x[margin_[k]] = std::clamp(old.margins[source], -0.1, 0.0);
       }
       c.col(0) += position_delta + velocity_delta * phase.start;
       c.col(1) += velocity_delta;
@@ -445,7 +542,7 @@ class Problem {
     std::array<std::function<bool(const Eigen::Vector3d&)>, 4> reach_accept;
     if (terrain_ != nullptr && robot_.model) {
       for (int leg = 0; leg < 4; ++leg) {
-        if (input_.fixed[leg]) continue;
+        if (FootFixed(leg)) continue;
         std::vector<Eigen::Vector3d> hips;
         for (size_t k = 0; k < phases_.size(); ++k) {
           if (!phases_[k].contacts[leg] || !phases_[k].landed[leg]) continue;
@@ -492,7 +589,7 @@ class Problem {
         }
       }
       // 이미 소비한 착지 목표는 다음 주기의 목표로 복사하지 않는다.
-      if (touchdown <= shift + 1e-10 || input_.fixed[leg]) continue;
+      if (touchdown <= shift + 1e-10 || FootFixed(leg)) continue;
       if (terrain_ != nullptr) {
         const Eigen::Vector3d foot = old.footholds.row(leg).transpose();
         // XY를 잘라 다른 단으로 옮기면 Z가 맞지 않는다. 기존 목표 전체가
@@ -502,7 +599,8 @@ class Problem {
             std::abs(foot.z() - terrain_->Sample(foot.head<2>()).height) >
                 terrain_->settings().contact_tolerance) continue;
         if (reach_accept[leg] && !reach_accept[leg](foot)) continue;
-        if (backward_weight_ > 0 && direction_.squaredNorm() > 0) {
+        // 재시도 반복값의 최적화된 발을 nominal 후보로 되돌리지 않는다.
+        if (old.success && backward_weight_ > 0 && direction_.squaredNorm() > 0) {
           const Eigen::Vector2d nominal = nominal_.row(leg).transpose();
           const double old_score = terrain_->FootholdCost(
               foot.head<2>(), nominal, direction_, backward_weight_);
@@ -521,6 +619,7 @@ class Problem {
       }
       ++diagnostic->reused_footholds;
     }
+    SetFixedPrefix(&x);
     if (!x.allFinite()) {
       *diagnostic = WarmStartDiagnostic();
       diagnostic->requested = true;
@@ -529,6 +628,11 @@ class Problem {
     }
     diagnostic->used = true;
     diagnostic->reason = "shifted_previous_plan";
+    if (terrain_changed) diagnostic->reason = "shifted_previous_plan_updated_terrain";
+    if (!old.success) {
+      diagnostic->reason = "shifted_retry_iterate";
+      if (terrain_changed) diagnostic->reason = "shifted_retry_iterate_updated_terrain";
+    }
     diagnostic->elapsed = shift;
     return x;
   }
@@ -635,7 +739,7 @@ class Problem {
           out.hessian(column, column) += 1.4;
         }
         double limit = 0.30;
-        if (input_.fixed[leg]) limit = 0.0;
+        if (FootFixed(leg)) limit = 0.0;
         add(x[column], nominal_(leg, axis) - limit, nominal_(leg, axis) + limit);
         if (need_jacobian) rows.push_back(Eigen::RowVectorXd::Unit(size_, column));
       }
@@ -653,7 +757,7 @@ class Problem {
               2 * residual.jacobian.transpose() * residual.jacobian;
         }
         double z_limit = robot_.leg_max;
-        if (input_.fixed[leg]) z_limit = 0.0;
+        if (FootFixed(leg)) z_limit = 0.0;
         add(x[column + 2], terrain_initial_(leg, 2) - z_limit,
             terrain_initial_(leg, 2) + z_limit);
         if (need_jacobian) rows.push_back(Eigen::RowVectorXd::Unit(size_, column + 2));
@@ -703,18 +807,57 @@ class Problem {
       group = kStructure;
       phase_index = k;
       sample_index = -1;
-      Matrix start = SampleTransform(k, 0.0).topRows(12);
-      Vector target(12);
-      target << input_.position, input_.velocity;
-      if (k > 0) {
-        start -= SampleTransform(k - 1, 1.0).topRows(12);
-        target.setZero();
+      if (fixed_prefix_[k]) {
+        for (int axis = 0; axis < 6; ++axis) {
+          for (int power = 0; power < 5; ++power) {
+            const int column = 30 * k + 5 * axis + power;
+            const double target = (*fixed_prefix_[k])(axis, power);
+            local_row = 5 * axis + power;
+            add(x[column], target, target);
+            if (need_jacobian) rows.push_back(Eigen::RowVectorXd::Unit(size_, column));
+          }
+        }
+      } else {
+        int continuity = 12;
+        Matrix start = SampleTransform(k, 0.0).topRows(continuity);
+        Vector target = Vector::Zero(continuity);
+        target.head<12>() << input_.position, input_.velocity;
+        if (k == 0 && input_.reference_prefix && input_.prefix_duration == 0) {
+          const double shift = BodyTime(input_) - BodyTime(input_.reference_prefix->seed_context);
+          target.head<6>() = b2_terrain_planner::Evaluate(*input_.reference_prefix, shift);
+          target.segment<6>(6) = b2_terrain_planner::Evaluate(*input_.reference_prefix, shift, 1);
+        }
+        if (k > 0) {
+          start -= SampleTransform(k - 1, 1.0).topRows(continuity);
+          target.setZero();
+        }
+        Vector start_value = start * x;
+        for (int row = 0; row < continuity; ++row) {
+          local_row = row;
+          add(start_value[row], target[row], target[row]);
+          if (need_jacobian) rows.push_back(start.row(row));
+        }
       }
-      Vector start_value = start * x;
-      for (int row = 0; row < 12; ++row) {
-        local_row = row;
-        add(start_value[row], target[row], target[row]);
-        if (need_jacobian) rows.push_back(start.row(row));
+      if (input_.reference_prefix && input_.prefix_duration >= phases_[k].start &&
+          input_.prefix_duration < phases_[k].start + phases_[k].duration) {
+        const double local = (input_.prefix_duration - phases_[k].start) / phases_[k].duration;
+        const Matrix join = SampleTransform(k, local);
+        const double old_time = BodyTime(input_) - BodyTime(input_.reference_prefix->seed_context) +
+                                input_.prefix_duration;
+        Vector target_join(18);
+        for (int derivative = 0; derivative < 3; ++derivative) {
+          target_join.segment<6>(6 * derivative) =
+              b2_terrain_planner::Evaluate(*input_.reference_prefix, old_time, derivative);
+        }
+        const Vector value = join.topRows(18) * x;
+        // 위치·속도는 고정 앞부분과의 C1 연결 또는 정지 초기 조건으로 이미 지정했다.
+        const Matrix jacobian = join.middleRows(12, 6);
+        const Vector residual = value.tail(6) - target_join.tail(6);
+        if (need_cost) out.cost += residual.squaredNorm();
+        if (full) {
+          out.gradient.noalias() += 2 * jacobian.transpose() * residual;
+          out.hessian.noalias() += 2 * jacobian.transpose() * jacobian;
+        }
       }
       if (margin_[k] >= 0) {
         const int column = margin_[k];
@@ -756,6 +899,10 @@ class Problem {
       const double weight = phases_[k].duration / (intervals + 1);
       for (int sample = 0; sample <= intervals; ++sample) {
         const double sample_time = static_cast<double>(sample) / intervals;
+        // 앞부분은 부모 계획의 고정 계수다. 새 동역학 최적화는 변경 가능한 꼬리에 적용한다.
+        if (input_.reference_prefix &&
+            (phases_[k].start + phases_[k].duration <= input_.prefix_duration + 1e-9 ||
+             phases_[k].start + sample_time * phases_[k].duration < input_.prefix_duration - 1e-9)) continue;
         Matrix transform;
         std::array<Eigen::Matrix<double, 5, 1>, 3> basis;
         Vector z;
@@ -956,6 +1103,11 @@ class Problem {
     Result candidate;
     candidate.success = true;
     Export(x, &candidate);
+    if (input_.reference_prefix) {
+      candidate = SpliceBody(*input_.reference_prefix,
+          BodyTime(input_) - BodyTime(input_.reference_prefix->seed_context),
+          candidate, input_.prefix_duration);
+    }
     result->kinematics_valid = true;
     auto check = [&](double time, int leg, const Eigen::Vector3d& foot) {
       const Vector6 pose = b2_terrain_planner::Evaluate(candidate, time);
@@ -982,9 +1134,17 @@ class Problem {
     }
     for (int leg = 0; leg < 4; ++leg) {
       double touchdown = robot_.period;
+      bool lands_in_horizon = false;
       for (const auto& phase : phases_) {
-        if (phase.landed[leg]) { touchdown = phase.start; break; }
+        if (phase.landed[leg]) {
+          touchdown = phase.start;
+          lands_in_horizon = true;
+          break;
+        }
       }
+      // 대기로 horizon 밖으로 밀린 다음 착지점을 현재 끝 시각에 착지한다고
+      // 검사하지 않는다. 실제 지지발 IK는 위의 모든 지지 구간에서 검사한다.
+      if (input_.gait_hold_duration > 0 && !lands_in_horizon) continue;
       check(touchdown, leg, candidate.footholds.row(leg).transpose());
     }
   }
@@ -1051,12 +1211,27 @@ class Problem {
   }
 
  private:
+  void SetFixedPrefix(Vector* x) const {
+    for (std::size_t k = 0; k < fixed_prefix_.size(); ++k) {
+      if (!fixed_prefix_[k]) continue;
+      for (int axis = 0; axis < 6; ++axis) {
+        for (int power = 0; power < 5; ++power) {
+          (*x)[30 * k + 5 * axis + power] = (*fixed_prefix_[k])(axis, power);
+        }
+      }
+    }
+  }
+
+  bool FootFixed(int leg) const {
+    return input_.fixed[leg] || input_.committed_footholds[leg].has_value();
+  }
   Robot robot_;
   Input input_;
   int intervals_;
   int size_;
   int feet_offset_;
   std::vector<Phase> phases_;
+  std::vector<std::optional<Eigen::Matrix<double, 6, 5>>> fixed_prefix_;
   std::vector<int> margin_;
   Profile* profile_;
   bool full_evaluation_;
@@ -1724,8 +1899,18 @@ void Validate(const Robot& r, const Input& input, const Settings& settings) {
   }
   if (!input.position.allFinite() || !input.velocity.allFinite() || !input.feet.allFinite() ||
       !input.command.allFinite() || !std::isfinite(input.gait_time) ||
+      !std::isfinite(BodyTime(input)) || BodyTime(input) < 0 ||
+      !std::isfinite(input.gait_hold_duration) || input.gait_hold_duration < 0 ||
+      input.gait_hold_duration > r.period ||
       std::abs(input.gait_time / r.period) > 1e6 ||
       (input.has_nominal && !input.nominal.allFinite())) throw std::invalid_argument("invalid planner input");
+  if (input.reference_prefix && (!input.reference_prefix->success ||
+      !std::isfinite(input.prefix_duration) || input.prefix_duration < 0 ||
+      input.prefix_duration >= r.period || input.reference_prefix->coefficients.empty() ||
+      BodyTime(input) < BodyTime(input.reference_prefix->seed_context) ||
+      BodyTime(input) - BodyTime(input.reference_prefix->seed_context) + input.prefix_duration > r.period)) {
+    throw std::invalid_argument("invalid body handover");
+  }
   if (!input.terrain.has_value() &&
       input.feet.col(2).maxCoeff() - input.feet.col(2).minCoeff() > 0.015) {
     throw std::invalid_argument("flat planner rejects non-flat support");
@@ -1744,6 +1929,62 @@ void Validate(const Robot& r, const Input& input, const Settings& settings) {
 }
 }  // namespace
 
+Result SpliceBody(const Result& previous, double shift, const Result& next, double join) {
+  Result output = next;
+  output.phases.clear();
+  output.coefficients.clear();
+  output.margins.clear();
+  const auto append = [&](const Result& source, double offset, double begin, double end) {
+    for (std::size_t i = 0; i < source.phases.size(); ++i) {
+      const auto& phase = source.phases[i];
+      const double left = std::max(begin, phase.start - offset);
+      const double right = std::min(end, phase.start + phase.duration - offset);
+      if (right - left < 1e-10) continue;
+      // 새 접촉 경계가 부모 다항식 내부에 생겨도 두 위상을 합치지 않는다.
+      std::vector<double> cuts{left, right};
+      for (const auto& nominal : next.phases) {
+        if (nominal.start > left + 1e-10 && nominal.start < right - 1e-10) {
+          cuts.push_back(nominal.start);
+        }
+      }
+      std::sort(cuts.begin(), cuts.end());
+      for (std::size_t j = 0; j + 1 < cuts.size(); ++j) {
+        const double piece_left = cuts[j];
+        const double piece_right = cuts[j + 1];
+        Phase clipped = phase;
+        clipped.start = piece_left;
+        clipped.duration = piece_right - piece_left;
+        // 부모의 landed는 부모 입력 시각 기준이다. 새 입력 기준 접촉 이력으로 바꾼다.
+        for (const auto& nominal : next.phases) {
+          if (0.5 * (piece_left + piece_right) >= nominal.start &&
+              0.5 * (piece_left + piece_right) < nominal.start + nominal.duration) {
+            clipped.contacts = nominal.contacts;
+            clipped.landed = nominal.landed;
+            break;
+          }
+        }
+        Eigen::Matrix<double, 6, 5> coefficients = Eigen::Matrix<double, 6, 5>::Zero();
+        const double delta = piece_left + offset - phase.start;
+        for (int power = 0; power < 5; ++power) {
+          for (int degree = power; degree < 5; ++degree) {
+            double binomial = 1;
+            for (int j = 1; j <= power; ++j) binomial *= double(degree - j + 1) / j;
+            coefficients.col(power) += source.coefficients[i].col(degree) *
+                binomial * std::pow(delta, degree - power);
+          }
+        }
+        output.phases.push_back(clipped);
+        output.coefficients.push_back(coefficients);
+        output.margins.push_back(source.margins[i]);
+      }
+    }
+  };
+  append(previous, shift, 0, join);
+  const auto& last = next.phases.back();
+  append(next, 0, join, last.start + last.duration);
+  return output;
+}
+
 Robot::Robot() {
   hips << 0.35, 0.2, 0.0, 0.35, -0.2, 0.0,
           -0.35, 0.2, 0.0, -0.35, -0.2, 0.0;
@@ -1759,7 +2000,11 @@ std::string QpReuseModeName(QpReuseMode mode) {
   return "invalid";
 }
 
-std::vector<Phase> MakeHorizon(double time, double period, double duty) {
+std::vector<Phase> MakeHorizon(double time, double period, double duty,
+    double hold_duration, const std::optional<std::array<bool, 4>>& hold_contacts) {
+  if (!std::isfinite(hold_duration) || hold_duration < 0 || hold_duration > period) {
+    throw std::invalid_argument("invalid gait hold duration");
+  }
   if (!std::isfinite(time) || !std::isfinite(period) || !std::isfinite(duty) ||
       period <= 0 || duty <= 0.5 || duty >= 1 || std::abs(time / period) > 1e6) {
     throw std::invalid_argument("invalid gait timing");
@@ -1788,6 +2033,20 @@ std::vector<Phase> MakeHorizon(double time, double period, double duty) {
     phase.contacts = Contacts(middle, period, duty);
     for (const auto& touchdown : touchdowns) if (touchdown.first <= middle) phase.landed[touchdown.second] = true;
     result.push_back(phase);
+  }
+  if (hold_duration > 0) {
+    std::vector<Phase> delayed;
+    Phase hold;
+    hold.duration = hold_duration;
+    hold.contacts = result.front().contacts;
+    if (hold_contacts) hold.contacts = *hold_contacts;
+    delayed.push_back(hold);
+    for (auto phase : result) {
+      phase.start += hold_duration;
+      phase.duration = std::min(phase.duration, period - phase.start);
+      if (phase.duration > 1e-9) delayed.push_back(phase);
+    }
+    return delayed;
   }
   return result;
 }
@@ -1847,10 +2106,17 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
   Result result;
   result.seed_context = {input.gait_time, robot.period, robot.duty, input.frame,
                          RobotSignature(robot), input.terrain.has_value(), input.feet,
-                         TerrainSignature(input.terrain)};
+                         TerrainSignature(input.terrain), input.body_time,
+                         input.gait_hold_duration, input.hold_contacts};
   try {
     ScopedTimer initialization_timer(&result.profile.initialization_seconds);
     Validate(robot, input, settings);
+    for (const auto& committed : input.committed_footholds) {
+      if (committed && (!committed->allFinite() ||
+          (!input.terrain && std::abs(committed->z()) > 1e-10))) {
+        throw std::invalid_argument("invalid committed foothold");
+      }
+    }
     QpCache reduced_cache(&result.profile);
     QpCache elastic_cache(&result.profile);
     StructureCache structure_cache;
@@ -1875,6 +2141,10 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
     initialization_timer.Stop();
     const bool realtime = settings.realtime_iterations > 0 && result.warm_start.used;
     double penalty = 10.0;
+    if (previous && !previous->success && result.warm_start.used &&
+        std::isfinite(previous->seed_penalty)) {
+      penalty = std::clamp(previous->seed_penalty, 10.0, 1e6);
+    }
     int small_improvements = 0;
     result.status = "iteration_limit";
     for (int iteration = 0; iteration < settings.max_iterations; ++iteration) {
@@ -2012,9 +2282,16 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
       result.success = false;
       result.status = "time_limit";
     }
-    if (result.success) problem.Export(x, &result);
+    const bool resumable = result.status == "time_limit" || result.status == "iteration_limit" ||
+                           result.status == "line_search_failed";
+    if (result.success || (resumable && x.allFinite())) {
+      problem.Export(x, &result);
+      result.seed_available = true;
+      result.seed_penalty = penalty;
+    }
   } catch (const std::exception& error) {
     result.success = false;
+    result.seed_available = false;
     result.coefficients.clear();
     result.phases.clear();
     result.margins.clear();
@@ -2041,14 +2318,15 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
     // 후보별로 몸통 SQP와 최종 지형·IK 검사를 전부 다시 수행한다.
     TerrainModel terrain(*input.terrain, settings.terrain);
     const auto nominal = NominalFootholds(robot, input,
-        MakeHorizon(input.gait_time, robot.period, robot.duty));
+        MakeHorizon(input.gait_time, robot.period, robot.duty,
+            input.gait_hold_duration, input.hold_contacts));
     Eigen::Vector3d command(input.command.x(), input.command.y(), 0);
     command = Eigen::AngleAxisd(input.position[3], Eigen::Vector3d::UnitZ()) * command;
     Eigen::Vector2d direction = Eigen::Vector2d::Zero();
     if (command.head<2>().norm() > 1e-6) direction = command.head<2>().normalized();
     std::vector<std::pair<double, TerrainAttempt>> alternatives;
     for (int leg = 0; leg < 4; ++leg) {
-      if (input.fixed[leg]) continue;
+      if (input.fixed[leg] || input.committed_footholds[leg]) continue;
       const Eigen::Vector2d center = nominal.row(leg).transpose();
       const auto other_platform = [&](const Eigen::Vector3d& foot) {
         // 다른 높이 후보를 구분하는 값이며 주변 평탄성 판정이 아니다.
@@ -2091,28 +2369,25 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
   if (result.elapsed > settings.time_limit) {
     result.success = false;
     result.status = "time_limit";
-    result.coefficients.clear();
-    result.phases.clear();
-    result.margins.clear();
-    result.footholds.setZero();
+    // 제어 발행 자격은 success로 차단하고 수치 재시도용 반복값은 보존한다.
   }
   return result;
 }
 
 Vector6 Evaluate(const Result& result, double elapsed, int derivative) {
-  if (!result.success || result.phases.empty() ||
+  if ((!result.success && !result.seed_available) || result.phases.empty() ||
       result.coefficients.size() != result.phases.size() || !std::isfinite(elapsed) ||
       derivative < 0 || derivative > 2 || elapsed < 0) throw std::invalid_argument("invalid evaluation");
-  double horizon = 0.0;
-  for (const auto& phase : result.phases) horizon += phase.duration;
+  const auto& last = result.phases.back();
+  const double horizon = last.start + last.duration;
   const double rounding = 16 * std::numeric_limits<double>::epsilon() * std::max(1.0, horizon);
   if (elapsed > horizon + rounding) throw std::out_of_range("trajectory extrapolation is forbidden");
   elapsed = std::min(elapsed, horizon);
-  double begin = 0.0;
   for (size_t k = 0; k < result.phases.size(); ++k) {
-    const double end = begin + result.phases[k].duration;
-    if (elapsed <= end) return result.coefficients[k] * Basis(elapsed - begin, 1.0, derivative);
-    begin = end;
+    const auto& phase = result.phases[k];
+    if (elapsed < phase.start + phase.duration || k + 1 == result.phases.size()) {
+      return result.coefficients[k] * Basis(elapsed - phase.start, 1.0, derivative);
+    }
   }
   throw std::out_of_range("trajectory extrapolation is forbidden");
 }

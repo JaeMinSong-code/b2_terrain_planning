@@ -1,9 +1,9 @@
 /**
  * @file robot_model.cpp
  * @brief RBDL의 이름 기반 관절 매핑·합성 관성·FK·제한 IK를 계산한다.
- * @version 0.0.3
+ * @version 0.0.4
+ * @update 2026-10-21: 측정 관절값의 제한 경계 오버슈트는 허용하고 큰 이상값은 거부함.
  * @update 2026-10-14: URDF 무릎 제한으로 다리별 최소·최대 고관절 거리를 계산함.
- * @update 2026-10-14: URDF 다리 체인으로 IK의 전체 RBDL 복사·갱신을 제거함.
  */
 #include "b2_terrain_planner/robot_model.h"
 
@@ -26,6 +26,7 @@ namespace {
 namespace rb = RigidBodyDynamics;
 const std::array<std::string, 4> kLegs{"FL", "FR", "RL", "RR"};
 const std::array<std::string, 3> kJoints{"hip", "thigh", "calf"};
+constexpr double kMeasuredJointLimitToleranceRad = 0.05;
 
 Eigen::Vector3d EulerRates(const Eigen::Vector3d& angles,
                            const Eigen::Vector3d& omega) {
@@ -77,8 +78,8 @@ struct RobotModel::Impl {
   Eigen::VectorXd Positions(const ModelState& state) const {
     if (!state.base_position.allFinite() || !state.base_orientation.coeffs().allFinite() ||
         std::abs(state.base_orientation.norm() - 1) > 1e-8 || !state.joints.allFinite() ||
-        (state.joints.array() < lower.array() - 1e-10).any() ||
-        (state.joints.array() > upper.array() + 1e-10).any()) {
+        (state.joints.array() < lower.array() - kMeasuredJointLimitToleranceRad).any() ||
+        (state.joints.array() > upper.array() + kMeasuredJointLimitToleranceRad).any()) {
       throw std::invalid_argument("invalid B2 model state or joint limits");
     }
     Eigen::VectorXd q = Eigen::VectorXd::Zero(model.q_size);

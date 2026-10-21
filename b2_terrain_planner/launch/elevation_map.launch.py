@@ -1,4 +1,4 @@
-"""B2 실기 odometry와 MuJoCo GT odometry를 사용하는 elevation map 실행."""
+"""입력 설정에 따라 실기·시뮬 센서와 odometry를 연결하는 elevation map 실행."""
 import os
 from pathlib import Path
 
@@ -23,12 +23,18 @@ def launch_nodes(context):
     config = value('input_config')
     if not config:
         config = str(share / 'config' / f'elevation_input_{mode}.yaml')
+    input_parameters = [config]
+    overrides = {}
+    for name in ('odom_topic', 'cloud_topic'):
+        if value(name):
+            overrides[name] = value(name)
+    if overrides:
+        input_parameters.append(overrides)
     nodes = []
     if mode == 'sim':
         if value('start_sim') == 'true':
-            workspace = Path(os.environ.get('PKIRO_WS', str(Path.home() / 'ros2_ws')))
             sim_binary = os.environ.get('PKIRO_SIM_EXECUTABLE', str(
-                workspace / 'install/b2_deploy/lib/b2_deploy/mujoco_node'))
+                Path(get_package_prefix('b2_deploy')) / 'lib/b2_deploy/mujoco_node'))
             if not Path(sim_binary).is_file():
                 raise RuntimeError('simulation executable missing: ' + sim_binary)
             nodes.append(Node(
@@ -37,7 +43,7 @@ def launch_nodes(context):
                              'odom.frame_id': 'odom', 'odom.child_frame_id': 'base_link'}],
                 additional_env={'PKIRO_ROBOT_BACKEND': 'mujoco'}))
     nodes.append(Node(package='b2_terrain_planner', executable='elevation_input_adapter.py',
-                      prefix=[python], parameters=[config], output='screen'))
+                      prefix=[python], parameters=input_parameters, output='screen'))
     nodes.append(Node(
         package='b2_terrain_planner', executable='elevation_mapping_runner.py', prefix=[python],
         name='elevation_mapping_node', output='screen',
@@ -68,12 +74,12 @@ def launch_nodes(context):
     handlers = [RegisterEventHandler(OnProcessExit(
         target_action=node, on_exit=[Shutdown(reason='elevation process exited')]))
         for node in nodes]
-    return nodes + handlers
+    return handlers + nodes
 
 
 def generate_launch_description():
     defaults = dict(mode='real', start_sim='false', launch_rviz='false', input_config='',
-                    rviz_config='')
+                    rviz_config='', odom_topic='', cloud_topic='')
     return LaunchDescription([
         *[DeclareLaunchArgument(key, default_value=value) for key, value in defaults.items()],
         OpaqueFunction(function=launch_nodes),
