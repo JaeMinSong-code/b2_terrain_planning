@@ -1,9 +1,9 @@
 /**
  * @file planner_retry_test.cpp
  * @brief 지연·실패를 주입해 비동기 재계획과 성공해 보존 및 발행 차단을 검증한다.
- * @version 0.0.7
+ * @version 0.0.8
+ * @update 2026-10-23: 이륙 전 발 이동 반영과 이륙 후 스윙 곡선·착지점 고정을 검증함.
  * @update 2026-10-23: 감속·복귀 변화율, 재진입 연속성, 중복 상태와 세션 초기화를 검증함.
- * @update 2026-10-23: 도달 여유 조건부 감속·히스테리시스·명령 복원과 계산 중 전환을 검증함.
  */
 #define B2_TERRAIN_PLANNER_NO_MAIN
 #include "../src/terrain_planner_node.cpp"
@@ -252,6 +252,90 @@ struct TerrainPlannerRetryTest {
     Finish(node, reset);
   }
 
+  static void CheckSwingReferenceUpdates(TerrainPlannerNode& node) {
+    node.swing_references_ = {};
+    TerrainPlannerNode::State state;
+    state.gait_clock_valid = true;
+    state.body_clock_valid = true;
+    state.contact_confirmed.fill(true);
+    Feet measured = node.nominal_input_.feet;
+    Result plan;
+    plan.footholds = measured;
+    plan.footholds.col(0).array() += .1;
+    const auto update = [&](double gait_time) {
+      state.gait_time = gait_time;
+      plan.seed_context.gait_time = gait_time;
+      plan.phases = MakeHorizon(gait_time, node.robot_.period, node.robot_.duty);
+      node.UpdateSwingReferences(plan, measured, state);
+    };
+    update(0.0);
+    const auto original = node.swing_references_[1];
+    Check(original.start > 0 && original.end > original.start,
+          "test did not start before FR liftoff");
+    // 최신 실패 로그의 약 40cm 수평 이동을 재현한다. 다음 이륙 시각은 그대로다.
+    const Eigen::Vector3d slip(-.37, -.17, .005);
+    measured.row(1) += slip.transpose();
+    update(.04);
+    const auto refreshed = node.swing_references_[1];
+    Check(std::abs(refreshed.start - original.start) < 1e-12 &&
+          std::abs(refreshed.end - original.end) < 1e-12,
+          "pre-liftoff refresh changed trot timing");
+    Check((refreshed.Sample(refreshed.start).first - measured.row(1).transpose()).norm() < 1e-12 &&
+          (refreshed.position - original.position).norm() > .4,
+          "pre-liftoff swing retained the stale start after foot movement");
+    Check(refreshed.Sample(refreshed.start).second.isZero(1e-12),
+          "future stance liftoff inherited an old swing velocity");
+    // 보행 대기 중 몸통 시각만 진행해도 아직 이륙하지 않은 시작점·정점은 갱신한다.
+    state.gait_paused = true;
+    for (double height : {.04, .01}) {
+      state.body_time += .2;
+      measured(1, 2) = height;
+      plan.footholds(1, 0) += .02;
+      update(.04);
+      const auto& future = node.swing_references_[1];
+      Check((future.position - measured.row(1).transpose()).norm() < 1e-12 &&
+            (future.target - plan.footholds.row(1).transpose()).norm() < 1e-12 &&
+            std::abs(future.apex_z -
+                     (std::max(height, future.target.z()) + node.swing_height_)) < 1e-12,
+            "paused future swing retained stale start, target or apex");
+    }
+    state.gait_paused = false;
+    const auto committed = node.swing_references_[1];
+    state.contact_confirmed[1] = false;
+    state.contact_confirmed[2] = false;
+    // 이륙 경계와 진행 중에는 추정 위치·후보 착지점이 달라져도 실행 곡선을 보존한다.
+    for (double time : {committed.start, committed.start + .04, committed.end - .02}) {
+      measured.row(1).array() += .03;
+      plan.footholds.row(1).array() += .05;
+      update(time);
+      const auto& active = node.swing_references_[1];
+      Check(std::abs(active.start - committed.start) < 1e-12 &&
+            std::abs(active.end - committed.end) < 1e-12 &&
+            (active.target - committed.target).norm() < 1e-12,
+            "active swing timing or touchdown changed");
+      for (double sample_time : {time, (time + committed.end) * .5, committed.end}) {
+        const auto before = committed.Sample(sample_time);
+        const auto after = active.Sample(sample_time);
+        Check((before.first - after.first).norm() < 1e-12 &&
+              (before.second - after.second).norm() < 1e-12,
+              "active swing position/velocity curve changed");
+      }
+      Input input;
+      input.gait_time = time;
+      Check(CommitActiveSwingFootholds(node.robot_, node.swing_references_, &input) &&
+            input.committed_footholds[1].has_value() &&
+            (*input.committed_footholds[1] - committed.target).norm() < 1e-12,
+            "active swing target was not fixed in optimizer input");
+    }
+    // 착지 후 다음 주기의 이륙점은 다시 현재 발 위치를 사용한다.
+    state.contact_confirmed.fill(true);
+    measured.row(1).array() -= .02;
+    update(committed.end + .01);
+    Check((node.swing_references_[1].position - measured.row(1).transpose()).norm() < 1e-12 &&
+          node.swing_references_[1].start > committed.end,
+          "next swing inherited the completed swing start");
+  }
+
   static void Run() {
     TerrainPlannerNode node;
     node.timer_->cancel();
@@ -468,6 +552,7 @@ struct TerrainPlannerRetryTest {
     Check(node.last_published_stamp_ns_ > before_refresh,
           "estimated contact OFF blocked stance resume refresh");
     CheckKinematicBraking(node);
+    CheckSwingReferenceUpdates(node);
 
     Input held_model = node.nominal_input_;
     held_model.gait_time = .4;
@@ -483,7 +568,7 @@ struct TerrainPlannerRetryTest {
           "hold checked fictitious future touchdown or skipped real supports");
     std::cout << "PASS seed preservation, nonblocking state, immediate/bounded retries, "
                  "epoch/pause/command/clock publication guards, latched stance support, "
-                 "reach-gated braking, rate-limited command recovery and epoch reset\n";
+                 "reach-gated braking, rate-limited command recovery, epoch reset, and measured pre-liftoff origins\n";
   }
 };
 

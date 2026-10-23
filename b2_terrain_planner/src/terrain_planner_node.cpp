@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.18
+ * @version 0.0.19
+ * @update 2026-10-23: 이륙 전 스윙 시작점은 측정 위치로 갱신하고 진행 중 곡선만 고정함.
  * @update 2026-10-23: 감속 진입·해제의 계산 목표를 몸통 시각 기반 변화율 제한으로 연결함.
- * @update 2026-10-23: 계산 시도별 입력·결과·발행 판정을 구조화 ROS 로그에 보존함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -595,13 +595,9 @@ class TerrainPlannerNode : public rclcpp::Node {
           // 이륙한 발은 남은 곡선 전체를 유지한다. Solve에도 같은 착지점을 고정했다.
           break;
         }
-        if (old.end > old.start && std::abs(old.end - next.end) < 1e-6 &&
-            next.start >= old.start && next.start < old.end) {
-          const auto sample = old.Sample(next.start);
-          next.position = sample.first;
-          next.velocity = sample.second;
-          next.apex_z = old.apex_z;
-        } else if (phase.start < 1e-9) {
+        // 이륙 전 후보는 같은 착지 시각이어도 현재 측정 위치에서 다시 만든다.
+        // 이전 곡선의 시작점을 이어받으면 지지 중 실제 발 이동을 다음 스윙까지 숨긴다.
+        if (phase.start < 1e-9) {
           const auto& v = state.foot_velocity[leg];
           next.velocity = Eigen::Vector3d(v.x, v.y, v.z);
         } else {
