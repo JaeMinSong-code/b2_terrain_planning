@@ -222,6 +222,9 @@ RViz의 Fixed Frame과 연결되는 TF도 같은 좌표 계약에 맞춰야 한�
   질량·관성·도달성 모델의 명목 관절 근사는 여전히 남아 있다.
 - 네 발 속도와 `contact_estimated`, `contact_confirmed`를 전달한다. WBC가 착지 확인에 따라
   보행 시간을 정지·재개하며 TAMOLS는 같은 `gait_time`으로 고정 trot 순서를 계획한다.
+  보행 대기 지지는 WBC stance를 나타내는 `contact_confirmed`만으로 판정한다.
+  stance 이후 `contact_estimated`가 OFF여도 지지를 취소하지 않으며, 추정 접촉은
+  지형 높이 검사와 접촉 주변 지도 보정에 별도로 사용한다.
 - 메시지 필드명은 유지한다. `base_pose.position`과 `base_twist.linear`는 전신 CoM,
   `base_pose.orientation`은 몸통 자세, `base_twist.angular`는 roll/pitch/yaw 변화율이다.
   `b2_deploy` bridge가 각속도로 변환하고 WBC는 전신 CoM Jacobian으로 병진을 직접 추종한다.
@@ -326,6 +329,7 @@ Solve는 입력·설정·직전 성공해의 복사본으로 별도 작업에서
 두 개 이상 지지발을 유지하는 0.8초 몸통 계획을 계산한다. `hold_gait` 동안 발 위상만
 정지하고 몸통 시간은 계속 진행한다. legacy 단일 시계 입력은 미확인 지지를 보류한다.
 계산 중 epoch·보행 시각 초기화·접촉 위상·실행 계획이 바뀌면 결과를 발행하지 않는다.
+WBC stance와 보행 대기 상태가 유지되면 추정 접촉 변동만으로 대기·재개 계획을 버리지 않는다.
 
 실패·발행 보류는 `previous_`를 지우지 않는다. 마지막 발행 성공해를 다음 초기값으로 넘기고,
 Solve 내부의 보행 시각·모델·지도 호환성 검사와 착지점 재검사를 그대로 거친다.

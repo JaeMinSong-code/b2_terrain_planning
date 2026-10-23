@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.14
+ * @version 0.0.15
+ * @update 2026-10-23: 보행 대기 지지와 발행 판정을 WBC stance 기준으로 통일함.
  * @update 2026-10-21: 착지 대기 중 몸통 시간 진행과 유한 재계획·보행 재개 연속성을 반영함.
- * @update 2026-10-19: 명령 확정·실행 계획 확인·착지 인계·중단 계산 재시도를 구현함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -595,11 +595,12 @@ class TerrainPlannerNode : public rclcpp::Node {
     if (state.gait_clock_valid) {
       input.gait_time = state.gait_time;
       const auto nominal = MakeHorizon(input.gait_time, robot_.period, robot_.duty);
-      // 위상 경계에서 예정 지지가 아직 확인되지 않은 발로 정착점을 초기화하지 않는다.
+      // WBC stance를 지지로 유지하고, 아직 stance가 아닌 예정 지지만 기다린다.
+      // 추정 접촉이 OFF로 바뀌어도 이미 확인된 stance를 취소하지 않는다.
       bool missing_support = false;
       std::array<bool, 4> supports{};
       for (int leg = 0; leg < 4; ++leg) {
-        supports[leg] = state.contact_confirmed[leg] && state.contact_estimated[leg];
+        supports[leg] = state.contact_confirmed[leg];
         if (nominal.front().contacts[leg] && !supports[leg]) missing_support = true;
       }
       if (missing_support) {
@@ -742,11 +743,10 @@ class TerrainPlannerNode : public rclcpp::Node {
       if (publishable) {
         const auto before = MakeHorizon(state.gait_time, robot_.period, robot_.duty);
         const auto after = MakeHorizon(state_->gait_time, robot_.period, robot_.duty);
+        // 추정 접촉 변동만으로 WBC stance가 유지된 계획을 버리지 않는다.
         publishable = before.front().contacts == after.front().contacts &&
                       state.contact_confirmed == state_->contact_confirmed &&
-                      (!state.body_clock_valid ||
-                       (state.gait_paused == state_->gait_paused &&
-                        (!input.hold_contacts || state.contact_estimated == state_->contact_estimated)));
+                      (!state.body_clock_valid || state.gait_paused == state_->gait_paused);
         reason = "contact_phase_changed_after_solve";
       }
     }

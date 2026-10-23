@@ -1,9 +1,9 @@
 /**
  * @file planner_retry_test.cpp
  * @brief 지연·실패를 주입해 비동기 재계획과 성공해 보존 및 발행 차단을 검증한다.
- * @version 0.0.3
+ * @version 0.0.4
+ * @update 2026-10-23: 추정 접촉 OFF·변동에도 WBC stance로 대기 해제와 계획 발행을 검증함.
  * @update 2026-10-21: 착지 대기 중 몸통 시간 진행과 유한 재계획·보행 재개 연속성을 반영함.
- * @update 2026-10-19: 명령 경계와 실패 반복값의 별도 보존·발행 금지·재시도를 검증함.
  */
 #define B2_TERRAIN_PLANNER_NO_MAIN
 #include "../src/terrain_planner_node.cpp"
@@ -22,6 +22,7 @@ struct TerrainPlannerRetryTest {
     double body_time = -1;
     double hold_duration = -1;
     std::optional<std::array<bool, 4>> hold_contacts;
+    std::optional<std::array<bool, 4>> contact_estimated;
     Eigen::Vector3d command = Eigen::Vector3d::Zero();
     std::promise<void> release;
     bool success = true;
@@ -52,6 +53,7 @@ struct TerrainPlannerRetryTest {
       attempt->body_time = BodyTime(input);
       attempt->hold_duration = input.gait_hold_duration;
       attempt->hold_contacts = input.hold_contacts;
+      attempt->contact_estimated = input.contact_estimated;
       attempt->command = input.command;
       auto release = attempt->release.get_future();
       attempt->started.store(true);
@@ -249,33 +251,50 @@ struct TerrainPlannerRetryTest {
     state.gait_epoch_ns = 3;
     state.gait_paused = true;
     state.contact_confirmed = {true, false, false, true};
-    state.contact_estimated = state.contact_confirmed;
+    state.contact_estimated.fill(false);
     auto hold = Install(node);
     update(.4);
     node.OnTimer();
     Started(hold);
+    const auto before_hold = node.last_published_stamp_ns_;
+    const auto hold_estimated = state.contact_estimated;
+    state.contact_estimated.fill(true);
+    update(.4);
+    Finish(node, hold);
     Check(hold->hold_duration == node.robot_.period && hold->body_time == .4 &&
           hold->hold_contacts == state.contact_confirmed, "touchdown wait blocked rolling body solve");
-    Finish(node, hold);
+    Check(hold->contact_estimated == hold_estimated, "stance overwrote measured terrain contacts");
+    Check(node.last_published_stamp_ns_ > before_hold,
+          "estimated contact change rejected two-stance hold plan");
     state.active_plan_stamp_ns = node.last_published_stamp_ns_;
     auto release = Install(node);
+    // 착지 후 추정 접촉이 모두 OFF여도 유한한 재개 prefix만 사용한다.
     state.contact_confirmed.fill(true);
-    state.contact_estimated.fill(true);
+    state.contact_estimated.fill(false);
     state.body_time = .42;
     update(.4);
     Started(release);
-    Check(release->hold_duration > 0 && release->hold_duration < .8, "resume prefix missing");
     const double resume_time = release->body_time + release->hold_duration;
+    const auto before_release = node.last_published_stamp_ns_;
+    state.contact_estimated.fill(true);
+    update(.4);
     Finish(node, release);
+    Check(release->hold_duration > 0 && release->hold_duration < .8, "resume prefix missing");
+    Check(node.last_published_stamp_ns_ > before_release,
+          "estimated contact change rejected stance resume plan");
     state.active_plan_stamp_ns = node.last_published_stamp_ns_;
     auto refresh = Install(node);
+    state.contact_estimated.fill(false);
     state.body_time = .44;
     update(.4);
     node.OnTimer();
     Started(refresh);
+    const auto before_refresh = node.last_published_stamp_ns_;
+    Finish(node, refresh);
     Check(std::abs(refresh->body_time + refresh->hold_duration - resume_time) < 1e-12,
           "rolling replanning postponed gait resume forever");
-    Finish(node, refresh);
+    Check(node.last_published_stamp_ns_ > before_refresh,
+          "estimated contact OFF blocked stance resume refresh");
     Input held_model = node.nominal_input_;
     held_model.gait_time = .4;
     held_model.body_time = .8;
@@ -289,7 +308,7 @@ struct TerrainPlannerRetryTest {
     Check(held_result.kinematics_valid.value_or(false) && held_result.ik_checks == 50,
           "hold checked fictitious future touchdown or skipped real supports");
     std::cout << "PASS seed preservation, nonblocking state, immediate/bounded retries, "
-                 "epoch/pause/command/clock publication guards\n";
+                 "epoch/pause/command/clock publication guards, latched stance support\n";
   }
 };
 
