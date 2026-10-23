@@ -17,8 +17,10 @@ GUI·RViz·지도·TAMOLS·시각화 TF를 함께 실행하고, 지도 입력은
 기존 LiDAR/CuPy 지도를 사용하고, 입력 GridMap의 구조를 유지한 채 높이·분산·유효성만
 평탄화한다. 평면 높이는 최근 유효 센서 관측을 따라 갱신해 odometry 드리프트를 반영한다.
 초기 발 링크/지면 높이 차이만 고정 오프셋으로 유지한다. TAMOLS와 RViz는 `/terrain_planner/elevation_map_flat`을 받는다.
-정지·전진·회전의 단발 계획은 검증했다. 초기 발 높이 검사는 스윙 구간과 실제 비접촉 발을
-제외하도록 수정했으며, 계산 시간 제한과 접촉·궤적 연결을 포함한 연속 보행 검증은 별도다.
+현재 지지발은 추정 위치를 그대로 사용하며 지도와 5mm 이상 높이가 달라도 입력을 거부하지 않는다.
+지도 조회 가능성, 다음 착지점의 지형 제약·최종 검사, GIAC 지지 안정성과 기구학 한계는 유지한다.
+이 변경은 높이 오차를 보정하거나 계산 성공을 보장하는 기능이 아니다. 계산 시간 제한과
+접촉·궤적 연결을 포함한 연속 보행 검증은 별도다.
 실행 순서, 재현 명령과 확인된 한계는 [평지 검증 문서](docs/flat_validation.md)를 따른다.
 
 B2 센서 또는 MuJoCo의 점군·odometry로 GPU 높이맵을 만들고, C++ TAMOLS 계획기로
@@ -224,7 +226,7 @@ RViz의 Fixed Frame과 연결되는 TF도 같은 좌표 계약에 맞춰야 한�
   보행 시간을 정지·재개하며 TAMOLS는 같은 `gait_time`으로 고정 trot 순서를 계획한다.
   보행 대기 지지는 WBC stance를 나타내는 `contact_confirmed`만으로 판정한다.
   stance 이후 `contact_estimated`가 OFF여도 지지를 취소하지 않으며, 추정 접촉은
-  지형 높이 검사와 접촉 주변 지도 보정에 별도로 사용한다.
+  접촉 주변 지도 보정에 별도로 사용한다. 현재 지지발의 높이를 지도와 강제로 일치시키지 않는다.
   몸통 최적화는 각 구간의 실제 지지발 조합과 위치에 맞춰 대각선 2발·3발·4발
   제약을 선택한다. 착지 시차로 생기는 3발 지지는 네 조합의 삼각형으로 계산하며,
   미착지 발을 대각선 지지로 대신 사용하지 않는다. 3발·4발 구간에는 지지 여유
@@ -312,7 +314,7 @@ throttle 없이 기록하며, 동일 계산/부모의 반복 보류만 최초 �
 
 `TAMOLS_SOLVE`의 `optimization_started`는 SQP 반복 실제 진입 여부다.
 `stage`는 반환 결과의 실패 단계이며 `input_validation`(입력·설정),
-`problem_setup`(지형·입력 발 높이 등 문제 구성), `initialization`(초기값),
+`problem_setup`(지도 조회·문제 구성), `initialization`(초기값),
 `optimization`(SQP), `final_validation`, `terrain_validation`, `kinematics_validation`,
 `export`, `total_time_budget`을 구분한다. 성공은 `complete`다. worker 밖 예외는
 `stage=not_started`, `status=solve_exception: ...`로 기록될 수 있으며 진입 여부를

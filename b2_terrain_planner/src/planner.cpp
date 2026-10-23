@@ -1,9 +1,9 @@
 /**
  * @file planner.cpp
  * @brief 접촉 조합별 생성 Jacobian과 지형 비용의 Gauss–Newton QP로 trot을 최적화한다.
- * @version 0.0.34
+ * @version 0.0.35
+ * @update 2026-10-23: 현재 지지발의 지도 높이 불일치에 따른 입력 거부를 제거함.
  * @update 2026-10-23: 입력·문제 구성·초기화·최적화·최종 검증의 실패 단계를 보존함.
- * @update 2026-10-23: 착지 대기의 세 지지 조합과 지지 여유·제약 진단을 연결함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -351,15 +351,10 @@ class Problem {
       }
       for (int leg = 0; leg < 4; ++leg) {
         const Eigen::Vector2d xy = input_.feet.row(leg).head<2>().transpose();
-        // 스윙 중이거나 실제 접촉이 아직 없으면 현재 Z가 지면과 달라도 된다.
-        // 미래 접촉 스케줄과 착지점의 지형 제약은 별도로 유지한다.
-        bool support = phases_.front().contacts[leg];
-        if (input_.contact_estimated) support = support && (*input_.contact_estimated)[leg];
-        if (!terrain_->IsQueryable(xy) ||
-            (support &&
-             std::abs(terrain_->Sample(xy).height - input_.feet(leg, 2)) >
-                 terrain_->settings().contact_tolerance)) {
-          throw std::invalid_argument("input feet do not match observed terrain height");
+        // 현재 지지는 추정 발 위치를 사용한다. 지도와의 높이 차이로 재계획을 막지 않는다.
+        // 지도 조회 가능성 및 다음 착지점의 지형 제약·최종 검사는 유지한다.
+        if (!terrain_->IsQueryable(xy)) {
+          throw std::invalid_argument("input foot position not queryable");
         }
         if (input_.committed_footholds[leg]) {
           // 지도가 갱신되어도 확정 Z를 지면 샘플로 다시 덮어쓰지 않는다.
