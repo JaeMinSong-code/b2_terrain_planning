@@ -1,9 +1,9 @@
 /**
  * @file planner.cpp
- * @brief 생성된 Jacobian과 지형 비용의 Gauss–Newton QP로 trot을 최적화한다.
- * @version 0.0.32
+ * @brief 접촉 조합별 생성 Jacobian과 지형 비용의 Gauss–Newton QP로 trot을 최적화한다.
+ * @version 0.0.33
+ * @update 2026-10-23: 착지 대기의 세 지지 조합과 지지 여유·제약 진단을 연결함.
  * @update 2026-10-21: 착지 대기 중 몸통 시간 진행과 유한 재계획·보행 재개 연속성을 반영함.
- * @update 2026-10-19: 연속 몸통 연결·초기값 구간 보존·실패 반복값 재검증을 구현함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -312,7 +312,7 @@ class Problem {
     size_ = feet_offset_ + 4 * foot_dimensions_;
     for (const Phase& phase : phases_) {
       margin_.push_back(-1);
-      if (std::count(phase.contacts.begin(), phase.contacts.end(), true) == 4) {
+      if (std::count(phase.contacts.begin(), phase.contacts.end(), true) >= 3) {
         margin_.back() = size_++;
       }
     }
@@ -873,17 +873,55 @@ class Problem {
       auto constraints_kernel = tamols_diagonal_a_constraint_jacobian;
       int nr = 20;
       int ng = 17;
-      const bool full_support = std::count(phases_[k].contacts.begin(), phases_[k].contacts.end(), true) == 4;
-      if (full_support) {
-        kernel = tamols_full_support;
-        values_kernel = tamols_full_support_values;
-        constraints_kernel = tamols_full_support_constraint_jacobian;
-        nr = 28;
-        ng = 26;
-      } else if (!phases_[k].contacts[0]) {
-        kernel = tamols_diagonal_b;
-        values_kernel = tamols_diagonal_b_values;
-        constraints_kernel = tamols_diagonal_b_constraint_jacobian;
+      const int contact_count =
+          std::count(phases_[k].contacts.begin(), phases_[k].contacts.end(), true);
+      const bool polygon_support = contact_count >= 3;
+      int contact_mask = 0;
+      for (int leg = 0; leg < 4; ++leg) {
+        if (phases_[k].contacts[leg]) contact_mask |= 1 << leg;
+      }
+      // trot의 대각선 두 지지와 착지 대기 중의 실제 세 지지 조합을 구분한다.
+      switch (contact_mask) {
+        case 9:  // FL, RR.
+          break;
+        case 6:  // FR, RL.
+          kernel = tamols_diagonal_b;
+          values_kernel = tamols_diagonal_b_values;
+          constraints_kernel = tamols_diagonal_b_constraint_jacobian;
+          break;
+        case 14:  // FR, RL, RR.
+          kernel = tamols_without_fl;
+          values_kernel = tamols_without_fl_values;
+          constraints_kernel = tamols_without_fl_constraint_jacobian;
+          break;
+        case 13:  // FL, RL, RR.
+          kernel = tamols_without_fr;
+          values_kernel = tamols_without_fr_values;
+          constraints_kernel = tamols_without_fr_constraint_jacobian;
+          break;
+        case 11:  // FL, FR, RR.
+          kernel = tamols_without_rl;
+          values_kernel = tamols_without_rl_values;
+          constraints_kernel = tamols_without_rl_constraint_jacobian;
+          break;
+        case 7:  // FL, FR, RL.
+          kernel = tamols_without_rr;
+          values_kernel = tamols_without_rr_values;
+          constraints_kernel = tamols_without_rr_constraint_jacobian;
+          break;
+        case 15:
+          kernel = tamols_full_support;
+          values_kernel = tamols_full_support_values;
+          constraints_kernel = tamols_full_support_constraint_jacobian;
+          break;
+        default:
+          throw std::invalid_argument("unsupported trot support combination");
+      }
+      int giac_end = 13;
+      if (polygon_support) {
+        nr = 12 + 4 * contact_count;
+        giac_end = 10 + 2 * contact_count;
+        ng = giac_end + 2 * contact_count;
       }
       std::vector<int> columns;
       if (block_assembly_) {
@@ -1017,9 +1055,9 @@ class Problem {
           local_row = row;
           if (row < 5) group = kFriction;
           else if (row < 10) group = kMotion;
-          else if (full_support && row < 18) group = kGiacInequality;
-          else if (!full_support && row == 10) group = kGiacEquality;
-          else if (!full_support && row < 13) group = kGiacInequality;
+          else if (polygon_support && row < giac_end) group = kGiacInequality;
+          else if (!polygon_support && row == 10) group = kGiacEquality;
+          else if (!polygon_support && row < giac_end) group = kGiacInequality;
           else group = kKinematic;
           add(constraints[row], lo[row], upper_bound);
           if (need_jacobian) {

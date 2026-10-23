@@ -1,9 +1,9 @@
 /**
  * @file planner_retry_test.cpp
  * @brief 지연·실패를 주입해 비동기 재계획과 성공해 보존 및 발행 차단을 검증한다.
- * @version 0.0.4
+ * @version 0.0.5
+ * @update 2026-10-23: 착지 대기의 두 지지·세 지지·네 지지 재개 계획 전달을 검증함.
  * @update 2026-10-23: 추정 접촉 OFF·변동에도 WBC stance로 대기 해제와 계획 발행을 검증함.
- * @update 2026-10-21: 착지 대기 중 몸통 시간 진행과 유한 재계획·보행 재개 연속성을 반영함.
  */
 #define B2_TERRAIN_PLANNER_NO_MAIN
 #include "../src/terrain_planner_node.cpp"
@@ -267,11 +267,24 @@ struct TerrainPlannerRetryTest {
     Check(node.last_published_stamp_ns_ > before_hold,
           "estimated contact change rejected two-stance hold plan");
     state.active_plan_stamp_ns = node.last_published_stamp_ns_;
+    auto tripod = Install(node);
+    state.contact_confirmed[1] = true;
+    state.contact_estimated.fill(false);
+    state.body_time = .42;
+    update(.4);
+    Started(tripod);
+    const auto before_tripod = node.last_published_stamp_ns_;
+    Finish(node, tripod);
+    Check(tripod->hold_contacts == state.contact_confirmed &&
+          tripod->hold_duration == node.robot_.period &&
+          node.last_published_stamp_ns_ > before_tripod,
+          "three-stance hold changed supports or blocked publication");
+    state.active_plan_stamp_ns = node.last_published_stamp_ns_;
     auto release = Install(node);
     // 착지 후 추정 접촉이 모두 OFF여도 유한한 재개 prefix만 사용한다.
     state.contact_confirmed.fill(true);
     state.contact_estimated.fill(false);
-    state.body_time = .42;
+    state.body_time = .44;
     update(.4);
     Started(release);
     const double resume_time = release->body_time + release->hold_duration;
@@ -285,7 +298,7 @@ struct TerrainPlannerRetryTest {
     state.active_plan_stamp_ns = node.last_published_stamp_ns_;
     auto refresh = Install(node);
     state.contact_estimated.fill(false);
-    state.body_time = .44;
+    state.body_time = .46;
     update(.4);
     node.OnTimer();
     Started(refresh);

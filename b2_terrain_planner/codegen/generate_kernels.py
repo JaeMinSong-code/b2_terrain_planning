@@ -6,6 +6,7 @@ acceleration(6), FL/FR/RL/RR 접촉점(12), 지지 여유(1)이다.
 p는 mass(1), column-major inertia(9), leg-major hips(12), height,
 mu, leg_min, leg_max, body-frame command(vx, vy, yaw_rate),
 기준 다리 벡터(12), 실제 모델 모드(1), pitch·수직 길이 비용의 제곱근(2), pitch/roll 한계(1), 다리별 최소·최대 도달 거리(4+4)이다.
+대각선 두 지지, 착지 대기의 세 지지 네 조합, 전체 지지의 계산 함수를 생성한다.
 """
 
 import argparse
@@ -114,7 +115,11 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     kernels = [make_kernel('tamols_diagonal_a', [0, 3]),
                make_kernel('tamols_diagonal_b', [2, 1]),
-               make_kernel('tamols_full_support', [0, 2, 3, 1])]
+               make_kernel('tamols_full_support', [0, 2, 3, 1]),
+               make_kernel('tamols_without_fl', [2, 3, 1]),
+               make_kernel('tamols_without_fr', [0, 2, 3]),
+               make_kernel('tamols_without_rl', [0, 3, 1]),
+               make_kernel('tamols_without_rr', [0, 2, 1])]
     os.chdir(args.output)
     generator = ca.CodeGenerator('tamols_kernels.c', {'with_header': True})
     for kernel in kernels:
@@ -141,7 +146,7 @@ def main():
         raise RuntimeError('unsupported conditional expression in generated C')
     generated.write_text(text)
     header = Path('tamols_kernels.h')
-    header.write_text('/**\n * @file tamols_kernels.h\n * @brief CasADi가 생성한 잔차·제약·미분 C API.\n * @version 0.0.5\n * @update 2026-10-14: 다리별 관절 제한 거리를 제약 매개변수로 추가함.\n * @update 2026-10-14: 자세 비용·pitch/roll 한계를 외부 매개변수로 분리함.\n */\n' + header.read_text())
+    header.write_text('/**\n * @file tamols_kernels.h\n * @brief 대각선 두 지지·세 지지 네 조합·전체 지지의 잔차·제약·미분 C API.\n * @version 0.0.6\n * @update 2026-10-23: 착지 대기의 세 지지 조합별 계산 함수를 추가함.\n * @update 2026-10-14: 다리별 관절 제한 거리를 제약 매개변수로 추가함.\n */\n' + header.read_text())
     for path in (generated, header):
         path.write_text('\n'.join(line.rstrip() for line in path.read_text().splitlines()) + '\n')
     manifest = {'casadi_version' : ca.__version__, 'z_size': 31, 'parameter_size': 54,

@@ -64,6 +64,12 @@ install(FILES scripts/elevation_common.py DESTINATION lib/${PROJECT_NAME})
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(support_combination_test tests/support_combination_test.cpp)
+    target_include_directories(support_combination_test PRIVATE generated)
+    target_compile_definitions(support_combination_test PRIVATE
+        B2_BUILD_MODEL_PATH="${CMAKE_CURRENT_SOURCE_DIR}/model/unitree_b2/b2.urdf")
+    target_link_libraries(support_combination_test PRIVATE tamols_sqp tamols_kernels)
+    add_test(NAME support_combination_test COMMAND support_combination_test)
     add_executable(committed_swing_test tests/committed_swing_test.cpp)
     target_link_libraries(committed_swing_test PRIVATE tamols_sqp)
     add_test(NAME committed_swing_test COMMAND committed_swing_test)
@@ -80,7 +86,7 @@ if(BUILD_TESTING)
     target_link_libraries(terrain_reuse_test PRIVATE tamols_sqp)
     add_test(NAME terrain_reuse_test COMMAND terrain_reuse_test)
     # ROS overlay의 설치본보다 방금 빌드한 라이브러리로 시험한다.
-    set_tests_properties(committed_swing_test support_patch_test swing_terrain_test terrain_reuse_test PROPERTIES
+    set_tests_properties(support_combination_test committed_swing_test support_patch_test swing_terrain_test terrain_reuse_test PROPERTIES
         ENVIRONMENT "OPENBLAS_NUM_THREADS=1;OMP_NUM_THREADS=1;LD_LIBRARY_PATH=$<TARGET_FILE_DIR:tamols_sqp>:$ENV{LD_LIBRARY_PATH}")
 endif()
 

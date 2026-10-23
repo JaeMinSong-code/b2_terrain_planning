@@ -19,6 +19,22 @@
     "tamols_full_support": {
       "residuals": 28,
       "constraints": 26
+    },
+    "tamols_without_fl": {
+      "residuals": 24,
+      "constraints": 22
+    },
+    "tamols_without_fr": {
+      "residuals": 24,
+      "constraints": 22
+    },
+    "tamols_without_rl": {
+      "residuals": 24,
+      "constraints": 22
+    },
+    "tamols_without_rr": {
+      "residuals": 24,
+      "constraints": 22
     }
   }
 }

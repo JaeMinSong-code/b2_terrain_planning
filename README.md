@@ -225,6 +225,10 @@ RViz의 Fixed Frame과 연결되는 TF도 같은 좌표 계약에 맞춰야 한�
   보행 대기 지지는 WBC stance를 나타내는 `contact_confirmed`만으로 판정한다.
   stance 이후 `contact_estimated`가 OFF여도 지지를 취소하지 않으며, 추정 접촉은
   지형 높이 검사와 접촉 주변 지도 보정에 별도로 사용한다.
+  몸통 최적화는 각 구간의 실제 지지발 조합과 위치에 맞춰 대각선 2발·3발·4발
+  제약을 선택한다. 착지 시차로 생기는 3발 지지는 네 조합의 삼각형으로 계산하며,
+  미착지 발을 대각선 지지로 대신 사용하지 않는다. 3발·4발 구간에는 지지 여유
+  변수를 사용한다. 이륙 순서는 trot을 유지하고 착지점은 해당 발의 이륙 시 확정한다.
 - 메시지 필드명은 유지한다. `base_pose.position`과 `base_twist.linear`는 전신 CoM,
   `base_pose.orientation`은 몸통 자세, `base_twist.angular`는 roll/pitch/yaw 변화율이다.
   `b2_deploy` bridge가 각속도로 변환하고 WBC는 전신 CoM Jacobian으로 병진을 직접 추종한다.
