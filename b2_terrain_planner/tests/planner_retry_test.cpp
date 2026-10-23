@@ -1,9 +1,9 @@
 /**
  * @file planner_retry_test.cpp
  * @brief 지연·실패를 주입해 비동기 재계획과 성공해 보존 및 발행 차단을 검증한다.
- * @version 0.0.5
+ * @version 0.0.6
+ * @update 2026-10-23: 도달 여유 조건부 감속·히스테리시스·명령 복원과 계산 중 전환을 검증함.
  * @update 2026-10-23: 착지 대기의 두 지지·세 지지·네 지지 재개 계획 전달을 검증함.
- * @update 2026-10-23: 추정 접촉 OFF·변동에도 WBC stance로 대기 해제와 계획 발행을 검증함.
  */
 #define B2_TERRAIN_PLANNER_NO_MAIN
 #include "../src/terrain_planner_node.cpp"
@@ -91,6 +91,114 @@ struct TerrainPlannerRetryTest {
     Wait([&] { return node.solve_future_.wait_for(std::chrono::seconds(0)) ==
                       std::future_status::ready; });
     node.CompleteSolve();
+  }
+
+  static void CheckKinematicBraking(TerrainPlannerNode& node) {
+    node.state_.reset();
+    node.previous_.reset();
+    node.retry_seed_.reset();
+    node.published_plans_.clear();
+    node.kinematic_braking_ = false;
+    const Eigen::Vector3d requested(.30, -.10, .40);
+    node.command_ = requested;
+    node.applied_command_ = requested;
+    node.command_slot_ = 1;
+    TerrainPlannerNode::State state;
+    state.header.frame_id = "odom";
+    state.gait_clock_valid = true;
+    state.gait_epoch_ns = 4;
+    state.gait_time = .4;
+    state.body_clock_valid = true;
+    state.body_time = .5;
+    state.gait_paused = true;
+    state.contact_confirmed = {true, true, false, true};
+    state.contact_estimated.fill(false);
+    // 회전·이동한 odom에서도 몸통 축 상대 기구학 여유가 같아야 한다.
+    const Eigen::Quaterniond orientation(Eigen::AngleAxisd(1.3, Eigen::Vector3d::UnitZ()));
+    const Eigen::Vector3d base(1.2, -.7, .55);
+    state.base_orientation.w = orientation.w();
+    state.base_orientation.x = orientation.x();
+    state.base_orientation.y = orientation.y();
+    state.base_orientation.z = orientation.z();
+    state.base_position.x = base.x();
+    state.base_position.y = base.y();
+    state.base_position.z = base.z();
+    const Eigen::Vector3d com = base + orientation * node.robot_.com_offset;
+    state.com_position.x = com.x();
+    state.com_position.y = com.y();
+    state.com_position.z = com.z();
+    const auto set_margin = [&](int leg, double margin) {
+      const Eigen::Vector3d offset = node.robot_.hips.row(leg).transpose() + node.robot_.com_offset;
+      const Eigen::Vector3d direction = Eigen::Vector3d(-.6, .2, -.77).normalized();
+      const Eigen::Vector3d foot = base + orientation *
+          (offset + direction * (node.robot_.reach_max[leg] - margin));
+      state.foot_position[leg].x = foot.x();
+      state.foot_position[leg].y = foot.y();
+      state.foot_position[leg].z = foot.z();
+    };
+    const auto update = [&] {
+      state.body_time += .002;
+      state.header.stamp = node.now();
+      node.OnState(state);
+    };
+    for (int leg = 0; leg < 4; ++leg) set_margin(leg, .20);
+    set_margin(2, -.20);  // 비지지발의 한계 초과는 감속을 유발하지 않는다.
+    auto safe = Install(node);
+    update();
+    node.OnTimer();
+    Started(safe);
+    Check(!node.kinematic_braking_ && (safe->command - requested).norm() < 1e-12,
+          "safe wait or nonstance foot suppressed requested command");
+    Check(std::abs(node.stance_reach_margin_ - .20) < 1e-12,
+          "rotated hip-to-foot distance or CoM offset was incorrect");
+    Finish(node, safe);
+
+    auto before_brake = Install(node);
+    update();
+    node.OnTimer();
+    Started(before_brake);
+    const auto published_before = node.last_published_stamp_ns_;
+    set_margin(0, .08);
+    update();  // 계산 중 한계 접근은 주기 타이머를 기다리지 않고 재계획을 요청한다.
+    auto brake = Install(node);
+    Finish(node, before_brake);
+    Started(brake);
+    Check(node.last_published_stamp_ns_ == published_before && brake->command.isZero(),
+          "pre-braking snapshot published or zero-target retry did not start");
+    Check(node.kinematic_braking_ && node.stance_reach_leg_ == 0 &&
+          (node.applied_command_ - requested).norm() < 1e-12 &&
+          (node.command_ - requested).norm() < 1e-12,
+          "braking overwrote operator command or used measured contacts");
+    Finish(node, brake);
+
+    auto band = Install(node);
+    set_margin(0, .12);
+    update();
+    node.OnTimer();
+    Started(band);
+    Check(node.kinematic_braking_ && band->command.isZero(), "braking chattered in hysteresis band");
+    Finish(node, band);
+    auto release = Install(node);
+    set_margin(0, .16);
+    update();
+    Started(release);
+    Check(!node.kinematic_braking_ && (release->command - requested).norm() < 1e-12,
+          "recovered reach did not restore saved command");
+    Finish(node, release);
+
+    auto reenter = Install(node);
+    set_margin(0, .08);
+    update();
+    Started(reenter);
+    Check(reenter->command.isZero(), "repeated unsafe wait did not brake");
+    Finish(node, reenter);
+    auto walking = Install(node);
+    state.gait_paused = false;
+    update();
+    Started(walking);
+    Check(!node.kinematic_braking_ && (walking->command - requested).norm() < 1e-12,
+          "normal walking inherited wait braking");
+    Finish(node, walking);
   }
 
   static void Run() {
@@ -308,6 +416,8 @@ struct TerrainPlannerRetryTest {
           "rolling replanning postponed gait resume forever");
     Check(node.last_published_stamp_ns_ > before_refresh,
           "estimated contact OFF blocked stance resume refresh");
+    CheckKinematicBraking(node);
+
     Input held_model = node.nominal_input_;
     held_model.gait_time = .4;
     held_model.body_time = .8;
@@ -321,7 +431,8 @@ struct TerrainPlannerRetryTest {
     Check(held_result.kinematics_valid.value_or(false) && held_result.ik_checks == 50,
           "hold checked fictitious future touchdown or skipped real supports");
     std::cout << "PASS seed preservation, nonblocking state, immediate/bounded retries, "
-                 "epoch/pause/command/clock publication guards, latched stance support\n";
+                 "epoch/pause/command/clock publication guards, latched stance support, "
+                 "reach-gated braking and command restoration\n";
   }
 };
 

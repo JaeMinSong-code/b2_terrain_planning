@@ -335,6 +335,23 @@ Solve는 입력·설정·직전 성공해의 복사본으로 별도 작업에서
 계산 중 epoch·보행 시각 초기화·접촉 위상·실행 계획이 바뀌면 결과를 발행하지 않는다.
 WBC stance와 보행 대기 상태가 유지되면 추정 접촉 변동만으로 대기·재개 계획을 버리지 않는다.
 
+대기(`gait_paused`) 중에도 도달 여유가 충분하면 속도 명령을 유지한다. 각 WBC stance 발의
+측정 고관절–발 거리와 URDF 관절 제한 최대 길이 차이 중 최솟값이
+`kinematic_braking.enter_margin_m`(기본 0.10 m) 이하이면 이번 TAMOLS 계산의
+vx/vy/yaw-rate 목표만 0으로 바꾼다. 지지발 여유가
+`kinematic_braking.release_margin_m`(기본 0.14 m) 이상으로 회복되거나 대기가 풀리면
+보관한 명령을 복원한다. 입력 명령과 보행 구간별 확정 명령은 지우지 않으며 기존 명령
+만료·확정 규칙을 따른다. 감속 목표에도 기존 몸통 p/v 연결·0.14초 앞부분과 최종 IK 검사는
+유지하므로 실제 속도를 순간적으로 0으로 만드는 기능이 아니다. 이 거리는 반경 방향
+신장 여유이며 모든 관절 방향의 여유나 감속 성공 보장은 아니다. 이미 한계에 도달했거나
+계산/인계가 늦으면 계획 만료 보호가 동작할 수 있다.
+
+거리 계산은 제어 odom의 base 위치·자세와 FK 발 위치를 쓰고, 비지지발·추정 접촉 변동은
+판정에서 제외한다. 진입·해제는 즉시 재계획을 요청하고, 계산 중 감속 상태가 바뀐 결과는
+`kinematic_braking_changed_after_solve`로 발행을 보류한다. `effective_command`는 감속이
+반영된 계산 목표를 표시한다. `pipeline_status`에는 `kinematic_braking_entered/released`
+이벤트와 `kinematic_braking`, `stance_reach_margin_m`, `stance_reach_leg`가 기록된다.
+
 실패·발행 보류는 `previous_`를 지우지 않는다. 마지막 발행 성공해를 다음 초기값으로 넘기고,
 Solve 내부의 보행 시각·모델·지도 호환성 검사와 착지점 재검사를 그대로 거친다.
 epoch/보행 시각 초기화 또는 ROS 시각 역행 시에는 성공해와 스윙 참조를 초기화한다.
