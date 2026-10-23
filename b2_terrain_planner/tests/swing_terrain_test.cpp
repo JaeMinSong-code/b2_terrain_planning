@@ -1,7 +1,8 @@
 /**
  * @file swing_terrain_test.cpp
  * @brief 공중에서 시작하는 양쪽 대각선 스윙 계획과 지지 발 높이 검사를 검증한다.
- * @version 0.0.1
+ * @version 0.0.2
+ * @update 2026-10-23: 입력 거부와 최적화 성공·시간 초과의 진단 단계를 검증함.
  * @update 2026-10-17: 스윙 입력 허용·지지 오류 거부·착지 지면 일치 회귀 시험을 추가함.
  */
 #include "b2_terrain_planner/planner.h"
@@ -47,6 +48,8 @@ void Run(double gait_time) {
   }
   const Result result = Solve(robot, input, settings);
   Check(result.success, "airborne replan failed: " + result.status);
+  Check(result.optimization_started && result.stage == "complete",
+        "successful solve missing optimization/completion diagnostic");
   Check(result.terrain_validation.has_value() && result.terrain_validation->passed,
         "landing terrain validation failed");
   for (int leg = 0; leg < 4; ++leg) {
@@ -62,7 +65,21 @@ void Run(double gait_time) {
     Check(!rejected.success &&
               rejected.status == "input feet do not match observed terrain height",
           "support height mismatch was accepted");
+    Check(!rejected.optimization_started && rejected.iterations == 0 &&
+              rejected.stage == "problem_setup",
+          "input height rejection was reported as an optimization failure");
   }
+  auto invalid_settings = settings;
+  invalid_settings.time_limit = 0;
+  const auto invalid = Solve(robot, input, invalid_settings);
+  Check(!invalid.optimization_started && invalid.stage == "input_validation",
+        "invalid settings did not preserve input validation stage");
+  auto short_settings = settings;
+  short_settings.time_limit = 1e-12;
+  const auto timeout = Solve(robot, input, short_settings);
+  Check(!timeout.success && timeout.optimization_started && timeout.status == "time_limit" &&
+            timeout.stage == "optimization",
+        "time limit was not distinguished from pre-optimization rejection");
   std::cout << "PASS gait_time=" << gait_time << " status=" << result.status << '\n';
 }
 

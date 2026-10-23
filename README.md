@@ -304,6 +304,28 @@ TAMOLS 추종의 다음 스윙은 이륙 후에도 확인 지지발이 최소 �
 
 ## 계획 갱신 중단 진단
 
+기본 실행에서는 진단 토픽뿐 아니라 `~/.ros/log/`(`ROS_LOG_DIR` 지정 시 해당 경로)의
+planner 로그에도 `TAMOLS_PIPELINE`/`TAMOLS_SOLVE` 뒤 JSON을 자동 저장한다.
+INFO 로그와 ROS 외부 파일 sink가 활성화되어 있어야 한다. 계산 시작·결과·발행 거부는
+throttle 없이 기록하며, 동일 계산/부모의 반복 보류만 최초 및 1초마다 저장한다.
+따라서 파일의 pipeline `event_seq` 간격은 반복 보류 생략 때문일 수 있다. 토픽은 그대로 발행한다.
+
+`TAMOLS_SOLVE`의 `optimization_started`는 SQP 반복 실제 진입 여부다.
+`stage`는 반환 결과의 실패 단계이며 `input_validation`(입력·설정),
+`problem_setup`(지형·입력 발 높이 등 문제 구성), `initialization`(초기값),
+`optimization`(SQP), `final_validation`, `terrain_validation`, `kinematics_validation`,
+`export`, `total_time_budget`을 구분한다. 성공은 `complete`다. worker 밖 예외는
+`stage=not_started`, `status=solve_exception: ...`로 기록될 수 있으며 진입 여부를
+확정할 수 없는 예외로 취급하며 `optimization_started=null`을 기록한다. `terrain_attempts`에는 내부 지지면 재시도 결과도 남긴다.
+
+`command`, `kinematic_braking`, `contact_confirmed`, `contact_estimated`,
+`parent_plan_stamp_ns`, `prefix_duration`은 해당 계산 입력 snapshot이다.
+`published`/`publication_reason`으로 계산 성공과 발행 성공을 구분한다.
+`attempt_seq`로 시작/결과를 연결하고 입력 `state_stamp_ns`를 B2 ROS 로그의
+`TAMOLS_WBC` 계획 stamp 및 WBC CSV `plan_stamp_ns`와 연결한다. ns는 정수로 읽는다.
+B2의 `adoption_observed`는 ROS 주기로 관측한 제어 판정 변화이며 모든 제어 틱 기록은 아니다.
+이 기록은 과거 2초 제한 경고만으로 마지막 실패 단계를 확정할 수 없던 문제를 보완한다.
+
 `/terrain_planner_node/pipeline_status`는 JSON 문자열로 각 보류·solve·발행 이벤트를 기록한다.
 `event_seq`는 이벤트 순번, `attempt_seq`는 Solve 호출 순번이다. `ros_ns`, `state_stamp_ns`,
 `map_stamp_ns`, `gait_epoch_ns`, `gait_time`, `solve_start_ns`, `solve_end_ns`,

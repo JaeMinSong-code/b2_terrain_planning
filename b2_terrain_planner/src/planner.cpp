@@ -1,9 +1,9 @@
 /**
  * @file planner.cpp
  * @brief 접촉 조합별 생성 Jacobian과 지형 비용의 Gauss–Newton QP로 trot을 최적화한다.
- * @version 0.0.33
+ * @version 0.0.34
+ * @update 2026-10-23: 입력·문제 구성·초기화·최적화·최종 검증의 실패 단계를 보존함.
  * @update 2026-10-23: 착지 대기의 세 지지 조합과 지지 여유·제약 진단을 연결함.
- * @update 2026-10-21: 착지 대기 중 몸통 시간 진행과 유한 재계획·보행 재개 연속성을 반영함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -2148,6 +2148,7 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
                          input.gait_hold_duration, input.hold_contacts};
   try {
     ScopedTimer initialization_timer(&result.profile.initialization_seconds);
+    result.stage = "input_validation";
     Validate(robot, input, settings);
     for (const auto& committed : input.committed_footholds) {
       if (committed && (!committed->allFinite() ||
@@ -2164,11 +2165,13 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
       terrain.emplace(*input.terrain, settings.terrain);
       terrain_pointer = &*terrain;
     }
+    result.stage = "problem_setup";
     Problem problem(robot, input, settings.sample_intervals,
                     &result.profile, settings.full_evaluation, terrain_pointer,
                     settings.block_assembly, settings.polynomial_tail,
                     settings.pitch_weight, settings.leg_vertical_weight, settings.orientation_limit,
                     settings.foothold_backward_weight, settings.vz_weight);
+    result.stage = "initialization";
     int replaced_leg = -1;
     if (alternative != nullptr) replaced_leg = alternative->leg;
     Vector x = problem.Initial(previous, &result.warm_start, replaced_leg);
@@ -2184,8 +2187,10 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
       penalty = std::clamp(previous->seed_penalty, 10.0, 1e6);
     }
     int small_improvements = 0;
+    result.stage = "optimization";
     result.status = "iteration_limit";
     for (int iteration = 0; iteration < settings.max_iterations; ++iteration) {
+      result.optimization_started = true;
       result.iterations = iteration + 1;
       Evaluation eval = problem.EvaluateAt(x);
       if (elapsed() >= settings.time_limit) {
@@ -2288,6 +2293,8 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
         break;
       }
     }
+    // 실패한 반복 뒤 진단 검사를 해도 원래 최적화 실패 단계를 유지한다.
+    if (result.success) result.stage = "final_validation";
     ScopedTimer validation_timer(&result.profile.final_validation_seconds);
     Evaluation final = problem.EvaluateAt(x, EvaluationMode::kValues);
     result.cost = final.cost;
@@ -2302,6 +2309,7 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
       if (result.success && !result.terrain_validation->passed) {
         result.success = false;
         result.status = "terrain_validation_failed: " + result.terrain_validation->reason;
+        result.stage = "terrain_validation";
       }
     }
     if (elapsed() > settings.time_limit) {
@@ -2309,6 +2317,7 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
       result.status = "time_limit";
     }
     if (result.success && robot.model) {
+      result.stage = "kinematics_validation";
       ScopedTimer ik_timer(&result.profile.ik_seconds);
       problem.CheckKinematics(x, &result);
       if (!result.kinematics_valid.value()) {
@@ -2323,10 +2332,12 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
     const bool resumable = result.status == "time_limit" || result.status == "iteration_limit" ||
                            result.status == "line_search_failed";
     if (result.success || (resumable && x.allFinite())) {
+      if (result.success) result.stage = "export";
       problem.Export(x, &result);
       result.seed_available = true;
       result.seed_penalty = penalty;
     }
+    if (result.success) result.stage = "complete";
   } catch (const std::exception& error) {
     result.success = false;
     result.seed_available = false;
@@ -2407,6 +2418,7 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
   if (result.elapsed > settings.time_limit) {
     result.success = false;
     result.status = "time_limit";
+    result.stage = "total_time_budget";
     // 제어 발행 자격은 success로 차단하고 수치 재시도용 반복값은 보존한다.
   }
   return result;

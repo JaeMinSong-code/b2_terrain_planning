@@ -1,9 +1,9 @@
 /**
  * @file planner.h
  * @brief 평지·지형 trot의 SQP 입력·출력 및 시간 구간 계획 계약.
- * @version 0.0.26
+ * @version 0.0.27
+ * @update 2026-10-23: 최적화 진입 여부와 실패 단계의 진단 필드를 추가함.
  * @update 2026-10-21: 착지 대기 중 몸통 시간 진행과 유한 재계획·보행 재개 연속성을 반영함.
- * @update 2026-10-19: 몸통 연결과 제어 발행 자격에서 분리한 재시도 초기값 계약을 추가함.
  */
 #ifndef B2_TERRAIN_PLANNER_PLANNER_H_
 #define B2_TERRAIN_PLANNER_PLANNER_H_
@@ -250,6 +250,9 @@ struct Result {
   int constraint_count = 0;
   std::vector<ConstraintDiagnostic> constraint_groups;
   std::string status;
+  // 반환 결과의 실패 단계. 성공은 complete이며 제어 판정에는 사용하지 않는다.
+  std::string stage = "not_started";
+  bool optimization_started = false;
   int iterations = 0;
   double elapsed = 0.0;
   double cost = 0.0;

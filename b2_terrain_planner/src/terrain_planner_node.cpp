@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.16
+ * @version 0.0.17
+ * @update 2026-10-23: 계산 시도별 입력·결과·발행 판정을 구조화 ROS 로그에 보존함.
  * @update 2026-10-23: 보행 대기 중 지지발 도달 여유에 따른 조건부 감속과 명령 복원을 추가함.
- * @update 2026-10-23: 보행 대기 지지와 발행 판정을 WBC stance 기준으로 통일함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -262,20 +262,52 @@ class TerrainPlannerNode : public rclcpp::Node {
       out << ",\"gait_paused\":" << std::boolalpha << state_->gait_paused
           << ",\"body_time\":" << StateBodyTime(*state_);
     }
+    if (pending_solve_) {
+      const auto& pending = *pending_solve_;
+      out << ",\"solve_kinematic_braking\":" << pending.kinematic_braking
+          << ",\"solve_command\":[" << pending.input.command.x() << ','
+          << pending.input.command.y() << ',' << pending.input.command.z() << ']'
+          << ",\"solve_contact_confirmed\":[";
+      for (int i = 0; i < 4; ++i) {
+        if (i > 0) out << ',';
+        out << pending.state.contact_confirmed[i];
+      }
+      out << ']';
+    }
     out << '}';
     std_msgs::msg::String message;
     message.data = out.str();
     pipeline_status_pub_->publish(message);
+    // 결과 이벤트는 전부 저장한다. 반복 보류만 같은 이유/계산/부모에서 1초마다 요약한다.
+    const std::string key = std::string(event) + ":" + reason + ":" +
+        std::to_string(attempt_seq_) + ":" +
+        std::to_string(state_.value_or(State{}).active_plan_stamp_ns);
+    const auto log_time = std::chrono::steady_clock::now();
+    const bool waiting = std::string(event) == "deferred" || std::string(event) == "state_rejected";
+    if (!waiting || key != last_pipeline_log_key_ ||
+        log_time - last_pipeline_log_time_ >= std::chrono::seconds(1)) {
+      RCLCPP_INFO(get_logger(), "TAMOLS_PIPELINE %s", message.data.c_str());
+      last_pipeline_log_key_ = key;
+      last_pipeline_log_time_ = log_time;
+    }
   }
 
-  void PublishSolveStatus(const Result& result, const Input& input,
-                          const builtin_interfaces::msg::Time& stamp, bool published) {
+  void PublishSolveStatus(const Result& result, const PendingSolve& pending,
+                          bool published, const char* publication_reason) {
+    const auto& input = pending.input;
+    const auto& stamp = pending.state.header.stamp;
     const auto number = [](double value) {
       if (!std::isfinite(value)) return std::string("null");
       std::ostringstream stream;
       stream << std::setprecision(12) << value;
       return stream.str();
     };
+    // solver 밖 예외 등 단계가 없는 결과는 미진입으로 단정하지 않는다.
+    const char* optimization_started = "null";
+    if (result.stage != "not_started") {
+      optimization_started = "false";
+      if (result.optimization_started) optimization_started = "true";
+    }
     std::string worst;
     double worst_violation = 0;
     for (const auto& group : result.constraint_groups) {
@@ -287,6 +319,12 @@ class TerrainPlannerNode : public rclcpp::Node {
     std::ostringstream out;
     out << std::boolalpha << "{\"status\":" << std::quoted(result.status)
         << ",\"success\":" << result.success << ",\"published\":" << published
+        << ",\"stage\":" << std::quoted(result.stage)
+        << ",\"optimization_started\":" << optimization_started
+        << ",\"publication_reason\":" << std::quoted(publication_reason)
+        << ",\"kinematic_braking\":" << pending.kinematic_braking
+        << ",\"parent_plan_stamp_ns\":" << pending.state.active_plan_stamp_ns
+        << ",\"prefix_duration\":" << number(input.prefix_duration)
         << ",\"attempt_seq\":" << attempt_seq_
         << ",\"state_stamp_ns\":" << rclcpp::Time(stamp).nanoseconds()
         << ",\"solve_start_ns\":" << solve_start_ns_
@@ -313,10 +351,28 @@ class TerrainPlannerNode : public rclcpp::Node {
       if (leg > 0) out << ',';
       out << number(input.feet(leg, 2));
     }
+    out << "],\"contact_confirmed\":[";
+    for (int leg = 0; leg < 4; ++leg) {
+      if (leg > 0) out << ',';
+      out << pending.state.contact_confirmed[leg];
+    }
+    out << "],\"contact_estimated\":[";
+    for (int leg = 0; leg < 4; ++leg) {
+      if (leg > 0) out << ',';
+      out << pending.state.contact_estimated[leg];
+    }
+    out << "],\"terrain_attempts\":[";
+    for (std::size_t i = 0; i < result.terrain_attempts.size(); ++i) {
+      if (i > 0) out << ',';
+      const auto& attempt = result.terrain_attempts[i];
+      out << "{\"leg\":" << attempt.leg << ",\"status\":" << std::quoted(attempt.status)
+          << ",\"success\":" << attempt.success << ",\"elapsed\":" << number(attempt.elapsed) << '}';
+    }
     out << "]}";
     std_msgs::msg::String message;
     message.data = out.str();
     solve_status_pub_->publish(message);
+    RCLCPP_INFO(get_logger(), "TAMOLS_SOLVE %s", message.data.c_str());
   }
 
   void OnCommand(const geometry_msgs::msg::TwistStamped& message) {
@@ -845,13 +901,13 @@ class TerrainPlannerNode : public rclcpp::Node {
         }
         retry_seed_parent_ns_ = state.active_plan_stamp_ns;
       }
-      PublishSolveStatus(result, input, state.header.stamp, false);
+      PublishSolveStatus(result, pending, false, "solve_failed");
       PublishPipelineStatus("solve_failed", result.status.c_str());
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                            "solve failed: %s", result.status.c_str());
       retry_requested_ = true;
     } else if (!publishable) {
-      PublishSolveStatus(result, input, state.header.stamp, false);
+      PublishSolveStatus(result, pending, false, reason);
       PublishPipelineStatus("publish_deferred", reason);
       retry_requested_ = true;
     } else {
@@ -860,7 +916,7 @@ class TerrainPlannerNode : public rclcpp::Node {
       // 실제 발행한 몸통 곡선을 다음 계산의 초기값으로 보관한다.
       previous_ = published_plans_.back().body;
       retry_seed_.reset();
-      PublishSolveStatus(result, input, state.header.stamp, true);
+      PublishSolveStatus(result, pending, true, "published");
     }
     // 실패해도 마지막 성공해는 보존한다. Solve 내부가 시간·모델·지형 호환성을 재검사한다.
     // 계산 중 수신한 최신 상태 또는 같은 상태의 제한된 재시도를 즉시 시작한다.
@@ -1020,6 +1076,9 @@ class TerrainPlannerNode : public rclcpp::Node {
 
     marker_pub_->publish(arr);
   }
+
+  std::string last_pipeline_log_key_;
+  std::chrono::steady_clock::time_point last_pipeline_log_time_;
 
   // 상태.
   Robot robot_;
