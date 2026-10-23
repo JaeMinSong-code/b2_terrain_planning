@@ -1,9 +1,9 @@
 /**
  * @file planner_retry_test.cpp
  * @brief 지연·실패를 주입해 비동기 재계획과 성공해 보존 및 발행 차단을 검증한다.
- * @version 0.0.8
+ * @version 0.0.9
+ * @update 2026-10-23: 보행 중 길이 여유 감속·재개 후 감속 유지·여유 회복 해제를 검증함.
  * @update 2026-10-23: 이륙 전 발 이동 반영과 이륙 후 스윙 곡선·착지점 고정을 검증함.
- * @update 2026-10-23: 감속·복귀 변화율, 재진입 연속성, 중복 상태와 세션 초기화를 검증함.
  */
 #define B2_TERRAIN_PLANNER_NO_MAIN
 #include "../src/terrain_planner_node.cpp"
@@ -111,7 +111,7 @@ struct TerrainPlannerRetryTest {
     state.gait_time = .4;
     state.body_clock_valid = true;
     state.body_time = .5;
-    state.gait_paused = true;
+    state.gait_paused = false;
     state.contact_confirmed = {true, true, false, true};
     state.contact_estimated.fill(false);
     // 회전·이동한 odom에서도 몸통 축 상대 기구학 여유가 같아야 한다.
@@ -149,7 +149,7 @@ struct TerrainPlannerRetryTest {
     node.OnTimer();
     Started(safe);
     Check(!node.kinematic_braking_ && (safe->command - requested).norm() < 1e-12,
-          "safe wait or nonstance foot suppressed requested command");
+          "safe walking or nonstance foot suppressed requested command");
     Check(std::abs(node.stance_reach_margin_ - .20) < 1e-12,
           "rotated hip-to-foot distance or CoM offset was incorrect");
     Finish(node, safe);
@@ -170,10 +170,11 @@ struct TerrainPlannerRetryTest {
     Check(node.kinematic_braking_ && node.stance_reach_leg_ == 0 &&
           (node.applied_command_ - requested).norm() < 1e-12 &&
           (node.command_ - requested).norm() < 1e-12,
-          "braking overwrote operator command or used measured contacts");
+          "walking failed to brake from confirmed stance reach or overwrote the operator command");
     Finish(node, brake);
 
     auto band = Install(node);
+    state.gait_paused = true;
     set_margin(0, .12);
     update();
     node.OnTimer();
@@ -208,9 +209,16 @@ struct TerrainPlannerRetryTest {
     state.gait_paused = false;
     update();
     Started(walking);
-    Check(!node.kinematic_braking_ && walking->command.isZero(1e-12),
-          "gait resume jumped from zero to the saved command");
+    Check(node.kinematic_braking_ && walking->command.isZero(1e-12),
+          "gait resume released braking while stance reach was still unsafe");
     Finish(node, walking);
+    auto reach_recovered = Install(node);
+    set_margin(0, .16);
+    update();
+    Started(reach_recovered);
+    Check(!node.kinematic_braking_ && reach_recovered->command.isZero(1e-12),
+          "walking reach recovery failed to release braking continuously");
+    Finish(node, reach_recovered);
     const double resume_time = state.body_time;
     auto recovering = Install(node);
     state.body_time += .048;
@@ -243,6 +251,7 @@ struct TerrainPlannerRetryTest {
     node.braking_command_filter_active_ = true;
     auto reset = Install(node);
     ++state.gait_epoch_ns;
+    for (int leg = 0; leg < 4; ++leg) set_margin(leg, .20);
     state.contact_confirmed.fill(true);
     state.body_time = 0;
     update();

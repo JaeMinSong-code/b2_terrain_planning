@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.19
+ * @version 0.0.20
+ * @update 2026-10-23: 착지 대기 여부와 무관하게 현재 stance 다리의 도달 여유로 감속을 판정함.
  * @update 2026-10-23: 이륙 전 스윙 시작점은 측정 위치로 갱신하고 진행 중 곡선만 고정함.
- * @update 2026-10-23: 감속 진입·해제의 계산 목표를 몸통 시각 기반 변화율 제한으로 연결함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -199,13 +199,13 @@ class TerrainPlannerNode : public rclcpp::Node {
     command_slot_ = slot;
   }
 
-  // 측정 odom/FK의 고관절-발 거리로 판단한다. 대기가 없으면 감속하지 않으며,
+  // 착지 대기 여부와 무관하게 측정 odom/FK의 현재 고관절-발 거리로 판단한다.
   // 비지지발과 측정 접촉 OFF는 WBC stance의 도달 여유 판정을 바꾸지 않는다.
   bool UpdateKinematicBraking(const State& state) {
     const bool previous = kinematic_braking_;
     stance_reach_margin_ = std::numeric_limits<double>::infinity();
     stance_reach_leg_ = -1;
-    if (!state.gait_clock_valid || !state.gait_paused) {
+    if (!state.gait_clock_valid) {
       kinematic_braking_ = false;
       return previous != kinematic_braking_;
     }
