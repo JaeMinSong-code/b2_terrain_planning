@@ -1,9 +1,9 @@
 /**
  * @file planner_retry_test.cpp
  * @brief 지연·실패를 주입해 비동기 재계획과 성공해 보존 및 발행 차단을 검증한다.
- * @version 0.0.6
+ * @version 0.0.7
+ * @update 2026-10-23: 감속·복귀 변화율, 재진입 연속성, 중복 상태와 세션 초기화를 검증함.
  * @update 2026-10-23: 도달 여유 조건부 감속·히스테리시스·명령 복원과 계산 중 전환을 검증함.
- * @update 2026-10-23: 착지 대기의 두 지지·세 지지·네 지지 재개 계획 전달을 검증함.
  */
 #define B2_TERRAIN_PLANNER_NO_MAIN
 #include "../src/terrain_planner_node.cpp"
@@ -99,6 +99,7 @@ struct TerrainPlannerRetryTest {
     node.retry_seed_.reset();
     node.published_plans_.clear();
     node.kinematic_braking_ = false;
+    node.ResetBrakingCommand();
     const Eigen::Vector3d requested(.30, -.10, .40);
     node.command_ = requested;
     node.applied_command_ = requested;
@@ -163,8 +164,9 @@ struct TerrainPlannerRetryTest {
     auto brake = Install(node);
     Finish(node, before_brake);
     Started(brake);
-    Check(node.last_published_stamp_ns_ == published_before && brake->command.isZero(),
-          "pre-braking snapshot published or zero-target retry did not start");
+    Check(node.last_published_stamp_ns_ == published_before &&
+          (brake->command - requested).norm() < 1e-12,
+          "pre-braking snapshot published or braking entry jumped the command");
     Check(node.kinematic_braking_ && node.stance_reach_leg_ == 0 &&
           (node.applied_command_ - requested).norm() < 1e-12 &&
           (node.command_ - requested).norm() < 1e-12,
@@ -176,29 +178,78 @@ struct TerrainPlannerRetryTest {
     update();
     node.OnTimer();
     Started(band);
-    Check(node.kinematic_braking_ && band->command.isZero(), "braking chattered in hysteresis band");
+    Check(node.kinematic_braking_ && band->command.head<2>().norm() < requested.head<2>().norm() &&
+          std::abs((band->command - requested).head<2>().norm() - .002) < 1e-12 &&
+          std::abs(band->command.z() - requested.z() + .002) < 1e-12,
+          "braking failed to ramp on advancing body time during gait pause");
     Finish(node, band);
     auto release = Install(node);
     set_margin(0, .16);
     update();
     Started(release);
-    Check(!node.kinematic_braking_ && (release->command - requested).norm() < 1e-12,
-          "recovered reach did not restore saved command");
+    Check(!node.kinematic_braking_ && (release->command - band->command).norm() < 1e-12,
+          "recovered reach jumped to the saved command");
     Finish(node, release);
 
     auto reenter = Install(node);
     set_margin(0, .08);
     update();
     Started(reenter);
-    Check(reenter->command.isZero(), "repeated unsafe wait did not brake");
+    Check((reenter->command - release->command).norm() < 1e-12,
+          "braking reentry reset the command");
     Finish(node, reenter);
+    // 보행 시각은 정지한 채 몸통 시각만 진행해 실제 감속 목표가 0에 도달하는지 확인한다.
+    for (int i = 0; i < 25; ++i) {
+      state.body_time += .018;
+      update();
+    }
+    Check(node.filtered_command_.isZero(1e-12), "sustained braking did not reach zero");
     auto walking = Install(node);
     state.gait_paused = false;
     update();
     Started(walking);
-    Check(!node.kinematic_braking_ && (walking->command - requested).norm() < 1e-12,
-          "normal walking inherited wait braking");
+    Check(!node.kinematic_braking_ && walking->command.isZero(1e-12),
+          "gait resume jumped from zero to the saved command");
     Finish(node, walking);
+    const double resume_time = state.body_time;
+    auto recovering = Install(node);
+    state.body_time += .048;
+    update();
+    node.OnTimer();
+    Started(recovering);
+    Check(std::abs(recovering->command.head<2>().norm() - .05) < 1e-12 &&
+          std::abs(recovering->command.z() - .05) < 1e-12,
+          "recovery exceeded linear/yaw command rates");
+    const Eigen::Vector3d snapshot = node.filtered_command_;
+    node.OnTimer();
+    node.OnTimer();
+    Check((snapshot - node.filtered_command_).norm() < 1e-12,
+          "same-state retries advanced recovery");
+    // 목표가 다음 상태에서 이동해도 계산 중 후보를 계속 폐기하지 않는다.
+    update();
+    const auto before_recovery = node.last_published_stamp_ns_;
+    Finish(node, recovering);
+    Check(node.last_published_stamp_ns_ > before_recovery,
+          "continuous command ramp discarded an otherwise valid solve");
+    for (int i = 0; i < 25; ++i) {
+      state.body_time += .018;
+      update();
+    }
+    Check(state.body_time > resume_time + .5 &&
+          (node.filtered_command_ - requested).norm() < 1e-12 &&
+          !node.braking_command_filter_active_, "recovery failed to reach the saved command");
+    // 새 세션에서는 이전 감속의 시간과 목표를 상속하지 않는다.
+    node.filtered_command_.setZero();
+    node.braking_command_filter_active_ = true;
+    auto reset = Install(node);
+    ++state.gait_epoch_ns;
+    state.contact_confirmed.fill(true);
+    state.body_time = 0;
+    update();
+    Started(reset);
+    Check((reset->command - requested).norm() < 1e-12 &&
+          !node.braking_command_filter_active_, "new epoch retained old braking recovery");
+    Finish(node, reset);
   }
 
   static void Run() {
@@ -432,7 +483,7 @@ struct TerrainPlannerRetryTest {
           "hold checked fictitious future touchdown or skipped real supports");
     std::cout << "PASS seed preservation, nonblocking state, immediate/bounded retries, "
                  "epoch/pause/command/clock publication guards, latched stance support, "
-                 "reach-gated braking and command restoration\n";
+                 "reach-gated braking, rate-limited command recovery and epoch reset\n";
   }
 };
 

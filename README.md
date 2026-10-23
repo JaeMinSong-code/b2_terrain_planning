@@ -362,19 +362,30 @@ WBC stance와 보행 대기 상태가 유지되면 추정 접촉 변동만으로
 대기(`gait_paused`) 중에도 도달 여유가 충분하면 속도 명령을 유지한다. 각 WBC stance 발의
 측정 고관절–발 거리와 URDF 관절 제한 최대 길이 차이 중 최솟값이
 `kinematic_braking.enter_margin_m`(기본 0.10 m) 이하이면 이번 TAMOLS 계산의
-vx/vy/yaw-rate 목표만 0으로 바꾼다. 지지발 여유가
+vx/vy/yaw-rate 계산 목표를 직전 목표에서 0을 향해 점진적으로 줄인다. 지지발 여유가
 `kinematic_braking.release_margin_m`(기본 0.14 m) 이상으로 회복되거나 대기가 풀리면
-보관한 명령을 복원한다. 입력 명령과 보행 구간별 확정 명령은 지우지 않으며 기존 명령
+직전 계산 목표에서 보관한 명령을 향해 점진적으로 복귀한다. 입력 명령과 보행 구간별 확정 명령은 지우지 않으며 기존 명령
 만료·확정 규칙을 따른다. 감속 목표에도 기존 몸통 p/v 연결·0.14초 앞부분과 최종 IK 검사는
 유지하므로 실제 속도를 순간적으로 0으로 만드는 기능이 아니다. 이 거리는 반경 방향
 신장 여유이며 모든 관절 방향의 여유나 감속 성공 보장은 아니다. 이미 한계에 도달했거나
 계산/인계가 늦으면 계획 만료 보호가 동작할 수 있다.
 
+목표 변화율은 `kinematic_braking.linear_rate_mps2`(기본 1.0 m/s², XY 벡터 노름)와
+`kinematic_braking.yaw_rate_radps2`(기본 1.0 rad/s²)로 제한한다. 감속 진입·해제 표본은
+직전 목표를 유지하고 이후 유효 상태의 몸통 시각 차이만큼 진행한다. legacy 입력은 상태
+stamp 차이를 쓰며, 동일 상태 재시도는 목표를 진행시키지 않는다. 감속 해제 후에도 원래
+명령에 도달할 때까지 제한을 유지하고 새 세션·시각 초기화에서 필터를 초기화한다.
+이 제한은 감속 사건과 그 복귀에만 적용하며 일반 명령 확정 규칙은 유지한다. 각 solve의
+목표는 여전히 horizon 전체에 같은 값이며 시간별 목표 곡선이나 기구학 기반 감속률은 아니다.
+기존 지지 일정과 z 제약은 유지한다. 변화율 기본값은 시험 시작값이며 단차·급정지·폐루프
+안정성을 보장하지 않는다.
+
 거리 계산은 제어 odom의 base 위치·자세와 FK 발 위치를 쓰고, 비지지발·추정 접촉 변동은
 판정에서 제외한다. 진입·해제는 즉시 재계획을 요청하고, 계산 중 감속 상태가 바뀐 결과는
 `kinematic_braking_changed_after_solve`로 발행을 보류한다. `effective_command`는 감속이
 반영된 계산 목표를 표시한다. `pipeline_status`에는 `kinematic_braking_entered/released`
-이벤트와 `kinematic_braking`, `stance_reach_margin_m`, `stance_reach_leg`가 기록된다.
+이벤트와 `kinematic_braking`, `stance_reach_margin_m`, `stance_reach_leg`,
+`braking_command_filter_active`, `effective_command`가 기록된다.
 
 실패·발행 보류는 `previous_`를 지우지 않는다. 마지막 발행 성공해를 다음 초기값으로 넘기고,
 Solve 내부의 보행 시각·모델·지도 호환성 검사와 착지점 재검사를 그대로 거친다.

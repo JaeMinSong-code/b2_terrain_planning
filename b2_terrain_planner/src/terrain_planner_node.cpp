@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.17
+ * @version 0.0.18
+ * @update 2026-10-23: 감속 진입·해제의 계산 목표를 몸통 시각 기반 변화율 제한으로 연결함.
  * @update 2026-10-23: 계산 시도별 입력·결과·발행 판정을 구조화 ROS 로그에 보존함.
- * @update 2026-10-23: 보행 대기 중 지지발 도달 여유에 따른 조건부 감속과 명령 복원을 추가함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -14,6 +14,7 @@
 #include "b2_terrain_planner/swing_reference.h"
 #include "b2_terrain_planner/committed_swing.h"
 
+#include <algorithm>
 #include <array>
 #include <deque>
 #include <cmath>
@@ -119,6 +120,14 @@ class TerrainPlannerNode : public rclcpp::Node {
         braking_enter_margin_ <= 0 || braking_release_margin_ <= braking_enter_margin_ ||
         braking_release_margin_ >= robot_.reach_max.minCoeff()) {
       throw std::invalid_argument("kinematic braking margins must satisfy 0 < enter < release < reach");
+    }
+    braking_linear_rate_ = declare_parameter<double>(
+        "kinematic_braking.linear_rate_mps2", 1.0);
+    braking_yaw_rate_ = declare_parameter<double>(
+        "kinematic_braking.yaw_rate_radps2", 1.0);
+    if (!std::isfinite(braking_linear_rate_) || braking_linear_rate_ <= 0 ||
+        !std::isfinite(braking_yaw_rate_) || braking_yaw_rate_ <= 0) {
+      throw std::invalid_argument("kinematic braking command rates must be positive and finite");
     }
     ConfigureSettings();
 
@@ -227,6 +236,47 @@ class TerrainPlannerNode : public rclcpp::Node {
     return previous != kinematic_braking_;
   }
 
+  void ResetBrakingCommand() {
+    braking_command_time_.reset();
+    braking_command_filter_active_ = false;
+    filtered_command_.setZero();
+  }
+
+  // 감속 사건과 복귀 중에만 목표 변화율을 제한한다. 동일 상태 재시도는 진행시키지 않는다.
+  void UpdateBrakingCommand(const State& state, bool braking_changed = false) {
+    double time = rclcpp::Time(state.header.stamp).seconds();
+    if (state.body_clock_valid) time = state.body_time;
+    double dt = 0.0;
+    if (braking_command_time_) {
+      dt = std::max(0.0, time - *braking_command_time_);
+    } else {
+      filtered_command_ = applied_command_;
+    }
+    braking_command_time_ = time;
+    if (braking_changed) {
+      braking_command_filter_active_ = true;
+      // 이번 표본에서 발견한 전환을 이전 표본 사이의 시간에 소급 적용하지 않는다.
+      dt = 0.0;
+    }
+    if (!braking_command_filter_active_) {
+      filtered_command_ = applied_command_;
+      return;
+    }
+    Eigen::Vector3d target = applied_command_;
+    if (kinematic_braking_) target.setZero();
+    Eigen::Vector2d delta = target.head<2>() - filtered_command_.head<2>();
+    const double max_linear_delta = braking_linear_rate_ * dt;
+    if (delta.norm() > max_linear_delta) delta *= max_linear_delta / delta.norm();
+    filtered_command_.head<2>() += delta;
+    const double max_yaw_delta = braking_yaw_rate_ * dt;
+    filtered_command_.z() += std::clamp(target.z() - filtered_command_.z(),
+                                      -max_yaw_delta, max_yaw_delta);
+    if (!kinematic_braking_ && (target - filtered_command_).norm() < 1e-12) {
+      filtered_command_ = target;
+      braking_command_filter_active_ = false;
+    }
+  }
+
   // 단일 executor에서 관찰한 원래 판정 결과만 기록한다. 진단은 재계획을 유발하지 않는다.
   void PublishPipelineStatus(const char* event, const char* reason, int leg = -1,
                              std::int64_t received_stamp_ns = 0) {
@@ -249,6 +299,9 @@ class TerrainPlannerNode : public rclcpp::Node {
         << ",\"map_stamp_ns\":" << rclcpp::Time(map_stamp_).nanoseconds()
         << ",\"leg\":" << leg
         << ",\"kinematic_braking\":" << std::boolalpha << kinematic_braking_
+        << ",\"braking_command_filter_active\":" << braking_command_filter_active_
+        << ",\"effective_command\":[" << filtered_command_.x() << ','
+        << filtered_command_.y() << ',' << filtered_command_.z() << ']'
         << ",\"stance_reach_leg\":" << stance_reach_leg_
         << ",\"stance_reach_margin_m\":";
     if (std::isfinite(stance_reach_margin_)) out << stance_reach_margin_;
@@ -611,6 +664,7 @@ class TerrainPlannerNode : public rclcpp::Node {
       published_plans_.clear();
       command_slot_ = -1;
       applied_command_.setZero();
+      ResetBrakingCommand();
       swing_references_ = {};
       kinematic_braking_ = false;
     }
@@ -625,7 +679,9 @@ class TerrainPlannerNode : public rclcpp::Node {
     }
     state_ = msg;
     LatchCommand(msg);
-    if (UpdateKinematicBraking(msg)) {
+    const bool braking_changed = UpdateKinematicBraking(msg);
+    UpdateBrakingCommand(msg, braking_changed);
+    if (braking_changed) {
       replan = true;
       const char* event = "kinematic_braking_released";
       if (kinematic_braking_) event = "kinematic_braking_entered";
@@ -653,6 +709,7 @@ class TerrainPlannerNode : public rclcpp::Node {
       published_plans_.clear();
       command_slot_ = -1;
       applied_command_.setZero();
+      ResetBrakingCommand();
       epoch_ns_.reset();
       last_planned_ns_ = -1;
       command_stamp_.reset();
@@ -662,10 +719,12 @@ class TerrainPlannerNode : public rclcpp::Node {
       stance_reach_leg_ = -1;
     }
     last_clock_ns_ = current_time;
-    if (state_) LatchCommand(*state_);
-    // 보관한 사용자 명령과 이번 계산 목표를 분리한다. 위치·속도 연결은 기존 곡선을 따른다.
-    Eigen::Vector3d effective_command = applied_command_;
-    if (kinematic_braking_) effective_command.setZero();
+    if (state_) {
+      LatchCommand(*state_);
+      UpdateBrakingCommand(*state_);
+    }
+    // 원본·구간 확정 명령은 보존하고, 이번 계산에는 감속·복귀가 반영된 목표를 사용한다.
+    const Eigen::Vector3d effective_command = filtered_command_;
     geometry_msgs::msg::TwistStamped command_message;
     command_message.header.stamp = now();
     command_message.header.frame_id = "base_heading";
@@ -1087,6 +1146,10 @@ class TerrainPlannerNode : public rclcpp::Node {
   Eigen::Vector3d command_ = Eigen::Vector3d::Zero();
   Eigen::Vector3d applied_command_ = Eigen::Vector3d::Zero();
   bool kinematic_braking_ = false;
+  Eigen::Vector3d filtered_command_ = Eigen::Vector3d::Zero();
+  std::optional<double> braking_command_time_;
+  bool braking_command_filter_active_ = false;
+  double braking_linear_rate_ = 1.0, braking_yaw_rate_ = 1.0;
   double braking_enter_margin_ = 0.10, braking_release_margin_ = 0.14;
   double stance_reach_margin_ = std::numeric_limits<double>::infinity();
   int stance_reach_leg_ = -1;
