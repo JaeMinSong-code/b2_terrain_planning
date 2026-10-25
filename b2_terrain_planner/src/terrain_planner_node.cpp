@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.20
- * @update 2026-10-23: 착지 대기 여부와 무관하게 현재 stance 다리의 도달 여유로 감속을 판정함.
- * @update 2026-10-23: 이륙 전 스윙 시작점은 측정 위치로 갱신하고 진행 중 곡선만 고정함.
+ * @version 0.0.23
+ * @update 2026-10-25: 기존 두 감속 트리거를 착지 대기 정지 시한·도달 여유 제약으로 교체함.
+ * @update 2026-10-25: 실패 시드 체인이 발산(2배)하거나 3회 소진되면 폐기해 발행 정체 고착을 차단함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -114,20 +114,10 @@ class TerrainPlannerNode : public rclcpp::Node {
     }
 
     InitRobot();
-    braking_enter_margin_ = declare_parameter<double>("kinematic_braking.enter_margin_m", 0.10);
-    braking_release_margin_ = declare_parameter<double>("kinematic_braking.release_margin_m", 0.14);
-    if (!std::isfinite(braking_enter_margin_) || !std::isfinite(braking_release_margin_) ||
-        braking_enter_margin_ <= 0 || braking_release_margin_ <= braking_enter_margin_ ||
-        braking_release_margin_ >= robot_.reach_max.minCoeff()) {
-      throw std::invalid_argument("kinematic braking margins must satisfy 0 < enter < release < reach");
-    }
-    braking_linear_rate_ = declare_parameter<double>(
-        "kinematic_braking.linear_rate_mps2", 1.0);
-    braking_yaw_rate_ = declare_parameter<double>(
-        "kinematic_braking.yaw_rate_radps2", 1.0);
-    if (!std::isfinite(braking_linear_rate_) || braking_linear_rate_ <= 0 ||
-        !std::isfinite(braking_yaw_rate_) || braking_yaw_rate_ <= 0) {
-      throw std::invalid_argument("kinematic braking command rates must be positive and finite");
+    stop_reach_margin_ = declare_parameter<double>("touchdown_stop.reach_margin_m", 0.02);
+    if (!std::isfinite(stop_reach_margin_) || stop_reach_margin_ <= 0 ||
+        stop_reach_margin_ >= (robot_.reach_max - robot_.reach_min).minCoeff()) {
+      throw std::invalid_argument("touchdown stop reach margin must fit the leg workspace");
     }
     ConfigureSettings();
 
@@ -161,7 +151,7 @@ class TerrainPlannerNode : public rclcpp::Node {
     State state;
     builtin_interfaces::msg::Time map_stamp;
     std::uint64_t generation = 0;
-    bool kinematic_braking = false;
+    std::optional<double> stop_deadline;
   };
 
   struct PublishedPlan {
@@ -198,83 +188,34 @@ class TerrainPlannerNode : public rclcpp::Node {
     applied_command_ = EffectiveCommand();
     command_slot_ = slot;
   }
-
-  // 착지 대기 여부와 무관하게 측정 odom/FK의 현재 고관절-발 거리로 판단한다.
-  // 비지지발과 측정 접촉 OFF는 WBC stance의 도달 여유 판정을 바꾸지 않는다.
-  bool UpdateKinematicBraking(const State& state) {
-    const bool previous = kinematic_braking_;
-    stance_reach_margin_ = std::numeric_limits<double>::infinity();
-    stance_reach_leg_ = -1;
-    if (!state.gait_clock_valid) {
-      kinematic_braking_ = false;
-      return previous != kinematic_braking_;
-    }
-    const Eigen::Quaterniond orientation(state.base_orientation.w, state.base_orientation.x,
-        state.base_orientation.y, state.base_orientation.z);
-    const Eigen::Matrix3d rotation = orientation.normalized().toRotationMatrix();
-    const Eigen::Vector3d base(state.base_position.x, state.base_position.y, state.base_position.z);
-    for (int leg = 0; leg < 4; ++leg) {
-      if (!state.contact_confirmed[leg]) continue;
-      // robot.hips는 CoM 상대값이므로 nominal CoM offset을 더해 base 상대값을 복원한다.
-      const Eigen::Vector3d hip = base + rotation *
-          (robot_.hips.row(leg).transpose() + robot_.com_offset);
-      const auto& point = state.foot_position[leg];
-      const Eigen::Vector3d foot(point.x, point.y, point.z);
-      const double margin = robot_.reach_max[leg] - (foot - hip).norm();
-      if (margin < stance_reach_margin_) {
-        stance_reach_margin_ = margin;
-        stance_reach_leg_ = leg;
+  // 최초 미확인 착지에서만 시한을 만든다. 실패·재발행·같은 상태 수신으로 연장하지 않는다.
+  bool UpdateTouchdownStop(const State& state) {
+    const bool was_stopping = stop_deadline_.has_value();
+    bool missing = false;
+    if (state.gait_clock_valid && state.body_clock_valid) {
+      const auto phases = MakeHorizon(state.gait_time, robot_.period, robot_.duty);
+      for (int leg = 0; leg < 4; ++leg) {
+        if (phases.front().contacts[leg] && !state.contact_confirmed[leg]) missing = true;
       }
     }
-    if (stance_reach_leg_ < 0) {
-      kinematic_braking_ = false;
-    } else if (kinematic_braking_) {
-      if (stance_reach_margin_ >= braking_release_margin_) kinematic_braking_ = false;
-    } else if (stance_reach_margin_ <= braking_enter_margin_) {
-      kinematic_braking_ = true;
-    }
-    return previous != kinematic_braking_;
-  }
-
-  void ResetBrakingCommand() {
-    braking_command_time_.reset();
-    braking_command_filter_active_ = false;
-    filtered_command_.setZero();
-  }
-
-  // 감속 사건과 복귀 중에만 목표 변화율을 제한한다. 동일 상태 재시도는 진행시키지 않는다.
-  void UpdateBrakingCommand(const State& state, bool braking_changed = false) {
-    double time = rclcpp::Time(state.header.stamp).seconds();
-    if (state.body_clock_valid) time = state.body_time;
-    double dt = 0.0;
-    if (braking_command_time_) {
-      dt = std::max(0.0, time - *braking_command_time_);
+    if (missing) {
+      if (!stop_deadline_) stop_deadline_ = state.body_time + robot_.period;
     } else {
-      filtered_command_ = applied_command_;
+      // 실제 착지가 확인되면 현재 감속 곡선과 연결해 정상 보행을 재개한다.
+      stop_deadline_.reset();
     }
-    braking_command_time_ = time;
-    if (braking_changed) {
-      braking_command_filter_active_ = true;
-      // 이번 표본에서 발견한 전환을 이전 표본 사이의 시간에 소급 적용하지 않는다.
-      dt = 0.0;
-    }
-    if (!braking_command_filter_active_) {
-      filtered_command_ = applied_command_;
-      return;
-    }
-    Eigen::Vector3d target = applied_command_;
-    if (kinematic_braking_) target.setZero();
-    Eigen::Vector2d delta = target.head<2>() - filtered_command_.head<2>();
-    const double max_linear_delta = braking_linear_rate_ * dt;
-    if (delta.norm() > max_linear_delta) delta *= max_linear_delta / delta.norm();
-    filtered_command_.head<2>() += delta;
-    const double max_yaw_delta = braking_yaw_rate_ * dt;
-    filtered_command_.z() += std::clamp(target.z() - filtered_command_.z(),
-                                      -max_yaw_delta, max_yaw_delta);
-    if (!kinematic_braking_ && (target - filtered_command_).norm() < 1e-12) {
-      filtered_command_ = target;
-      braking_command_filter_active_ = false;
-    }
+    return was_stopping != stop_deadline_.has_value();
+  }
+
+  Eigen::Vector3d PlanningCommand() const {
+    if (stop_deadline_) return Eigen::Vector3d::Zero();
+    return applied_command_;
+  }
+
+  void DiscardRetrySeed() {
+    retry_seed_.reset();
+    retry_seed_failures_ = 0;
+    retry_seed_violation_ = std::numeric_limits<double>::infinity();
   }
 
   // 단일 executor에서 관찰한 원래 판정 결과만 기록한다. 진단은 재계획을 유발하지 않는다.
@@ -298,14 +239,12 @@ class TerrainPlannerNode : public rclcpp::Node {
         << ",\"solve_end_ns\":" << solve_end_ns_
         << ",\"map_stamp_ns\":" << rclcpp::Time(map_stamp_).nanoseconds()
         << ",\"leg\":" << leg
-        << ",\"kinematic_braking\":" << std::boolalpha << kinematic_braking_
-        << ",\"braking_command_filter_active\":" << braking_command_filter_active_
-        << ",\"effective_command\":[" << filtered_command_.x() << ','
-        << filtered_command_.y() << ',' << filtered_command_.z() << ']'
-        << ",\"stance_reach_leg\":" << stance_reach_leg_
-        << ",\"stance_reach_margin_m\":";
-    if (std::isfinite(stance_reach_margin_)) out << stance_reach_margin_;
+        << ",\"touchdown_stop\":" << std::boolalpha << stop_deadline_.has_value()
+        << ",\"stop_deadline_body_time\":";
+    if (stop_deadline_) out << *stop_deadline_;
     else out << "null";
+    const Eigen::Vector3d command = PlanningCommand();
+    out << ",\"effective_command\":[" << command.x() << ',' << command.y() << ',' << command.z() << ']';
     if (state_) {
       out << ",\"state_stamp_ns\":" << rclcpp::Time(state_->header.stamp).nanoseconds()
           << ",\"gait_epoch_ns\":" << state_->gait_epoch_ns
@@ -317,7 +256,7 @@ class TerrainPlannerNode : public rclcpp::Node {
     }
     if (pending_solve_) {
       const auto& pending = *pending_solve_;
-      out << ",\"solve_kinematic_braking\":" << pending.kinematic_braking
+      out << ",\"solve_touchdown_stop\":" << pending.stop_deadline.has_value()
           << ",\"solve_command\":[" << pending.input.command.x() << ','
           << pending.input.command.y() << ',' << pending.input.command.z() << ']'
           << ",\"solve_contact_confirmed\":[";
@@ -375,7 +314,9 @@ class TerrainPlannerNode : public rclcpp::Node {
         << ",\"stage\":" << std::quoted(result.stage)
         << ",\"optimization_started\":" << optimization_started
         << ",\"publication_reason\":" << std::quoted(publication_reason)
-        << ",\"kinematic_braking\":" << pending.kinematic_braking
+        << ",\"touchdown_stop\":" << input.touchdown_stop_time.has_value()
+        << ",\"stop_remaining_sec\":" << number(input.touchdown_stop_time.value_or(-1.0))
+        << ",\"stop_reach_margin_m\":" << number(input.stop_reach_margin)
         << ",\"parent_plan_stamp_ns\":" << pending.state.active_plan_stamp_ns
         << ",\"prefix_duration\":" << number(input.prefix_duration)
         << ",\"attempt_seq\":" << attempt_seq_
@@ -476,8 +417,8 @@ class TerrainPlannerNode : public rclcpp::Node {
     settings_.projection_rank_tolerance = 1e-9;
     settings_.projection_residual_tolerance = 5e-7;
     settings_.qp_regularization = 0.3;
-    settings_.realtime_iterations = 5;
-    settings_.sample_intervals = 12;
+    settings_.realtime_iterations = 2;
+    settings_.sample_intervals = 6;
     settings_.qp_eps_abs = 1e-3;
     settings_.qp_eps_rel = 1e-3;
     settings_.qp_max_iterations = 4000;
@@ -524,7 +465,8 @@ class TerrainPlannerNode : public rclcpp::Node {
 
     HeightMap hm;
     hm.resolution = res;
-    hm.frame = msg.header.frame_id.empty() ? frame_ : msg.header.frame_id;
+    hm.frame = msg.header.frame_id;
+    if (hm.frame.empty()) hm.frame = frame_;
     // 내 격자: col↔x(증가), row↔y(증가), origin=(0,0) 셀 중심.
     hm.origin = Eigen::Vector2d(cx - msg.info.length_x / 2.0 + 0.5 * res,
                                cy - msg.info.length_y / 2.0 + 0.5 * res);
@@ -656,13 +598,12 @@ class TerrainPlannerNode : public rclcpp::Node {
       ++generation_;
       retry_requested_ = true;
       previous_.reset();
-      retry_seed_.reset();
+      DiscardRetrySeed();
       published_plans_.clear();
       command_slot_ = -1;
       applied_command_.setZero();
-      ResetBrakingCommand();
+      stop_deadline_.reset();
       swing_references_ = {};
-      kinematic_braking_ = false;
     }
     bool replan = state_ && state_->gait_paused != msg.gait_paused;
     if (state_ && msg.plan_adoption_status > 1 &&
@@ -675,13 +616,11 @@ class TerrainPlannerNode : public rclcpp::Node {
     }
     state_ = msg;
     LatchCommand(msg);
-    const bool braking_changed = UpdateKinematicBraking(msg);
-    UpdateBrakingCommand(msg, braking_changed);
-    if (braking_changed) {
+    if (UpdateTouchdownStop(msg)) {
       replan = true;
-      const char* event = "kinematic_braking_released";
-      if (kinematic_braking_) event = "kinematic_braking_entered";
-      PublishPipelineStatus(event, "stance_reach_margin", stance_reach_leg_, stamp);
+      const char* event = "touchdown_stop_released";
+      if (stop_deadline_) event = "touchdown_stop_entered";
+      PublishPipelineStatus(event, "landing_confirmation", -1, stamp);
     }
     // 후보를 발행했다고 실행된 것으로 간주하지 않는다. WBC가 확인한 스윙만 고정한다.
     if (const auto* active = ActivePlan()) swing_references_ = active->swings;
@@ -701,26 +640,23 @@ class TerrainPlannerNode : public rclcpp::Node {
       state_.reset();
       terrain_.reset();
       previous_.reset();
-      retry_seed_.reset();
+      DiscardRetrySeed();
       published_plans_.clear();
       command_slot_ = -1;
       applied_command_.setZero();
-      ResetBrakingCommand();
+      stop_deadline_.reset();
       epoch_ns_.reset();
       last_planned_ns_ = -1;
       command_stamp_.reset();
       if (!command_topic_.empty()) command_.setZero();
-      kinematic_braking_ = false;
-      stance_reach_margin_ = std::numeric_limits<double>::infinity();
-      stance_reach_leg_ = -1;
     }
     last_clock_ns_ = current_time;
     if (state_) {
       LatchCommand(*state_);
-      UpdateBrakingCommand(*state_);
+      UpdateTouchdownStop(*state_);
     }
-    // 원본·구간 확정 명령은 보존하고, 이번 계산에는 감속·복귀가 반영된 목표를 사용한다.
-    const Eigen::Vector3d effective_command = filtered_command_;
+    // 대기 정지는 단순 명령 변경 외에 아래의 종단·도달 제약을 함께 적용한다.
+    const Eigen::Vector3d effective_command = PlanningCommand();
     geometry_msgs::msg::TwistStamped command_message;
     command_message.header.stamp = now();
     command_message.header.frame_id = "base_heading";
@@ -823,6 +759,13 @@ class TerrainPlannerNode : public rclcpp::Node {
         return;
       }
     }
+    if (stop_deadline_) {
+      input.gait_hold_duration = robot_.period;
+      input.hold_contacts = state.contact_confirmed;
+      input.touchdown_stop_time = std::clamp(*stop_deadline_ - state.body_time, 0.0, robot_.period);
+      input.stop_reach_margin = stop_reach_margin_;
+      input.command.setZero();
+    }
     input.contact_estimated = state.contact_estimated;
     input.position << state.com_position.x, state.com_position.y, state.com_position.z,
                       ypr[0], ypr[1], ypr[2];
@@ -865,7 +808,7 @@ class TerrainPlannerNode : public rclcpp::Node {
     same_state_retry_used_ = stamp_ns == last_planned_ns_;
     last_planned_ns_ = stamp_ns;
     retry_requested_ = false;
-    pending_solve_ = PendingSolve{input, state, map_stamp_, generation_, kinematic_braking_};
+    pending_solve_ = PendingSolve{input, state, map_stamp_, generation_, stop_deadline_};
     ++attempt_seq_;
     solve_state_stamp_ns_ = stamp_ns;
     solve_start_ns_ = now().nanoseconds();
@@ -912,8 +855,8 @@ class TerrainPlannerNode : public rclcpp::Node {
       reason = "state_not_fresh_after_solve";
     }
     if (publishable) {
-      publishable = pending.kinematic_braking == kinematic_braking_;
-      reason = "kinematic_braking_changed_after_solve";
+      publishable = pending.stop_deadline == stop_deadline_;
+      reason = "touchdown_stop_changed_after_solve";
     }
     if (publishable && state.gait_clock_valid) {
       publishable = state.active_plan_stamp_ns == state_->active_plan_stamp_ns;
@@ -943,11 +886,26 @@ class TerrainPlannerNode : public rclcpp::Node {
     // 명령은 계산 입력의 snapshot이다. 새 명령 수신은 성공해 발행을 취소하지 않는다.
     if (!result.success) {
       // 실패 반복값은 성공 계획과 별도 보관한다. 부모/세션이 같은 계산에서만 재사용한다.
-      if (result.seed_available && !result.phases.empty() &&
+      // 시드 체인이 발산하거나 소진되면 폐기해 다음 계산을 마지막 발행 계획에서 시작한다.
+      // 발행 정체 중에는 부모가 바뀌지 않아 오염된 시드가 영원히 유효 판정을 받기 때문이다.
+      bool store_seed = result.seed_available && !result.phases.empty() &&
           result.coefficients.size() == result.phases.size() &&
           result.margins.size() == result.phases.size() &&
           pending.generation == generation_ && state_ &&
-          state.active_plan_stamp_ns == state_->active_plan_stamp_ns) {
+          state.active_plan_stamp_ns == state_->active_plan_stamp_ns;
+      const bool used_retry_seed =
+          result.warm_start.reason.rfind("shifted_retry_iterate", 0) == 0;
+      if (used_retry_seed) {
+        const bool diverged =
+            result.violation > 2.0 * retry_seed_violation_ + 1e-9;
+        if (++retry_seed_failures_ >= 3 || diverged) {
+          store_seed = false;
+          const char* reason = "chain_exhausted";
+          if (diverged) reason = "violation_diverged";
+          PublishPipelineStatus("retry_seed_discarded", reason);
+        }
+      }
+      if (store_seed) {
         retry_seed_ = result;
         if (input.reference_prefix) {
           retry_seed_ = SpliceBody(*input.reference_prefix,
@@ -955,6 +913,10 @@ class TerrainPlannerNode : public rclcpp::Node {
               result, input.prefix_duration);
         }
         retry_seed_parent_ns_ = state.active_plan_stamp_ns;
+        if (!used_retry_seed) retry_seed_failures_ = 1;
+        retry_seed_violation_ = result.violation;
+      } else {
+        DiscardRetrySeed();
       }
       PublishSolveStatus(result, pending, false, "solve_failed");
       PublishPipelineStatus("solve_failed", result.status.c_str());
@@ -970,7 +932,7 @@ class TerrainPlannerNode : public rclcpp::Node {
       Publish(result, input, state);
       // 실제 발행한 몸통 곡선을 다음 계산의 초기값으로 보관한다.
       previous_ = published_plans_.back().body;
-      retry_seed_.reset();
+      DiscardRetrySeed();
       PublishSolveStatus(result, pending, true, "published");
     }
     // 실패해도 마지막 성공해는 보존한다. Solve 내부가 시간·모델·지형 호환성을 재검사한다.
@@ -1141,14 +1103,8 @@ class TerrainPlannerNode : public rclcpp::Node {
   Settings settings_;
   Eigen::Vector3d command_ = Eigen::Vector3d::Zero();
   Eigen::Vector3d applied_command_ = Eigen::Vector3d::Zero();
-  bool kinematic_braking_ = false;
-  Eigen::Vector3d filtered_command_ = Eigen::Vector3d::Zero();
-  std::optional<double> braking_command_time_;
-  bool braking_command_filter_active_ = false;
-  double braking_linear_rate_ = 1.0, braking_yaw_rate_ = 1.0;
-  double braking_enter_margin_ = 0.10, braking_release_margin_ = 0.14;
-  double stance_reach_margin_ = std::numeric_limits<double>::infinity();
-  int stance_reach_leg_ = -1;
+  std::optional<double> stop_deadline_;
+  double stop_reach_margin_ = 0.02;
   std::int64_t command_slot_ = -1;
   std::deque<PublishedPlan> published_plans_;
   std::string command_topic_;
@@ -1164,6 +1120,8 @@ class TerrainPlannerNode : public rclcpp::Node {
   std::optional<Result> previous_;
   std::optional<Result> retry_seed_;
   std::int64_t retry_seed_parent_ns_ = 0;
+  int retry_seed_failures_ = 0;
+  double retry_seed_violation_ = std::numeric_limits<double>::infinity();
   std::function<Result(const Robot&, const Input&, const Settings&, const Result*)> solver_ = Solve;
   std::future<std::pair<Result, std::int64_t>> solve_future_;
   std::optional<PendingSolve> pending_solve_;

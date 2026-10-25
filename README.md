@@ -130,6 +130,17 @@ OSQP 1.x는 C API가 달라 직접 호환되지 않는다.
 ```
 
 CPU 산출물은 `build/`, ROS 산출물은 `.perception/`에 생성한다.
+`b2_deploy_ws`의 기본 MuJoCo 런처는 워크스페이스 `~/ros2_ws/install`의 노드를 실행하므로
+이 런처로 시험할 때는 아래 경로도 빌드해야 한다. `.perception`만 갱신하면 반영되지 않는다.
+
+```bash
+cd ~/ros2_ws
+source /opt/ros/humble/setup.bash
+colcon build --base-paths src --packages-select b2_terrain_planner --executor sequential \
+  --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DPython3_EXECUTABLE=/usr/bin/python3
+ctest --test-dir build/b2_terrain_planner --output-on-failure
+```
+
 CPU 빌드와 실행에는 ROS·GPU·CasADi·IPOPT가 필요하지 않다.
 OSQP 위치는 CMake의 `OSQP_INCLUDE_DIR`, `OSQP_LIBRARY`,
 RBDL 위치는 `RBDL_DIR` 또는 `CUSTOM_RBDL_PATH`로 지정할 수 있다.
@@ -323,7 +334,7 @@ throttle 없이 기록하며, 동일 계산/부모의 반복 보류만 최초 �
 `stage=not_started`, `status=solve_exception: ...`로 기록될 수 있으며 진입 여부를
 확정할 수 없는 예외로 취급하며 `optimization_started=null`을 기록한다. `terrain_attempts`에는 내부 지지면 재시도 결과도 남긴다.
 
-`command`, `kinematic_braking`, `contact_confirmed`, `contact_estimated`,
+`command`, `touchdown_stop`, `contact_confirmed`, `contact_estimated`,
 `parent_plan_stamp_ns`, `prefix_duration`은 해당 계산 입력 snapshot이다.
 `published`/`publication_reason`으로 계산 성공과 발행 성공을 구분한다.
 `attempt_seq`로 시작/결과를 연결하고 입력 `state_stamp_ns`를 B2 ROS 로그의
@@ -362,35 +373,33 @@ Solve는 입력·설정·직전 성공해의 복사본으로 별도 작업에서
 계산 중 epoch·보행 시각 초기화·접촉 위상·실행 계획이 바뀌면 결과를 발행하지 않는다.
 WBC stance와 보행 대기 상태가 유지되면 추정 접촉 변동만으로 대기·재개 계획을 버리지 않는다.
 
-착지 대기(`gait_paused`) 여부와 무관하게 현재 다리 길이로 감속을 판정한다. 각 WBC stance 발의
-측정 고관절–발 거리와 URDF 관절 제한 최대 길이 차이 중 최솟값이
-`kinematic_braking.enter_margin_m`(기본 0.10 m) 이하이면 이번 TAMOLS 계산의
-vx/vy/yaw-rate 계산 목표를 직전 목표에서 0을 향해 점진적으로 줄인다. 지지발 여유가
-`kinematic_braking.release_margin_m`(기본 0.14 m) 이상으로 회복되면
-직전 계산 목표에서 보관한 명령을 향해 점진적으로 복귀한다. 보행 재개 자체는 감속을
-해제하지 않는다. 판단은 현재 측정한 길이 여유를 사용하며 미래 궤적 예측은 추가하지 않는다.
-입력 명령과 보행 구간별 확정 명령은 지우지 않으며 기존 명령
-만료·확정 규칙을 따른다. 감속 목표에도 기존 몸통 p/v 연결·0.14초 앞부분과 최종 IK 검사는
-유지하므로 실제 속도를 순간적으로 0으로 만드는 기능이 아니다. 이 거리는 반경 방향
-신장 여유이며 모든 관절 방향의 여유나 감속 성공 보장은 아니다. 이미 한계에 도달했거나
-계산/인계가 늦으면 계획 만료 보호가 동작할 수 있다.
+착지 예정 발이 아직 WBC stance로 확인되지 않으면 즉시 정지 계획을 요청한다.
+기존 다리 여유 0.10m 진입/0.14m 해제 감속과 발행 정체 0.2초 명령 램프는 제거했다.
+일반 보행 명령은 기존 확정 규칙을 따르며, 착지 대기 중에만 속도 목표를 0으로 둔다.
+명령만 낮추는 방식과 달리 다음 조건을 TAMOLS 최적화에 함께 적용한다.
 
-목표 변화율은 `kinematic_braking.linear_rate_mps2`(기본 1.0 m/s², XY 벡터 노름)와
-`kinematic_braking.yaw_rate_radps2`(기본 1.0 rad/s²)로 제한한다. 감속 진입·해제 표본은
-직전 목표를 유지하고 이후 유효 상태의 몸통 시각 차이만큼 진행한다. legacy 입력은 상태
-stamp 차이를 쓰며, 동일 상태 재시도는 목표를 진행시키지 않는다. 감속 해제 후에도 원래
-명령에 도달할 때까지 제한을 유지하고 새 세션·시각 초기화에서 필터를 초기화한다.
-이 제한은 감속 사건과 그 복귀에만 적용하며 일반 명령 확정 규칙은 유지한다. 각 solve의
-목표는 여전히 horizon 전체에 같은 값이며 시간별 목표 곡선이나 기구학 기반 감속률은 아니다.
-기존 지지 일정과 z 제약은 유지한다. 변화율 기본값은 시험 시작값이며 단차·급정지·폐루프
-안정성을 보장하지 않는다.
+- 최초 대기의 `body_time + 0.8초`를 정지 시한으로 보관한다. 실패·재계획·지지 추가로
+  시한을 연장하지 않으며 각 입력의 `touchdown_stop_time`은 남은 시간이다.
+- 정지 시각의 XYZ·yaw/pitch/roll 속도와 가속도를 0으로 만들고 이후 다항식은 상수로
+  유지한다. 고정 앞부분의 p/v와 기존 인계 계약은 유지한다.
+- 지지 다리 최대 도달 길이에서 `touchdown_stop.reach_margin_m`(기본 0.02m)을
+  제외한 범위 안에서 감속 곡선을 최적화한다. 0.8초 동안 일정 감속을 강제하지 않는다.
+  정지 전 도달 여유가 소진되지 않도록 곡선의 형상을 조정한다.
+- 정지 계획은 구간당 최소 12등분으로 최적화 제약을 평가하고, 최종 48등분 도달 검사와
+  실제 관절 제한 IK 검사를 통과한 경우에만 발행한다. 평시 설정은 2회·6등분이다.
+- 착지가 먼저 확인되면 현재 감속 곡선과 연결한 정상 보행 계획으로 재개한다.
+  계속 미확인이라면 시한 이후에도 정지 위치를 유지한다. 추정 접촉 ON만으로 해제하지 않는다.
 
-거리 계산은 제어 odom의 base 위치·자세와 FK 발 위치를 쓰고, 비지지발·추정 접촉 변동은
-판정에서 제외한다. 진입·해제는 즉시 재계획을 요청하고, 계산 중 감속 상태가 바뀐 결과는
-`kinematic_braking_changed_after_solve`로 발행을 보류한다. `effective_command`는 감속이
-반영된 계산 목표를 표시한다. `pipeline_status`에는 `kinematic_braking_entered/released`
-이벤트와 `kinematic_braking`, `stance_reach_margin_m`, `stance_reach_leg`,
-`braking_command_filter_active`, `effective_command`가 기록된다.
+`pipeline_status`에는 `touchdown_stop_entered/released`, `touchdown_stop`,
+`stop_deadline_body_time`, `effective_command`를 기록한다. `TAMOLS_SOLVE`의
+`stop_remaining_sec`, `stop_reach_margin_m`으로 시한과 여유를 확인한다.
+계산 중 대기 진입·해제가 바뀐 후보는 `touchdown_stop_changed_after_solve`로 거부한다.
+정지 계획의 warm start는 최초 진입 시 정지 다항식을 만들고, 이후 같은 시한의 계획을 이동해 재사용한다.
+
+이 제약은 발행된 기준 궤적의 조건이다. 이미 고정 앞부분이 한계를 넘거나 현재 지지만으로
+정지할 수 없는 입력은 성공으로 처리하지 않는다. 도달 여유는 반경 길이 기준이며 관절별
+각도 여유를 뜻하지 않는다. 계산·실제 추종·폐루프 안정성을 보장하는 독립 복구 제어는 아니다.
+특히 대각 2지지에서 임의의 횡방향 속도를 가진 입력의 정지해는 없거나 solver가 찾지 못할 수 있다.
 
 실패·발행 보류는 `previous_`를 지우지 않는다. 마지막 발행 성공해를 다음 초기값으로 넘기고,
 Solve 내부의 보행 시각·모델·지도 호환성 검사와 착지점 재검사를 그대로 거친다.

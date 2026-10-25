@@ -1,9 +1,9 @@
 /**
  * @file planner.h
  * @brief 평지·지형 trot의 SQP 입력·출력 및 시간 구간 계획 계약.
- * @version 0.0.27
+ * @version 0.0.28
+ * @update 2026-10-25: 착지 대기의 정지 시한과 지지 다리 도달 여유 계약을 추가함.
  * @update 2026-10-23: 최적화 진입 여부와 실패 단계의 진단 필드를 추가함.
- * @update 2026-10-21: 착지 대기 중 몸통 시간 진행과 유한 재계획·보행 재개 연속성을 반영함.
  */
 #ifndef B2_TERRAIN_PLANNER_PLANNER_H_
 #define B2_TERRAIN_PLANNER_PLANNER_H_
@@ -55,6 +55,10 @@ struct Input {
   std::optional<double> body_time;
   double gait_hold_duration = 0.0;
   std::optional<std::array<bool, 4>> hold_contacts;
+  // 현재 horizon 기준 정지 시각. 지정하면 전 구간 대기, 해당 시각 이후 p 고정·v/a=0.
+  // 노드는 최초 대기의 절대 몸통 시각을 보관해 재계획 시 이 값을 감소시킨다.
+  std::optional<double> touchdown_stop_time;
+  double stop_reach_margin = 0.02;  // 지지 다리 최대 도달 길이에서 남길 거리 [m].
   Feet feet = Feet::Zero();
   Eigen::Vector3d command = Eigen::Vector3d::Zero();  // Body vx/vy, yaw rate.
   double gait_time = 0.0;
@@ -210,6 +214,7 @@ struct SeedContext {
   std::optional<double> body_time;
   double gait_hold_duration = 0.0;
   std::optional<std::array<bool, 4>> hold_contacts;
+  std::optional<double> touchdown_stop_time;
 };
 
 // 연속 몸통의 warm start/인계에는 body time, 발 위상에는 gait time을 사용한다.

@@ -1,9 +1,9 @@
 /**
  * @file planner.cpp
  * @brief 접촉 조합별 생성 Jacobian과 지형 비용의 Gauss–Newton QP로 trot을 최적화한다.
- * @version 0.0.35
+ * @version 0.0.36
+ * @update 2026-10-25: 착지 대기 정지·정지 후 유지와 도달 여유를 최적화 및 최종 검사에 적용함.
  * @update 2026-10-23: 현재 지지발의 지도 높이 불일치에 따른 입력 거부를 제거함.
- * @update 2026-10-23: 입력·문제 구성·초기화·최적화·최종 검증의 실패 단계를 보존함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -260,24 +260,32 @@ class Problem {
             input.gait_hold_duration, input.hold_contacts)),
         profile_(profile), full_evaluation_(full_evaluation), terrain_(terrain),
         block_assembly_(block_assembly), polynomial_tail_(polynomial_tail) {
+    std::vector<double> splits;
     if (input_.reference_prefix) {
-      std::vector<double> splits{input_.prefix_duration};
+      splits.push_back(input_.prefix_duration);
       const double shift = BodyTime(input_) - BodyTime(input_.reference_prefix->seed_context);
       for (const auto& phase : input_.reference_prefix->phases) {
         const double split = phase.start - shift;
         if (input_.prefix_duration == 0 || split < input_.prefix_duration) splits.push_back(split);
       }
-      for (double split : splits) {
-        for (std::size_t k = 0; k < phases_.size(); ++k) {
-          const auto old = phases_[k];
-          if (split > old.start + 1e-9 && split < old.start + old.duration - 1e-9) {
-            Phase tail = old;
-            tail.start = split;
-            tail.duration = old.start + old.duration - tail.start;
-            phases_[k].duration = tail.start - old.start;
-            phases_.insert(phases_.begin() + k + 1, tail);
-            break;
-          }
+    }
+    if (input_.touchdown_stop_time) {
+      const double stop = *input_.touchdown_stop_time;
+      splits.push_back(stop);
+      // 정지까지 두 다항식을 사용해 지지 안정성과 도달 여유 안에서 감속 형상을 조정한다.
+      if (stop > input_.prefix_duration) splits.push_back((stop + input_.prefix_duration) * .5);
+    }
+    std::sort(splits.begin(), splits.end());
+    for (double split : splits) {
+      for (std::size_t k = 0; k < phases_.size(); ++k) {
+        const auto old = phases_[k];
+        if (split > old.start + 1e-9 && split < old.start + old.duration - 1e-9) {
+          Phase tail = old;
+          tail.start = split;
+          tail.duration = old.start + old.duration - tail.start;
+          phases_[k].duration = tail.start - old.start;
+          phases_.insert(phases_.begin() + k + 1, tail);
+          break;
         }
       }
     }
@@ -333,6 +341,11 @@ class Problem {
     parameters_.segment<4>(45) = robot.reach_min;
     parameters_.segment<4>(49) = robot.reach_max;
     parameters_[53] = std::sqrt(vz_weight);
+    if (input_.touchdown_stop_time) {
+      parameters_.segment<3>(26).setZero();
+      parameters_[25] -= input_.stop_reach_margin;
+      parameters_.segment<4>(49).array() -= input_.stop_reach_margin;
+    }
     backward_weight_ = backward_weight;
     Eigen::Vector3d world_command(input.command.x(), input.command.y(), 0.0);
     world_command = Eigen::AngleAxisd(input.position[3], Eigen::Vector3d::UnitZ()) * world_command;
@@ -397,8 +410,54 @@ class Problem {
         x.segment<3>(feet_offset_ + 3 * leg) = terrain_initial_.row(leg).transpose();
       }
     }
+    if (input_.touchdown_stop_time) InitializeStop(&x);
     SetFixedPrefix(&x);
     return x;
+  }
+
+  // 위치·속도를 유지하며 v/a=0으로 끝나는 4차 초기값. 최종 곡선은 SQP가 조정한다.
+  void InitializeStop(Vector* x) const {
+    double begin = 0.0;
+    Vector6 position = input_.position;
+    Vector6 velocity = input_.velocity;
+    Vector6 acceleration = Vector6::Zero();
+    if (input_.reference_prefix) {
+      begin = input_.prefix_duration;
+      const double source_time = BodyTime(input_) -
+          BodyTime(input_.reference_prefix->seed_context) + begin;
+      position = b2_terrain_planner::Evaluate(*input_.reference_prefix, source_time);
+      velocity = b2_terrain_planner::Evaluate(*input_.reference_prefix, source_time, 1);
+      acceleration = b2_terrain_planner::Evaluate(*input_.reference_prefix, source_time, 2);
+    }
+    const double duration = *input_.touchdown_stop_time - begin;
+    Eigen::Matrix<double, 6, 5> polynomial = Eigen::Matrix<double, 6, 5>::Zero();
+    polynomial.col(0) = position;
+    if (duration > 1e-9) {
+      polynomial.col(1) = velocity * duration;
+      polynomial.col(2) = .5 * acceleration * duration * duration;
+      polynomial.col(3) = -velocity * duration - (2.0 / 3.0) * acceleration * duration * duration;
+      polynomial.col(4) = .5 * velocity * duration + .25 * acceleration * duration * duration;
+    }
+    for (std::size_t k = 0; k < phases_.size(); ++k) {
+      const auto& phase = phases_[k];
+      if (fixed_prefix_[k]) continue;
+      Eigen::Matrix<double, 6, 5, Eigen::RowMajor> coefficients =
+          Eigen::Matrix<double, 6, 5, Eigen::RowMajor>::Zero();
+      if (duration <= 1e-9 || phase.start >= *input_.touchdown_stop_time - 1e-9) {
+        coefficients.col(0) = polynomial.rowwise().sum();
+      } else {
+        const double offset = (phase.start - begin) / duration;
+        for (int power = 0; power < 5; ++power) {
+          for (int degree = power; degree < 5; ++degree) {
+            double binomial = 1.0;
+            for (int j = 1; j <= power; ++j) binomial *= double(degree - j + 1) / j;
+            coefficients.col(power) += polynomial.col(degree) * binomial *
+                std::pow(offset, degree - power) * std::pow(phase.duration / duration, power);
+          }
+        }
+      }
+      x->segment<30>(30 * k) = Eigen::Map<const Vector>(coefficients.data(), 30);
+    }
   }
 
   Vector Initial(const Result* previous, WarmStartDiagnostic* diagnostic, int replaced_leg = -1) const {
@@ -407,6 +466,15 @@ class Problem {
     diagnostic->requested = true;
     const auto& old = *previous;
     const auto& context = old.seed_context;
+    // 보행 초기값을 정지 문제에 그대로 넣지 않는다. 같은 정지 시한의 재계획만 이동 재사용한다.
+    if (input_.touchdown_stop_time &&
+        (!context.touchdown_stop_time ||
+         std::abs(*input_.touchdown_stop_time - std::max(0.0,
+             *context.touchdown_stop_time - (BodyTime(input_) - BodyTime(context)))) > 1e-8)) {
+      diagnostic->reason = "touchdown_stop_initial";
+      return x;
+    }
+
     auto reject = [&](const char* reason) {
       diagnostic->reason = reason;
       return x;
@@ -681,6 +749,7 @@ class Problem {
     const bool need_cost = mode != EvaluationMode::kConstraintJacobian;
     const bool compact = block_assembly_ && mode == EvaluationMode::kConstraintJacobian;
     if (intervals == 0) intervals = intervals_;
+    if (input_.touchdown_stop_time) intervals = std::max(intervals, 12);
     Evaluation out;
     if (full) {
       out.gradient = Vector::Zero(size_);
@@ -814,9 +883,14 @@ class Problem {
         }
       } else {
         int continuity = 12;
+        if (input_.touchdown_stop_time && k > 0 &&
+            phases_[k - 1].start >= *input_.touchdown_stop_time - 1e-9) {
+          continuity = 6;  // 양쪽 고정 구간의 v=0 연결은 계수 제약에 이미 포함된다.
+        }
         Matrix start = SampleTransform(k, 0.0).topRows(continuity);
         Vector target = Vector::Zero(continuity);
-        target.head<12>() << input_.position, input_.velocity;
+        target.head<6>() = input_.position;
+        if (continuity == 12) target.tail<6>() = input_.velocity;
         if (k == 0 && input_.reference_prefix && input_.prefix_duration == 0) {
           const double shift = BodyTime(input_) - BodyTime(input_.reference_prefix->seed_context);
           target.head<6>() = b2_terrain_planner::Evaluate(*input_.reference_prefix, shift);
@@ -852,6 +926,34 @@ class Problem {
         if (full) {
           out.gradient.noalias() += 2 * jacobian.transpose() * residual;
           out.hessian.noalias() += 2 * jacobian.transpose() * jacobian;
+        }
+      }
+      if (input_.touchdown_stop_time && !fixed_prefix_[k]) {
+        group = kStructure;
+        const double stop = *input_.touchdown_stop_time;
+        if (phases_[k].start >= stop - 1e-9) {
+          // 정지 이후 다항식의 모든 미분 계수를 0으로 고정한다.
+          for (int axis = 0; axis < 6; ++axis) {
+            for (int power = 1; power < 5; ++power) {
+              if (k == 0 && power == 1) continue;  // 초기 속도 등식과 중복하지 않는다.
+              const int column = 30 * k + 5 * axis + power;
+              add(x[column], 0.0, 0.0);
+              if (need_jacobian) rows.push_back(Eigen::RowVectorXd::Unit(size_, column));
+            }
+          }
+        } else if (std::abs(phases_[k].start + phases_[k].duration - stop) < 1e-9) {
+          int first_row = 6;
+          int row_count = 12;
+          if (k + 1 < static_cast<int>(phases_.size())) {
+            first_row = 12;
+            row_count = 6;  // v=0은 다음 고정 구간과의 C1 연결로 강제된다.
+          }
+          const Matrix end = SampleTransform(k, 1.0).middleRows(first_row, row_count);
+          const Vector value = end * x;
+          for (int row = 0; row < row_count; ++row) {
+            add(value[row], 0.0, 0.0);
+            if (need_jacobian) rows.push_back(end.row(row));
+          }
         }
       }
       if (margin_[k] >= 0) {
@@ -1130,6 +1232,37 @@ class Problem {
       }
     }
     return feet;
+  }
+
+  bool CheckStopReach(const Vector& x) const {
+    if (!input_.touchdown_stop_time) return true;
+    Result candidate;
+    candidate.success = true;
+    Export(x, &candidate);
+    if (input_.reference_prefix) {
+      candidate = SpliceBody(*input_.reference_prefix,
+          BodyTime(input_) - BodyTime(input_.reference_prefix->seed_context),
+          candidate, input_.prefix_duration);
+    }
+    for (const auto& phase : phases_) {
+      for (int sample = 0; sample <= 48; ++sample) {
+        const double time = phase.start + phase.duration * sample / 48.0;
+        const Vector6 pose = b2_terrain_planner::Evaluate(candidate, time);
+        if (time >= *input_.touchdown_stop_time - 1e-9 &&
+            (b2_terrain_planner::Evaluate(candidate, time, 1).norm() > 1e-4 ||
+             b2_terrain_planner::Evaluate(candidate, time, 2).norm() > 1e-4)) return false;
+        const Eigen::Matrix3d rotation = Rotation(pose);
+        for (int leg = 0; leg < 4; ++leg) {
+          if (!phase.contacts[leg]) continue;
+          const Eigen::Vector3d hip = pose.head<3>() + rotation * robot_.hips.row(leg).transpose();
+          double maximum = robot_.leg_max;
+          if (robot_.use_reference_legs) maximum = robot_.reach_max[leg];
+          if ((hip - input_.feet.row(leg).transpose()).norm() >
+              maximum - input_.stop_reach_margin + 1e-6) return false;
+        }
+      }
+    }
+    return true;
   }
 
   void CheckKinematics(const Vector& x, Result* result) const {
@@ -1937,6 +2070,15 @@ void Validate(const Robot& r, const Input& input, const Settings& settings) {
       input.gait_hold_duration > r.period ||
       std::abs(input.gait_time / r.period) > 1e6 ||
       (input.has_nominal && !input.nominal.allFinite())) throw std::invalid_argument("invalid planner input");
+  if (input.touchdown_stop_time &&
+      (!std::isfinite(*input.touchdown_stop_time) || *input.touchdown_stop_time < 0 ||
+       *input.touchdown_stop_time > r.period || input.gait_hold_duration != r.period ||
+       !input.hold_contacts || !std::isfinite(input.stop_reach_margin) ||
+       input.stop_reach_margin <= 0 || input.stop_reach_margin >= r.leg_max - r.leg_min ||
+       (r.use_reference_legs &&
+        input.stop_reach_margin >= (r.reach_max - r.reach_min).minCoeff()))) {
+    throw std::invalid_argument("invalid touchdown stop contract");
+  }
   if (input.reference_prefix && (!input.reference_prefix->success ||
       !std::isfinite(input.prefix_duration) || input.prefix_duration < 0 ||
       input.prefix_duration >= r.period || input.reference_prefix->coefficients.empty() ||
@@ -2140,7 +2282,7 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
   result.seed_context = {input.gait_time, robot.period, robot.duty, input.frame,
                          RobotSignature(robot), input.terrain.has_value(), input.feet,
                          TerrainSignature(input.terrain), input.body_time,
-                         input.gait_hold_duration, input.hold_contacts};
+                         input.gait_hold_duration, input.hold_contacts, input.touchdown_stop_time};
   try {
     ScopedTimer initialization_timer(&result.profile.initialization_seconds);
     result.stage = "input_validation";
@@ -2310,6 +2452,11 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
     if (elapsed() > settings.time_limit) {
       result.success = false;
       result.status = "time_limit";
+    }
+    if (result.success && !problem.CheckStopReach(x)) {
+      result.success = false;
+      result.status = "touchdown_stop_reach_failed";
+      result.stage = "final_validation";
     }
     if (result.success && robot.model) {
       result.stage = "kinematics_validation";
