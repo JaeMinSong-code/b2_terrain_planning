@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.25
+ * @version 0.0.26
+ * @update 2026-10-25: 착지 대기는 계획 입력만 0으로 덮고 사용자 램프는 계속 진행하도록 수정함.
  * @update 2026-10-25: 반걸음 명령 확정 대신 몸통 시각 기반 XY·yaw 속도 목표 램프를 적용함.
- * @update 2026-10-25: 착지 대기 감속을 속도 목표 0으로 단순화하고 정지 시한·추가 여유 입력을 제거함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -184,7 +184,7 @@ class TerrainPlannerNode : public rclcpp::Node {
     const double dt = time - *command_ramp_time_;
     if (dt <= 0.0) return;
     command_ramp_time_ = time;
-    if (touchdown_stop_) return;
+    // 착지 대기는 PlanningCommand에서만 적용한다. 사용자 램프는 계속 진행한다.
     const Eigen::Vector3d target = EffectiveCommand();
     const Eigen::Vector2d delta = target.head<2>() - applied_command_.head<2>();
     const double distance = delta.norm();
@@ -210,7 +210,6 @@ class TerrainPlannerNode : public rclcpp::Node {
         }
       }
     }
-    if (touchdown_stop_) applied_command_.setZero();
     return was_stopping != touchdown_stop_;
   }
 

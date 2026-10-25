@@ -1,9 +1,9 @@
 /**
  * @file planner_retry_test.cpp
  * @brief 지연·실패를 주입해 비동기 재계획과 성공해 보존 및 발행 차단을 검증한다.
- * @version 0.0.14
+ * @version 0.0.15
+ * @update 2026-10-25: 반복 착지 대기에도 사용자 목표에 도달하고 해제 시 유지된 램프를 쓰는지 검증함.
  * @update 2026-10-25: 스윙 중 명령 램프·XY 변화율·방향 반전·대기 후 램프 복귀를 검증함.
- * @update 2026-10-25: 착지 대기 속도 목표 0과 접촉 확인 후 명령 복귀를 검증함.
  */
 #define B2_TERRAIN_PLANNER_NO_MAIN
 #include "../src/terrain_planner_node.cpp"
@@ -132,14 +132,18 @@ struct TerrainPlannerRetryTest {
     Check(node.PlanningCommand().isZero(), "touchdown stop lost priority");
     state.body_time += .5;
     node.UpdateCommandRamp(state);
+    Check(node.PlanningCommand().isZero() &&
+          node.applied_command_.isApprox(Eigen::Vector3d(-.18, -.24, -.6), 1e-10),
+          "touchdown wait stopped the user ramp or lost zero override");
     state.contact_confirmed.fill(true);
     node.UpdateTouchdownStop(state);
     node.UpdateCommandRamp(state);
-    Check(node.PlanningCommand().isZero(), "resume jumped to saved request");
+    Check(node.PlanningCommand().isApprox(Eigen::Vector3d(-.18, -.24, -.6), 1e-10),
+          "resume did not use the preserved ramp");
     state.body_time += .02;
     node.UpdateCommandRamp(state);
-    Check(node.PlanningCommand().isApprox(Eigen::Vector3d(-.006, -.008, -.02), 1e-10),
-          "resume did not ramp from zero");
+    Check(node.PlanningCommand().isApprox(Eigen::Vector3d(-.186, -.248, -.62), 1e-10),
+          "resume restarted the user ramp");
     state.body_time += 2.0;
     node.UpdateCommandRamp(state);
     Check(node.PlanningCommand().isApprox(node.command_), "ramp overshot target");
@@ -149,6 +153,26 @@ struct TerrainPlannerRetryTest {
     node.UpdateCommandRamp(state);
     Check(node.PlanningCommand().isApprox(Eigen::Vector3d(-.27, -.36, -.9), 1e-10),
           "expired command did not ramp toward zero");
+    // 반복 대기마다 램프를 초기화하면 최대 속도에 영원히 도달하지 못하는 회귀를 재현한다.
+    node.command_topic_.clear();
+    node.command_ << .5, 0.0, .5;
+    node.applied_command_.setZero();
+    for (int tick = 1; tick <= 12; ++tick) {
+      state.contact_confirmed[2] = tick % 2 == 0;
+      node.UpdateTouchdownStop(state);
+      state.body_time += .1;
+      node.UpdateCommandRamp(state);
+      Check(std::abs(node.applied_command_.x() - std::min(.5, .05 * tick)) < 1e-10,
+            "repeated touchdown waits reset the user ramp");
+      if (node.touchdown_stop_) {
+        Check(node.PlanningCommand().isZero(), "wait lost zero override");
+      } else {
+        Check(node.PlanningCommand().isApprox(node.applied_command_),
+              "confirmed support did not expose the ongoing ramp");
+      }
+    }
+    Check(node.PlanningCommand().isApprox(node.command_),
+          "repeated touchdown waits prevented full command speed");
   }
 
   static void CheckTouchdownStop(TerrainPlannerNode& node) {
@@ -174,7 +198,7 @@ struct TerrainPlannerRetryTest {
     }
     state.contact_confirmed.fill(true);
     Check(node.UpdateTouchdownStop(state) && !node.touchdown_stop_ &&
-          node.PlanningCommand().isZero(), "confirmed landing jumped to saved command");
+          node.PlanningCommand().x() == .5, "confirmed landing did not restore preserved command");
   }
 
   static void CheckRetrySeedDiscard(TerrainPlannerNode& node) {
