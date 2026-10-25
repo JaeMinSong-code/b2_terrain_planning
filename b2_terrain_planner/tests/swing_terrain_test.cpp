@@ -127,6 +127,38 @@ void CheckSupportHeightOffset() {
   }
   std::cout << "PASS zero-command hold with +/-10mm support height offsets\n";
 }
+// 실지형 재현: 관측 높이는 알려졌지만 미관측 셀이 흩어져 필터 지원 영역(9x9)이
+// 어디에서도 전부 known이 아니다. 과거에는 모든 질의가 TerrainDomainError였고
+// 첫 계획 생성이 막혔다. 높이·경계 비용 유효성 분리 후에는 계획을 생성해야 한다.
+void CheckUnobservedNeighborhood() {
+  Robot robot;
+  Settings settings;
+  settings.time_limit = 3.0;
+  settings.sample_intervals = 4;
+  settings.structured_equalities = true;
+  settings.lapack_svd = true;
+  Input input = FlatInput(robot, 0.4);
+  HeightMap& map = *input.terrain;
+  // 0.35m(7셀) 간격의 고립 구멍. 어떤 9x9 창에도 구멍이 포함돼 필터 지원 영역은
+  // 비지만, 2x2 착지 블록은 대부분 관측 상태로 남는다.
+  int holes = 0;
+  for (int row = 3; row < map.valid.rows(); row += 7) {
+    for (int col = 3; col < map.valid.cols(); col += 7) {
+      map.valid(row, col) = 0;
+      ++holes;
+    }
+  }
+  Check(holes > 0, "test map had no unobserved cells");
+  const Result result = Solve(robot, input, settings);
+  Check(result.success && result.optimization_started,
+        "plan not generated on map with scattered unobserved cells: " + result.status);
+  for (int leg = 0; leg < 4; ++leg) {
+    Check(std::abs(result.footholds(leg, 2)) < settings.terrain.contact_tolerance,
+          "future landing left the observed ground height");
+  }
+  std::cout << "PASS first plan on map with " << holes
+            << " scattered holes, status=" << result.status << '\n';
+}
 }  // namespace
 
 int main() {
@@ -135,6 +167,7 @@ int main() {
     for (double time : {0.0, 0.2, 0.4, 0.6, 0.8}) Run(time);
     CheckDelayedContact();
     CheckSupportHeightOffset();
+    CheckUnobservedNeighborhood();
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

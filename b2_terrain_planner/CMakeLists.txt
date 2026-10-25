@@ -90,8 +90,11 @@ if(BUILD_TESTING)
     add_executable(terrain_reuse_test tests/terrain_reuse_test.cpp)
     target_link_libraries(terrain_reuse_test PRIVATE tamols_sqp)
     add_test(NAME terrain_reuse_test COMMAND terrain_reuse_test)
+    add_executable(terrain_validity_test tests/terrain_validity_test.cpp)
+    target_link_libraries(terrain_validity_test PRIVATE tamols_sqp)
+    add_test(NAME terrain_validity_test COMMAND terrain_validity_test)
     # ROS overlay의 설치본보다 방금 빌드한 라이브러리로 시험한다.
-    set_tests_properties(touchdown_stop_test support_combination_test committed_swing_test support_patch_test swing_terrain_test terrain_reuse_test PROPERTIES
+    set_tests_properties(touchdown_stop_test support_combination_test committed_swing_test support_patch_test swing_terrain_test terrain_reuse_test terrain_validity_test PROPERTIES
         ENVIRONMENT "OPENBLAS_NUM_THREADS=1;OMP_NUM_THREADS=1;LD_LIBRARY_PATH=$<TARGET_FILE_DIR:tamols_sqp>:$ENV{LD_LIBRARY_PATH}")
 endif()
 

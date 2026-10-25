@@ -1,7 +1,8 @@
 /**
  * @file terrain.h
  * @brief 정적 높이맵의 보간·유효성·착지 비용과 후보 검색 계약.
- * @version 0.0.6
+ * @version 0.0.7
+ * @update 2026-10-26: 착지 높이 조회 유효성과 평활·경계 비용 유효성을 분리함.
  * @update 2026-10-14: 맵 조회 가능 여부와 비용 계약에서 추가 하드 판정 설정을 제거함.
  * @update 2026-10-14: 예측 도달성 조건을 후보 검색에 선택적으로 적용함.
  */
@@ -81,6 +82,9 @@ class TerrainModel {
   HeightMap map_;
   TerrainSettings settings_;
   Eigen::MatrixXd gradients_[4];  // 원본·평활 높이의 X/Y 기울기.
+  // 착지 높이 조회 유효성(관측 높이 셀)과 평활·경계 비용 유효성(필터 지원 영역)을
+  // 분리한다. 주변 일부가 미관측이어도 관측된 착지 셀의 높이는 조회할 수 있다.
+  Eigen::ArrayXXi height_known_;
   Eigen::ArrayXXi usable_;
 };
 }  // namespace b2_terrain_planner

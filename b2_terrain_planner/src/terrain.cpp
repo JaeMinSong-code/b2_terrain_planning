@@ -1,7 +1,8 @@
 /**
  * @file terrain.cpp
  * @brief 유효성 보존 높이맵 필터와 일관된 보간 미분·착지 후보 검색.
- * @version 0.0.7
+ * @version 0.0.8
+ * @update 2026-10-26: 착지 높이 조회(관측 셀)와 경계 비용(필터 지원 영역) 유효성을 분리함.
  * @update 2026-10-14: 모서리 비용을 유지하고 주변 평탄성·기울기 하드 판정을 제거함.
  * @update 2026-10-14: 지지면 후보에 호출자가 제공한 도달성 조건을 적용함.
  */
@@ -115,9 +116,11 @@ TerrainModel::TerrainModel(const HeightMap& map,
                                (2 * map.resolution);
     }
   }
+  // 착지 높이 조회 유효성: 해당 셀의 관측 높이가 알려졌는가. 주변 미관측과 무관하다.
+  height_known_ = known;
   usable_ = Eigen::ArrayXXi::Zero(rows, cols);
   const int halo = radius + 1;
-  // 필터와 중앙차분 지원 영역 전체가 유효한 내부만 사용한다.
+  // 평활·경계 비용 유효성: 필터와 중앙차분 지원 영역 전체가 known인 내부만.
   for (int row = halo; row < rows - halo; ++row) {
     for (int col = halo; col < cols - halo; ++col) {
       usable_(row, col) = known.block(row - halo, col - halo,
@@ -135,8 +138,10 @@ TerrainSample TerrainModel::Sample(const Eigen::Vector2d& xy) const {
   }
   const int col = static_cast<int>(std::floor(index.x()));
   const int row = static_cast<int>(std::floor(index.y()));
-  if (!usable_.block<2, 2>(row, col).all()) {
-    throw TerrainDomainError("terrain query has unknown or uncertain support");
+  // 착지 높이는 보간에 쓰는 네 셀의 관측 높이만 있으면 조회한다. 주변이 미관측이라도
+  // 관측된 착지 영역을 사용 불가능으로 만들지 않는다.
+  if (!height_known_.block<2, 2>(row, col).all()) {
+    throw TerrainDomainError("terrain query has unknown landing height");
   }
   const double x = index.x() - col;
   const double y = index.y() - row;
@@ -144,10 +149,15 @@ TerrainSample TerrainModel::Sample(const Eigen::Vector2d& xy) const {
   const auto height = Bilinear(map_.heights, row, col, x, y, map_.resolution);
   result.height = height.value;
   result.gradient = height.gradient;
-  for (int axis = 0; axis < 4; ++axis) {
-    const auto edge = Bilinear(gradients_[axis], row, col, x, y, map_.resolution);
-    result.edge[axis] = edge.value;
-    result.edge_jacobian.row(axis) = edge.gradient.transpose();
+  // 평활 높이의 중앙차분으로 만든 경계 비용은 필터 지원 영역 전체가 known일 때만
+  // 유효하다. 주변이 미관측이면 경계 항을 0으로 두어(비용·그라디언트 없음) 착지
+  // 높이 조회는 유지하되 미관측에서 비롯한 오염된 경계 비용을 쓰지 않는다.
+  if (usable_.block<2, 2>(row, col).all()) {
+    for (int axis = 0; axis < 4; ++axis) {
+      const auto edge = Bilinear(gradients_[axis], row, col, x, y, map_.resolution);
+      result.edge[axis] = edge.value;
+      result.edge_jacobian.row(axis) = edge.gradient.transpose();
+    }
   }
   return result;
 }
