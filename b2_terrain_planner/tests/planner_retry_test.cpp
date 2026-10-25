@@ -1,9 +1,9 @@
 /**
  * @file planner_retry_test.cpp
  * @brief 지연·실패를 주입해 비동기 재계획과 성공해 보존 및 발행 차단을 검증한다.
- * @version 0.0.13
+ * @version 0.0.14
+ * @update 2026-10-25: 스윙 중 명령 램프·XY 변화율·방향 반전·대기 후 램프 복귀를 검증함.
  * @update 2026-10-25: 착지 대기 속도 목표 0과 접촉 확인 후 명령 복귀를 검증함.
- * @update 2026-10-25: 착지 대기의 즉시 정지 입력·시한 유지·실측 접촉 오탐 내성을 검증함.
  */
 #define B2_TERRAIN_PLANNER_NO_MAIN
 #include "../src/terrain_planner_node.cpp"
@@ -98,6 +98,59 @@ struct TerrainPlannerRetryTest {
     node.CompleteSolve();
   }
 
+  static void CheckCommandRamp() {
+    TerrainPlannerNode node;
+    node.timer_->cancel();
+    node.completion_timer_->cancel();
+    node.command_ << .3, .4, 1.0;
+    TerrainPlannerNode::State state;
+    state.gait_clock_valid = true;
+    state.body_clock_valid = true;
+    state.gait_time = .2;  // 같은 스윙 안에서도 램프가 진행돼야 한다.
+    state.body_time = 10.0;
+    node.UpdateCommandRamp(state);
+    Check(node.PlanningCommand().isZero(), "initial ramp jumped to request");
+    state.body_time += .1;
+    node.UpdateCommandRamp(state);
+    Check(node.PlanningCommand().isApprox(Eigen::Vector3d(.03, .04, .1), 1e-10),
+          "XY vector or yaw ramp rate is incorrect");
+    node.UpdateCommandRamp(state);
+    Check(node.PlanningCommand().isApprox(Eigen::Vector3d(.03, .04, .1), 1e-10),
+          "same-state retry advanced ramp");
+    node.command_ << -.3, -.4, -1.0;
+    state.body_time += .1;
+    node.UpdateCommandRamp(state);
+    Check(node.PlanningCommand().isZero(1e-10), "reversal jumped across zero");
+    state.body_time += .1;
+    node.UpdateCommandRamp(state);
+    Check(node.PlanningCommand().isApprox(Eigen::Vector3d(-.03, -.04, -.1), 1e-10),
+          "reversal did not continue smoothly");
+    state.gait_time = .4;
+    state.contact_confirmed.fill(true);
+    state.contact_confirmed[2] = false;
+    node.UpdateTouchdownStop(state);
+    Check(node.PlanningCommand().isZero(), "touchdown stop lost priority");
+    state.body_time += .5;
+    node.UpdateCommandRamp(state);
+    state.contact_confirmed.fill(true);
+    node.UpdateTouchdownStop(state);
+    node.UpdateCommandRamp(state);
+    Check(node.PlanningCommand().isZero(), "resume jumped to saved request");
+    state.body_time += .02;
+    node.UpdateCommandRamp(state);
+    Check(node.PlanningCommand().isApprox(Eigen::Vector3d(-.006, -.008, -.02), 1e-10),
+          "resume did not ramp from zero");
+    state.body_time += 2.0;
+    node.UpdateCommandRamp(state);
+    Check(node.PlanningCommand().isApprox(node.command_), "ramp overshot target");
+    node.command_topic_ = "/test/command";
+    node.command_stamp_.reset();
+    state.body_time += .1;
+    node.UpdateCommandRamp(state);
+    Check(node.PlanningCommand().isApprox(Eigen::Vector3d(-.27, -.36, -.9), 1e-10),
+          "expired command did not ramp toward zero");
+  }
+
   static void CheckTouchdownStop(TerrainPlannerNode& node) {
     node.touchdown_stop_ = false;
     node.applied_command_ << .5, 0.0, .5;
@@ -121,7 +174,7 @@ struct TerrainPlannerRetryTest {
     }
     state.contact_confirmed.fill(true);
     Check(node.UpdateTouchdownStop(state) && !node.touchdown_stop_ &&
-          node.PlanningCommand().x() == .5, "confirmed landing did not restore saved command");
+          node.PlanningCommand().isZero(), "confirmed landing jumped to saved command");
   }
 
   static void CheckRetrySeedDiscard(TerrainPlannerNode& node) {
@@ -400,18 +453,18 @@ struct TerrainPlannerRetryTest {
     Finish(node, changed_command);
     Check(node.last_published_stamp_ns_ > before_command && !node.solve_future_.valid(),
           "incoming command discarded successful snapshot");
-    Check(node.applied_command_.isZero(), "command changed within the same step");
+    Check(node.applied_command_.isZero(), "command advanced without a new state time");
     state.gait_paused = false;
     auto next_command = Install(node);
     update(.4);
     node.OnTimer();
     Started(next_command);
-    Check(std::abs(next_command->command.x() - .1) < 1e-12,
-          "next confirmed stance did not latch pending command");
+    Check(next_command->command.x() > 0 && next_command->command.x() <= .1,
+          "new state did not advance command ramp");
     node.command_.x() = -.2;
     Finish(node, next_command);
-    Check(std::abs(node.applied_command_.x() - .1) < 1e-12,
-          "command changed during solve");
+    Check(node.applied_command_.isApprox(next_command->command),
+          "command advanced during solve without new state time");
 
     auto partial = Install(node, false);
     partial->export_seed = true;
@@ -505,6 +558,7 @@ struct TerrainPlannerRetryTest {
           "rolling replanning postponed gait resume forever");
     Check(node.last_published_stamp_ns_ > before_refresh,
           "estimated contact OFF blocked stance resume refresh");
+    CheckCommandRamp();
     CheckTouchdownStop(node);
     CheckRetrySeedDiscard(node);
     CheckSwingReferenceUpdates(node);
@@ -523,7 +577,7 @@ struct TerrainPlannerRetryTest {
           "hold still ran the removed final IK checker");
     std::cout << "PASS seed preservation, nonblocking state, immediate/bounded retries, "
                  "epoch/pause/command/clock publication guards, latched stance support, "
-                 "touchdown stop deadline, retry-seed discard, "
+                 "command ramp, touchdown stop, retry-seed discard, "
                  "epoch reset, and measured pre-liftoff origins\n";
   }
 };

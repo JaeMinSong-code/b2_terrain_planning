@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.24
+ * @version 0.0.25
+ * @update 2026-10-25: 반걸음 명령 확정 대신 몸통 시각 기반 XY·yaw 속도 목표 램프를 적용함.
  * @update 2026-10-25: 착지 대기 감속을 속도 목표 0으로 단순화하고 정지 시한·추가 여유 입력을 제거함.
- * @update 2026-10-25: 기존 두 감속 트리거를 착지 대기 정지 시한·도달 여유 제약으로 교체함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -102,6 +102,12 @@ class TerrainPlannerNode : public rclcpp::Node {
     if (!std::isfinite(command_timeout_) || command_timeout_ <= 0.0) {
       throw std::invalid_argument("command_timeout must be positive and finite");
     }
+    command_linear_accel_ = declare_parameter<double>("command_ramp.linear_accel", 0.5);
+    command_angular_accel_ = declare_parameter<double>("command_ramp.angular_accel", 1.0);
+    if (!std::isfinite(command_linear_accel_) || command_linear_accel_ <= 0.0 ||
+        !std::isfinite(command_angular_accel_) || command_angular_accel_ <= 0.0) {
+      throw std::invalid_argument("command_ramp acceleration must be positive and finite");
+    }
     effective_command_pub_ = create_publisher<geometry_msgs::msg::TwistStamped>(
         "~/effective_command", rclcpp::QoS(1));
     if (!command_topic_.empty()) {
@@ -168,20 +174,29 @@ class TerrainPlannerNode : public rclcpp::Node {
     return state.gait_time;
   }
 
-  void LatchCommand(const State& state) {
-    if (!state.gait_clock_valid) {
-      applied_command_ = EffectiveCommand();
+  void UpdateCommandRamp(const State& state) {
+    double time = rclcpp::Time(state.header.stamp).seconds();
+    if (state.body_clock_valid) time = state.body_time;
+    if (!command_ramp_time_) {
+      command_ramp_time_ = time;
       return;
     }
-    const auto nominal = MakeHorizon(state.gait_time, robot_.period, robot_.duty);
-    const auto slot = static_cast<std::int64_t>(std::floor(
-        2.0 * state.gait_time / robot_.period + 1e-9));
-    if (slot == command_slot_) return;
-    for (int leg = 0; leg < 4; ++leg) {
-      if (!nominal.front().contacts[leg] || !state.contact_confirmed[leg]) return;
+    const double dt = time - *command_ramp_time_;
+    if (dt <= 0.0) return;
+    command_ramp_time_ = time;
+    if (touchdown_stop_) return;
+    const Eigen::Vector3d target = EffectiveCommand();
+    const Eigen::Vector2d delta = target.head<2>() - applied_command_.head<2>();
+    const double distance = delta.norm();
+    const double step = command_linear_accel_ * dt;
+    if (distance > step) {
+      applied_command_.head<2>() += delta * (step / distance);
+    } else {
+      applied_command_.head<2>() = target.head<2>();
     }
-    applied_command_ = EffectiveCommand();
-    command_slot_ = slot;
+    const double yaw_step = command_angular_accel_ * dt;
+    applied_command_.z() += std::clamp(target.z() - applied_command_.z(),
+                                     -yaw_step, yaw_step);
   }
   // 예정 착지가 확인되지 않으면 기존 TAMOLS 속도 목표만 0으로 낮춘다.
   bool UpdateTouchdownStop(const State& state) {
@@ -195,6 +210,7 @@ class TerrainPlannerNode : public rclcpp::Node {
         }
       }
     }
+    if (touchdown_stop_) applied_command_.setZero();
     return was_stopping != touchdown_stop_;
   }
 
@@ -220,7 +236,8 @@ class TerrainPlannerNode : public rclcpp::Node {
         << ",\"ros_ns\":" << now().nanoseconds()
         << ",\"received_stamp_ns\":" << received_stamp_ns
         << ",\"solve_state_stamp_ns\":" << solve_state_stamp_ns_
-        << ",\"command_slot\":" << command_slot_
+        << ",\"ramped_command\":[" << applied_command_.x() << ','
+        << applied_command_.y() << ',' << applied_command_.z() << ']'
         << ",\"active_plan_stamp_ns\":" << (state_.value_or(State{}).active_plan_stamp_ns)
         << ",\"retry_requested\":" << std::boolalpha << retry_requested_
         << ",\"last_planned_ns\":" << last_planned_ns_
@@ -586,7 +603,7 @@ class TerrainPlannerNode : public rclcpp::Node {
       previous_.reset();
       DiscardRetrySeed();
       published_plans_.clear();
-      command_slot_ = -1;
+      command_ramp_time_.reset();
       applied_command_.setZero();
       touchdown_stop_ = false;
       swing_references_ = {};
@@ -601,13 +618,13 @@ class TerrainPlannerNode : public rclcpp::Node {
       }
     }
     state_ = msg;
-    LatchCommand(msg);
     if (UpdateTouchdownStop(msg)) {
       replan = true;
       const char* event = "touchdown_stop_released";
       if (touchdown_stop_) event = "touchdown_stop_entered";
       PublishPipelineStatus(event, "landing_confirmation", -1, stamp);
     }
+    UpdateCommandRamp(msg);
     // 후보를 발행했다고 실행된 것으로 간주하지 않는다. WBC가 확인한 스윙만 고정한다.
     if (const auto* active = ActivePlan()) swing_references_ = active->swings;
     // 위상을 멈추기 전에 착지해도 즉시 재계획한다. 미확인 지지는 OnTimer가 계획에서 제외한다.
@@ -628,7 +645,7 @@ class TerrainPlannerNode : public rclcpp::Node {
       previous_.reset();
       DiscardRetrySeed();
       published_plans_.clear();
-      command_slot_ = -1;
+      command_ramp_time_.reset();
       applied_command_.setZero();
       touchdown_stop_ = false;
       epoch_ns_.reset();
@@ -638,10 +655,10 @@ class TerrainPlannerNode : public rclcpp::Node {
     }
     last_clock_ns_ = current_time;
     if (state_) {
-      LatchCommand(*state_);
       UpdateTouchdownStop(*state_);
+      UpdateCommandRamp(*state_);
     }
-    // 대기 정지는 단순 명령 변경 외에 아래의 종단·도달 제약을 함께 적용한다.
+    // 램프한 사용자 목표를 사용하며 착지 대기는 속도 목표만 즉시 0으로 낮춘다.
     const Eigen::Vector3d effective_command = PlanningCommand();
     geometry_msgs::msg::TwistStamped command_message;
     command_message.header.stamp = now();
@@ -1083,7 +1100,9 @@ class TerrainPlannerNode : public rclcpp::Node {
   Eigen::Vector3d command_ = Eigen::Vector3d::Zero();
   Eigen::Vector3d applied_command_ = Eigen::Vector3d::Zero();
   bool touchdown_stop_ = false;
-  std::int64_t command_slot_ = -1;
+  std::optional<double> command_ramp_time_;
+  double command_linear_accel_ = 0.5;
+  double command_angular_accel_ = 1.0;
   std::deque<PublishedPlan> published_plans_;
   std::string command_topic_;
   double command_timeout_ = 0.25;
