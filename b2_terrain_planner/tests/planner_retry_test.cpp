@@ -1,9 +1,9 @@
 /**
  * @file planner_retry_test.cpp
  * @brief 지연·실패를 주입해 비동기 재계획과 성공해 보존 및 발행 차단을 검증한다.
- * @version 0.0.12
+ * @version 0.0.13
+ * @update 2026-10-25: 착지 대기 속도 목표 0과 접촉 확인 후 명령 복귀를 검증함.
  * @update 2026-10-25: 착지 대기의 즉시 정지 입력·시한 유지·실측 접촉 오탐 내성을 검증함.
- * @update 2026-10-25: 실패 시드 체인의 발산·소진 폐기와 마지막 발행 계획 복귀를 검증함.
  */
 #define B2_TERRAIN_PLANNER_NO_MAIN
 #include "../src/terrain_planner_node.cpp"
@@ -21,7 +21,6 @@ struct TerrainPlannerRetryTest {
     double gait_time = -1;
     double body_time = -1;
     double hold_duration = -1;
-    std::optional<double> stop_time;
     std::optional<std::array<bool, 4>> hold_contacts;
     std::optional<std::array<bool, 4>> contact_estimated;
     Eigen::Vector3d command = Eigen::Vector3d::Zero();
@@ -54,7 +53,6 @@ struct TerrainPlannerRetryTest {
       attempt->gait_time = input.gait_time;
       attempt->body_time = BodyTime(input);
       attempt->hold_duration = input.gait_hold_duration;
-      attempt->stop_time = input.touchdown_stop_time;
       attempt->hold_contacts = input.hold_contacts;
       attempt->contact_estimated = input.contact_estimated;
       attempt->command = input.command;
@@ -74,7 +72,6 @@ struct TerrainPlannerRetryTest {
       result.seed_context.body_time = input.body_time;
       result.seed_context.gait_hold_duration = input.gait_hold_duration;
       result.seed_context.hold_contacts = input.hold_contacts;
-      result.seed_context.touchdown_stop_time = input.touchdown_stop_time;
       result.phases = MakeHorizon(input.gait_time, robot.period, robot.duty,
           input.gait_hold_duration, input.hold_contacts);
       result.footholds = input.feet;
@@ -102,7 +99,7 @@ struct TerrainPlannerRetryTest {
   }
 
   static void CheckTouchdownStop(TerrainPlannerNode& node) {
-    node.stop_deadline_.reset();
+    node.touchdown_stop_ = false;
     node.applied_command_ << .5, 0.0, .5;
     TerrainPlannerNode::State state;
     state.gait_clock_valid = true;
@@ -110,21 +107,20 @@ struct TerrainPlannerRetryTest {
     state.gait_time = .4;
     state.body_time = 10.0;
     state.contact_confirmed.fill(true);
-    Check(!node.UpdateTouchdownStop(state) && !node.stop_deadline_ &&
+    Check(!node.UpdateTouchdownStop(state) && !node.touchdown_stop_ &&
           node.PlanningCommand().x() == .5, "ordinary support triggered stopping");
     state.contact_confirmed[2] = false;
     Check(node.UpdateTouchdownStop(state) && node.PlanningCommand().isZero() &&
-          std::abs(*node.stop_deadline_ - 10.8) < 1e-12,
-          "missing landing did not immediately request a timed stop");
-    const double deadline = *node.stop_deadline_;
+          node.touchdown_stop_,
+          "missing landing did not immediately request zero velocity");
     for (double time : {10.0, 10.1, 10.5, 10.9}) {
       state.body_time = time;
       state.contact_estimated.fill(true);
-      Check(!node.UpdateTouchdownStop(state) && *node.stop_deadline_ == deadline &&
-            node.PlanningCommand().isZero(), "retry or raw contact moved/released the stop deadline");
+      Check(!node.UpdateTouchdownStop(state) && node.touchdown_stop_ &&
+            node.PlanningCommand().isZero(), "retry or raw contact released the zero-velocity command");
     }
     state.contact_confirmed.fill(true);
-    Check(node.UpdateTouchdownStop(state) && !node.stop_deadline_ &&
+    Check(node.UpdateTouchdownStop(state) && !node.touchdown_stop_ &&
           node.PlanningCommand().x() == .5, "confirmed landing did not restore saved command");
   }
 
@@ -208,7 +204,6 @@ struct TerrainPlannerRetryTest {
     Finish(node, recovered);
   }
 
-  // 발행 정체가 유예를 넘기면 도달 여유와 무관하게 명령을 0으로 줄이고 발행 성공이 해제한다.
   static void CheckSwingReferenceUpdates(TerrainPlannerNode& node) {
     node.swing_references_ = {};
     TerrainPlannerNode::State state;
@@ -461,8 +456,7 @@ struct TerrainPlannerRetryTest {
     state.contact_estimated.fill(true);
     update(.4);
     Finish(node, hold);
-    Check(hold->stop_time && std::abs(*hold->stop_time - .8) < 1e-12 &&
-          hold->command.isZero(), "hold did not request zero velocity and a fixed stop time");
+    Check(hold->command.isZero(), "hold did not request zero velocity");
     Check(hold->hold_duration == node.robot_.period && hold->body_time == .4 &&
           hold->hold_contacts == state.contact_confirmed, "touchdown wait blocked rolling body solve");
     Check(hold->contact_estimated == hold_estimated, "stance overwrote measured terrain contacts");
@@ -477,8 +471,7 @@ struct TerrainPlannerRetryTest {
     Started(tripod);
     const auto before_tripod = node.last_published_stamp_ns_;
     Finish(node, tripod);
-    Check(tripod->stop_time && std::abs(*tripod->stop_time - .78) < 1e-12,
-          "additional support postponed the stop time");
+    Check(tripod->command.isZero(), "additional support released the zero-velocity command");
     Check(tripod->hold_contacts == state.contact_confirmed &&
           tripod->hold_duration == node.robot_.period &&
           node.last_published_stamp_ns_ > before_tripod,
@@ -526,8 +519,8 @@ struct TerrainPlannerRetryTest {
     model_settings.time_limit = 3;
     const auto held_result = Solve(node.robot_, held_model, model_settings);
     Check(held_result.success, "real-model two-support hold solve failed");
-    Check(held_result.kinematics_valid.value_or(false) && held_result.ik_checks == 50,
-          "hold checked fictitious future touchdown or skipped real supports");
+    Check(!held_result.kinematics_valid && held_result.ik_checks == 0,
+          "hold still ran the removed final IK checker");
     std::cout << "PASS seed preservation, nonblocking state, immediate/bounded retries, "
                  "epoch/pause/command/clock publication guards, latched stance support, "
                  "touchdown stop deadline, retry-seed discard, "

@@ -1,7 +1,8 @@
 /**
  * @file touchdown_stop_test.cpp
- * @brief B2 모델의 착지 대기 감속·정지 유지와 재계획 연결을 검증한다.
- * @version 0.0.1
+ * @brief B2 모델의 착지 대기 목표 속도 감속과 기존 궤적 재사용·연결을 검증한다.
+ * @version 0.0.2
+ * @update 2026-10-25: 추가 정지 제약 없이 목표 속도 0으로 감속하는 기존 SQP 경로를 검증함.
  * @update 2026-10-25: 이동 상태의 정지·도달 여유·고정 앞부분 인계 회귀를 추가함.
  */
 #include "b2_terrain_planner/planner.h"
@@ -16,32 +17,6 @@ using namespace b2_terrain_planner;
 
 void Check(bool value, const std::string& message) {
   if (!value) throw std::runtime_error(message);
-}
-
-void CheckStopped(const Result& plan, double stop, const Robot& robot,
-                  const Input& input) {
-  Check(plan.success, "stop solve failed: " + plan.status);
-  Check(plan.kinematics_valid.value_or(false), "stop failed actual joint IK");
-  for (double time = stop; time <= robot.period + 1e-9; time += .01) {
-    Check(Evaluate(plan, time, 1).norm() < 1e-4, "body continued after stop deadline");
-    Check(Evaluate(plan, time, 2).norm() < 1e-4, "nonzero acceleration after stop");
-    Check((Evaluate(plan, time) - Evaluate(plan, stop)).norm() < 1e-5,
-          "stopped pose moved");
-  }
-  for (int sample = 0; sample <= 160; ++sample) {
-    const double time = robot.period * sample / 160.0;
-    const Vector6 pose = Evaluate(plan, time);
-    const Eigen::Matrix3d rotation = (Eigen::AngleAxisd(pose[3], Eigen::Vector3d::UnitZ()) *
-        Eigen::AngleAxisd(pose[4], Eigen::Vector3d::UnitY()) *
-        Eigen::AngleAxisd(pose[5], Eigen::Vector3d::UnitX())).toRotationMatrix();
-    for (int leg = 0; leg < 4; ++leg) {
-      if (!(*input.hold_contacts)[leg]) continue;
-      const auto hip = pose.head<3>() + rotation * robot.hips.row(leg).transpose();
-      Check((hip - input.feet.row(leg).transpose()).norm() <=
-                robot.reach_max[leg] - input.stop_reach_margin + 1e-5,
-            "stop consumed reserved leg reach");
-    }
-  }
 }
 
 void Run() {
@@ -60,10 +35,9 @@ void Run() {
   input.gait_hold_duration = robot.period;
   input.hold_contacts = std::array<bool, 4>{true, true, true, true};
   input.contact_estimated = input.hold_contacts;
-  input.touchdown_stop_time = .6;
   input.velocity.x() = .5;
   input.velocity[3] = .5;
-  input.command << .5, 0, .5;  // 정지 계약은 보관된 사용자 명령보다 우선한다.
+  input.command << .5, 0, .5;
   Settings settings;
   settings.time_limit = .1;
   settings.sample_intervals = 6;
@@ -84,64 +58,44 @@ void Run() {
   settings.pitch_weight = 10;
   settings.leg_vertical_weight = 30;
   settings.vz_weight = 10;
-  const auto stop = Solve(robot, input, settings);
-  CheckStopped(stop, .6, robot, input);
-  std::cout << "four supports stop: " << stop.elapsed << " s\n";
-  Check((Evaluate(stop, 0) - input.position).norm() < 1e-5 &&
-            (Evaluate(stop, 0, 1) - input.velocity).norm() < 1e-5,
-        "stop jumped the initial pose/velocity");
+  const auto moving = Solve(robot, input, settings);
+  Check(moving.success, "moving reference failed: " + moving.status);
 
-  for (const auto& contacts : {std::array<bool, 4>{true, true, false, true},
-                               std::array<bool, 4>{true, false, false, true}}) {
-    Input waiting = input;
-    waiting.hold_contacts = contacts;
-    waiting.contact_estimated = contacts;
-    waiting.touchdown_stop_time = robot.period;
-    if (!contacts[1]) {
-      // 대각 2지지는 지지선 방향으로 움직이는 입력의 감속을 검증한다.
-      waiting.position.head<2>() = .5 * (input.feet.row(0) + input.feet.row(3)).head<2>().transpose();
-      waiting.velocity.setZero();
-      waiting.velocity.head<2>() = .2 * (input.feet.row(0) - input.feet.row(3)).head<2>().normalized().transpose();
-    }
-    const auto limited_support = Solve(robot, waiting, settings);
-    CheckStopped(limited_support, robot.period, robot, waiting);
-    std::cout << "landing wait stop: " << limited_support.elapsed << " s\n";
-  }
-
-  Input shifted = input;
-  shifted.body_time = 1.1;
-  shifted.touchdown_stop_time = .5;
-  shifted.reference_prefix = std::make_shared<Result>(stop);
-  shifted.prefix_duration = .14;
-  shifted.position = Evaluate(stop, .1);
-  shifted.velocity = Evaluate(stop, .1, 1);
-  const auto next = Solve(robot, shifted, settings, &stop);
-  CheckStopped(next, .5, robot, shifted);
+  Input waiting = input;
+  waiting.body_time = 1.1;
+  waiting.reference_prefix = std::make_shared<Result>(moving);
+  waiting.prefix_duration = .14;
+  waiting.position = Evaluate(moving, .1);
+  waiting.velocity = Evaluate(moving, .1, 1);
+  waiting.command.setZero();
+  const auto slowed = Solve(robot, waiting, settings, &moving);
+  Check(slowed.success, "zero-command hold failed: " + slowed.status);
+  Check(slowed.warm_start.used, "landing wait discarded the previous plan seed");
+  Check(!slowed.terrain_validation && !slowed.kinematics_valid && slowed.ik_checks == 0,
+        "removed final checkers still ran");
+  Check(slowed.profile.final_validation_seconds == 0 && slowed.profile.ik_seconds == 0,
+        "removed post-processing still ran");
   for (double time : {0.0, .07, .14}) {
-    Check((Evaluate(next, time) - Evaluate(stop, time + .1)).norm() < 1e-5 &&
-              (Evaluate(next, time, 1) - Evaluate(stop, time + .1, 1)).norm() < 1e-5,
-          "stop replan broke the immutable prefix");
+    Check((Evaluate(slowed, time) - Evaluate(moving, time + .1)).norm() < 1e-5 &&
+              (Evaluate(slowed, time, 1) - Evaluate(moving, time + .1, 1)).norm() < 1e-5,
+          "zero-command replan broke the immutable prefix");
   }
-  // 이미 정지한 뒤에도 미착지이면 새 0.8초 정지 시한을 만들지 않고 정지 자세를 유지한다.
-  Input held = shifted;
-  held.body_time = 1.62;
-  held.touchdown_stop_time = 0;
-  held.position = Evaluate(stop, .62);
-  held.velocity = Evaluate(stop, .62, 1);
-  const auto stationary = Solve(robot, held, settings, &stop);
-  CheckStopped(stationary, 0, robot, held);
-
-  Input impossible = input;
-  impossible.stop_reach_margin = robot.reach_max.minCoeff() * .8;
-  const auto rejected = Solve(robot, impossible, settings);
-  Check(!rejected.success, "impossible stop was published as feasible");
+  Input continued = waiting;
+  continued.command = input.command;
+  const auto cruising = Solve(robot, continued, settings, &moving);
+  Check(cruising.success, "comparison plan failed: " + cruising.status);
+  Check(Evaluate(slowed, robot.period, 1).head<2>().norm() <
+            Evaluate(cruising, robot.period, 1).head<2>().norm(),
+        "zero command did not reduce the planned terminal horizontal speed");
+  std::cout << "zero-command hold: " << slowed.elapsed << " s, "
+            << slowed.iterations << " iterations\n";
 }
 }  // namespace
 
 int main() {
   try {
     Run();
-    std::cout << "PASS touchdown stop, reserved reach, prefix continuity, stationary hold\n";
+    std::cout << "PASS touchdown zero-command deceleration, warm start, prefix continuity\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

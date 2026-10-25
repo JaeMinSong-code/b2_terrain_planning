@@ -1,7 +1,8 @@
 /**
  * @file terrain_reuse_test.cpp
  * @brief 지도 영역 이동 시 이전 궤적 재사용과 변경 지형의 착지점 재검사를 검증한다.
- * @version 0.0.1
+ * @version 0.0.2
+ * @update 2026-10-25: 사후 지도 검사 없이 기존 지형 비용과 착지점 계산이 유지되는지 검증함.
  * @update 2026-10-17: 이동 평면·높이 변경·미관측 영역·좌표계 불일치 회귀 시험을 추가함.
  */
 #include "b2_terrain_planner/planner.h"
@@ -47,8 +48,7 @@ int main() {
           "moving map rejected: " + moved.status + ", warm=" + moved.warm_start.reason);
     Check(moved.warm_start.reason == "shifted_previous_plan_updated_terrain",
           "changed map diagnostic missing");
-    Check(moved.terrain_validation && moved.terrain_validation->passed,
-          "moving map validation missing");
+    Check(!moved.terrain_validation, "removed final terrain checker still ran");
     // 평면 높이가 바뀌면 이전 착지 Z를 그대로 복사해서는 안 된다.
     input.terrain->heights.setConstant(0.02);
     input.feet.col(2).setConstant(0.02);
@@ -56,8 +56,7 @@ int main() {
     const Result raised = Solve(robot, input, settings, &initial);
     Check(raised.success && raised.warm_start.used, "changed height solve: " + raised.status);
     Check(raised.warm_start.reused_footholds == 0, "old-height footholds reused");
-    Check(raised.terrain_validation && raised.terrain_validation->passed,
-          "new terrain validation failed");
+    Check(!raised.terrain_validation, "removed final terrain checker still ran");
     for (int leg = 0; leg < 4; ++leg) {
       Check(std::abs(raised.footholds(leg, 2) - 0.02) < settings.terrain.contact_tolerance,
             "landing height was not updated");

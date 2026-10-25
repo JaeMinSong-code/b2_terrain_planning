@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.23
+ * @version 0.0.24
+ * @update 2026-10-25: 착지 대기 감속을 속도 목표 0으로 단순화하고 정지 시한·추가 여유 입력을 제거함.
  * @update 2026-10-25: 기존 두 감속 트리거를 착지 대기 정지 시한·도달 여유 제약으로 교체함.
- * @update 2026-10-25: 실패 시드 체인이 발산(2배)하거나 3회 소진되면 폐기해 발행 정체 고착을 차단함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -114,11 +114,6 @@ class TerrainPlannerNode : public rclcpp::Node {
     }
 
     InitRobot();
-    stop_reach_margin_ = declare_parameter<double>("touchdown_stop.reach_margin_m", 0.02);
-    if (!std::isfinite(stop_reach_margin_) || stop_reach_margin_ <= 0 ||
-        stop_reach_margin_ >= (robot_.reach_max - robot_.reach_min).minCoeff()) {
-      throw std::invalid_argument("touchdown stop reach margin must fit the leg workspace");
-    }
     ConfigureSettings();
 
     state_sub_ = create_subscription<b2_terrain_planner::msg::LocomotionState>(
@@ -151,7 +146,7 @@ class TerrainPlannerNode : public rclcpp::Node {
     State state;
     builtin_interfaces::msg::Time map_stamp;
     std::uint64_t generation = 0;
-    std::optional<double> stop_deadline;
+    bool touchdown_stop = false;
   };
 
   struct PublishedPlan {
@@ -188,27 +183,23 @@ class TerrainPlannerNode : public rclcpp::Node {
     applied_command_ = EffectiveCommand();
     command_slot_ = slot;
   }
-  // 최초 미확인 착지에서만 시한을 만든다. 실패·재발행·같은 상태 수신으로 연장하지 않는다.
+  // 예정 착지가 확인되지 않으면 기존 TAMOLS 속도 목표만 0으로 낮춘다.
   bool UpdateTouchdownStop(const State& state) {
-    const bool was_stopping = stop_deadline_.has_value();
-    bool missing = false;
+    const bool was_stopping = touchdown_stop_;
+    touchdown_stop_ = false;
     if (state.gait_clock_valid && state.body_clock_valid) {
       const auto phases = MakeHorizon(state.gait_time, robot_.period, robot_.duty);
       for (int leg = 0; leg < 4; ++leg) {
-        if (phases.front().contacts[leg] && !state.contact_confirmed[leg]) missing = true;
+        if (phases.front().contacts[leg] && !state.contact_confirmed[leg]) {
+          touchdown_stop_ = true;
+        }
       }
     }
-    if (missing) {
-      if (!stop_deadline_) stop_deadline_ = state.body_time + robot_.period;
-    } else {
-      // 실제 착지가 확인되면 현재 감속 곡선과 연결해 정상 보행을 재개한다.
-      stop_deadline_.reset();
-    }
-    return was_stopping != stop_deadline_.has_value();
+    return was_stopping != touchdown_stop_;
   }
 
   Eigen::Vector3d PlanningCommand() const {
-    if (stop_deadline_) return Eigen::Vector3d::Zero();
+    if (touchdown_stop_) return Eigen::Vector3d::Zero();
     return applied_command_;
   }
 
@@ -239,10 +230,7 @@ class TerrainPlannerNode : public rclcpp::Node {
         << ",\"solve_end_ns\":" << solve_end_ns_
         << ",\"map_stamp_ns\":" << rclcpp::Time(map_stamp_).nanoseconds()
         << ",\"leg\":" << leg
-        << ",\"touchdown_stop\":" << std::boolalpha << stop_deadline_.has_value()
-        << ",\"stop_deadline_body_time\":";
-    if (stop_deadline_) out << *stop_deadline_;
-    else out << "null";
+        << ",\"touchdown_stop\":" << std::boolalpha << touchdown_stop_;
     const Eigen::Vector3d command = PlanningCommand();
     out << ",\"effective_command\":[" << command.x() << ',' << command.y() << ',' << command.z() << ']';
     if (state_) {
@@ -256,7 +244,7 @@ class TerrainPlannerNode : public rclcpp::Node {
     }
     if (pending_solve_) {
       const auto& pending = *pending_solve_;
-      out << ",\"solve_touchdown_stop\":" << pending.stop_deadline.has_value()
+      out << ",\"solve_touchdown_stop\":" << pending.touchdown_stop
           << ",\"solve_command\":[" << pending.input.command.x() << ','
           << pending.input.command.y() << ',' << pending.input.command.z() << ']'
           << ",\"solve_contact_confirmed\":[";
@@ -314,9 +302,7 @@ class TerrainPlannerNode : public rclcpp::Node {
         << ",\"stage\":" << std::quoted(result.stage)
         << ",\"optimization_started\":" << optimization_started
         << ",\"publication_reason\":" << std::quoted(publication_reason)
-        << ",\"touchdown_stop\":" << input.touchdown_stop_time.has_value()
-        << ",\"stop_remaining_sec\":" << number(input.touchdown_stop_time.value_or(-1.0))
-        << ",\"stop_reach_margin_m\":" << number(input.stop_reach_margin)
+        << ",\"touchdown_stop\":" << pending.touchdown_stop
         << ",\"parent_plan_stamp_ns\":" << pending.state.active_plan_stamp_ns
         << ",\"prefix_duration\":" << number(input.prefix_duration)
         << ",\"attempt_seq\":" << attempt_seq_
@@ -602,7 +588,7 @@ class TerrainPlannerNode : public rclcpp::Node {
       published_plans_.clear();
       command_slot_ = -1;
       applied_command_.setZero();
-      stop_deadline_.reset();
+      touchdown_stop_ = false;
       swing_references_ = {};
     }
     bool replan = state_ && state_->gait_paused != msg.gait_paused;
@@ -619,7 +605,7 @@ class TerrainPlannerNode : public rclcpp::Node {
     if (UpdateTouchdownStop(msg)) {
       replan = true;
       const char* event = "touchdown_stop_released";
-      if (stop_deadline_) event = "touchdown_stop_entered";
+      if (touchdown_stop_) event = "touchdown_stop_entered";
       PublishPipelineStatus(event, "landing_confirmation", -1, stamp);
     }
     // 후보를 발행했다고 실행된 것으로 간주하지 않는다. WBC가 확인한 스윙만 고정한다.
@@ -644,7 +630,7 @@ class TerrainPlannerNode : public rclcpp::Node {
       published_plans_.clear();
       command_slot_ = -1;
       applied_command_.setZero();
-      stop_deadline_.reset();
+      touchdown_stop_ = false;
       epoch_ns_.reset();
       last_planned_ns_ = -1;
       command_stamp_.reset();
@@ -759,13 +745,6 @@ class TerrainPlannerNode : public rclcpp::Node {
         return;
       }
     }
-    if (stop_deadline_) {
-      input.gait_hold_duration = robot_.period;
-      input.hold_contacts = state.contact_confirmed;
-      input.touchdown_stop_time = std::clamp(*stop_deadline_ - state.body_time, 0.0, robot_.period);
-      input.stop_reach_margin = stop_reach_margin_;
-      input.command.setZero();
-    }
     input.contact_estimated = state.contact_estimated;
     input.position << state.com_position.x, state.com_position.y, state.com_position.z,
                       ypr[0], ypr[1], ypr[2];
@@ -808,7 +787,7 @@ class TerrainPlannerNode : public rclcpp::Node {
     same_state_retry_used_ = stamp_ns == last_planned_ns_;
     last_planned_ns_ = stamp_ns;
     retry_requested_ = false;
-    pending_solve_ = PendingSolve{input, state, map_stamp_, generation_, stop_deadline_};
+    pending_solve_ = PendingSolve{input, state, map_stamp_, generation_, touchdown_stop_};
     ++attempt_seq_;
     solve_state_stamp_ns_ = stamp_ns;
     solve_start_ns_ = now().nanoseconds();
@@ -855,7 +834,7 @@ class TerrainPlannerNode : public rclcpp::Node {
       reason = "state_not_fresh_after_solve";
     }
     if (publishable) {
-      publishable = pending.stop_deadline == stop_deadline_;
+      publishable = pending.touchdown_stop == touchdown_stop_;
       reason = "touchdown_stop_changed_after_solve";
     }
     if (publishable && state.gait_clock_valid) {
@@ -1103,8 +1082,7 @@ class TerrainPlannerNode : public rclcpp::Node {
   Settings settings_;
   Eigen::Vector3d command_ = Eigen::Vector3d::Zero();
   Eigen::Vector3d applied_command_ = Eigen::Vector3d::Zero();
-  std::optional<double> stop_deadline_;
-  double stop_reach_margin_ = 0.02;
+  bool touchdown_stop_ = false;
   std::int64_t command_slot_ = -1;
   std::deque<PublishedPlan> published_plans_;
   std::string command_topic_;
