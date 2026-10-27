@@ -12,7 +12,6 @@ from rclpy.duration import Duration
 from rclpy.executors import ExternalShutdownException
 from tf2_ros import TransformException
 from elevation_mapping_cupy.elevation_mapping_node import ElevationMappingNode
-from elevation_mapping_cupy.traversability_polygon import transform_to_map_index
 from geometry_msgs.msg import PointStamped
 from elevation_common import decode_xyz, rotation, flat_ground_height
 
@@ -24,6 +23,8 @@ class StrictElevationMappingNode(ElevationMappingNode):
         super().__init__()
         self.initializer_pending = self.use_initializer_at_start
         self.last_initializer_attempt = -math.inf
+        self.initialize_patch_length = float(self._b2_param('initialize_patch_length', 1.2))
+        self.initialize_patch_width = float(self._b2_param('initialize_patch_width', 0.8))
         self.flat_plane_pub = self.create_publisher(PointStamped, '/elevation/observed_plane', 10)
         self.input_timer = self.create_timer(0.01, self.flush_inputs)
 
@@ -43,44 +44,46 @@ class StrictElevationMappingNode(ElevationMappingNode):
         self.pending_clouds.popleft()
         self._last_t = msg.header.stamp
         self.pose_update()
-        self.try_initialize_from_feet(msg.header.stamp)
+        self.try_initialize_from_ground(msg)
         super().pointcloud_callback(msg, key)
         if self.flat_plane_pub.get_subscription_count() > 0:
             self.publish_observed_plane(msg)
         self.last_accepted = time.monotonic()
 
-    def try_initialize_from_feet(self, stamp):
-        """기존 CuPy 초기화기를 한 번 실행하되 이미 관측된 셀은 보존한다."""
+    def try_initialize_from_ground(self, msg):
+        """평지 출발 시 관측 바닥 높이로 몸통 아래 미관측 사각형만 한 번 채운다."""
         if not self.initializer_pending:
             return
         wall_now = time.monotonic()
         if wall_now - self.last_initializer_attempt < 1.0:
             return
         self.last_initializer_attempt = wall_now
-        points = []
-        for frame, offset in zip(self.initialize_frame_id, self.initialize_tf_offset):
-            tf = self.safe_lookup_transform(self.map_frame, frame, stamp)
-            if tf is None:
-                self.get_logger().info(f'Initializer waiting for {frame}; LiDAR mapping continues',
-                                       throttle_duration_sec=5.0)
-                return
-            t = tf.transform.translation
-            points.append([t.x, t.y, t.z + offset])
+        sensor = self.safe_lookup_transform(self.map_frame, msg.header.frame_id, msg.header.stamp)
+        base = self.safe_lookup_transform(self.map_frame, self.base_frame, msg.header.stamp)
+        if sensor is None or base is None:
+            return
         try:
-            # initialize_map()은 기존 지도까지 clear하므로 native 초기화기·dilation을
-            # 별도 버퍼에 실행하고 미관측 셀만 합친다. 지형 보간 알고리즘은 바꾸지 않는다.
+            t, q = sensor.transform.translation, sensor.transform.rotation
+            world = decode_xyz(msg) @ rotation([q.x, q.y, q.z, q.w]).T + np.array([t.x, t.y, t.z])
+            b, q = base.transform.translation, base.transform.rotation
+            length, width = self.initialize_patch_length, self.initialize_patch_width
+            # 발 링크 중심 대신 같은 시각·프레임의 실제 LiDAR 바닥을 기준으로 쓴다.
+            height = flat_ground_height(world, [b.x, b.y, b.z], max(length, width))
+            yaw = math.atan2(2 * (q.w*q.z + q.x*q.y), 1 - 2 * (q.y*q.y + q.z*q.z))
+            c, s = math.cos(yaw), math.sin(yaw)
+            corners = np.array([[-length/2, -width/2], [-length/2, width/2],
+                                [length/2, -width/2], [length/2, width/2]])
+            xy = corners @ np.array([[c, s], [-s, c]]) + [b.x, b.y]
             with self._map.map_lock:
-                seeds = cp.asarray(points, dtype=self._map.data_type)
-                seeds[:, :2] = transform_to_map_index(
-                    seeds[:, :2], self._map.center[:2], self._map.cell_n, self._map.resolution)
+                seeds = cp.asarray(np.column_stack((xy, np.full(4, height))),
+                                   dtype=self._map.data_type)
+                seeds[:, :2] = ((seeds[:, :2] - self._map.center[:2]) / self._map.resolution
+                                + self._map.cell_n / 2)
                 seeds[:, 2] -= self._map.center[2]
                 initialized = cp.zeros_like(self._map.elevation_map)
-                self._map.map_initializer(initialized, seeds, self.initialize_method)
-                if self.param.dilation_size_initialize > 0:
-                    for _ in range(2):
-                        self._map.dilation_filter_kernel_initializer(
-                            initialized[0], initialized[2], initialized[0], initialized[2],
-                            size=self._map.cell_n * self._map.cell_n)
+                # native linear 초기화기의 볼록껍질을 로봇 크기 사각형으로 제한한다.
+                # initialize_map()은 기존 지도도 clear하므로 별도 버퍼만 사용한다.
+                self._map.map_initializer(initialized, seeds, 'linear')
                 missing = (self._map.elevation_map[2] <= 0.5) & (initialized[2] > 0.5)
                 count = int(cp.count_nonzero(missing).item())
                 self._map.elevation_map[:, missing] = initialized[:, missing]
@@ -88,10 +91,10 @@ class StrictElevationMappingNode(ElevationMappingNode):
                 self._map.plugin_manager.reset_layers()
             self.initializer_pending = False
             self.get_logger().info(
-                f'Foot initializer complete: method={self.initialize_method}, '
-                f'frames={list(self.initialize_frame_id)}, filled={count} cells')
+                f'Ground initializer complete: height={height:.4f} m, '
+                f'patch={length:.2f}x{width:.2f} m, filled={count} cells')
         except (ValueError, AssertionError, QhullError) as error:
-            self.get_logger().warning(f'Foot initializer retry: {error}', throttle_duration_sec=5.0)
+            self.get_logger().warning(f'Ground initializer retry: {error}', throttle_duration_sec=5.0)
 
     def publish_observed_plane(self, msg):
         """누적 fusion과 독립적으로 최신 점군/TF의 평면을 같은 source stamp로 보낸다."""

@@ -1,26 +1,22 @@
 #!/usr/bin/env python3
-"""격리 ROS domain/GPU에서 초기화 TF, 원본 보존, 1회 실행과 clear를 검증한다.
-
-사용: elevation_env.sh 로드 후 python initializer_gpu_test.py <b2_terrain_planner 경로>
-"""
+"""실제 CuPy 초기화기의 높이·범위·관측 보존·일회성·후속 융합을 검증한다."""
 import math
 from pathlib import Path
 import sys
-import time
 
 import cupy as cp
 import numpy as np
 import rclpy
 from ament_index_python.packages import get_package_share_directory
-from b2_terrain_planner.msg import LocomotionState
-from nav_msgs.msg import Odometry
+from geometry_msgs.msg import TransformStamped
+from sensor_msgs_py.point_cloud2 import create_cloud_xyz32
+from std_msgs.msg import Header
 from std_srvs.srv import Trigger
-from tf2_msgs.msg import TFMessage
 
 package = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(package / 'scripts'))
-from elevation_input_adapter import ElevationInputAdapter
 from elevation_mapping_runner import StrictElevationMappingNode
+from elevation_mapping_cupy.elevation_mapping_node import ElevationMappingNode
 
 
 def main():
@@ -29,84 +25,80 @@ def main():
                     str(package / 'config/elevation_map_sim.yaml'),
                     '-p', 'map_frame:=elevation_odom', '-p', 'base_frame:=elevation_base'])
     mapper = StrictElevationMappingNode()
-    adapter = ElevationInputAdapter()
-    observer = rclpy.create_node('initializer_tf_check')
-    messages = []
-    subscription = observer.create_subscription(TFMessage, '/elevation/tf', messages.append, 10)
     try:
         assert mapper.use_initializer_at_start and mapper.initializer_pending
-        assert mapper.initialize_method == 'linear'
-        assert list(mapper.initialize_frame_id) == ['FL_foot', 'FR_foot', 'RL_foot', 'RR_foot']
-        assert list(mapper.initialize_tf_offset) == [0.0] * 4
-        assert mapper.param.dilation_size_initialize == 2
-
-        # TF 미준비는 초기화만 대기하며 지도 내용을 변경하지 않는다.
-        mapper.try_initialize_from_feet(mapper.get_clock().now().to_msg())
-        assert mapper.initializer_pending
+        stamp = mapper.get_clock().now().to_msg()
+        header = Header(stamp=stamp, frame_id='test_lidar')
+        gx, gy = np.meshgrid(np.arange(-1.0, 1.01, 0.05), np.arange(-1.0, 1.01, 0.05))
+        ground_z = -0.031
+        sensor_z = 0.8
+        points = np.column_stack((gx.ravel(), gy.ravel(),
+                                  np.full(gx.size, ground_z - sensor_z)))
+        cloud = create_cloud_xyz32(header, points)
+        mapper.try_initialize_from_ground(cloud)
+        assert mapper.initializer_pending, 'missing TF must defer only initialization'
         assert int(cp.count_nonzero(mapper._map.elevation_map[2]).item()) == 0
-
-        state = LocomotionState()
-        state.header.frame_id = 'odom'
-        feet = [(0.32, 0.19), (0.32, -0.19), (-0.34, 0.19), (-0.34, -0.19)]
-        for foot, (x, y) in zip(state.foot_position, feet):
-            foot.x, foot.y, foot.z = x, y, 0.03
-        odom = Odometry()
-        odom.header.frame_id = 'odom'
-        odom.child_frame_id = 'base_link'
-        odom.pose.pose.orientation.w = 1.0
-        deadline = time.monotonic() + 3.0
-        while not messages and time.monotonic() < deadline:
-            stamp = adapter.get_clock().now().to_msg()
-            odom.header.stamp = stamp
-            state.header.stamp = stamp
-            adapter.on_odom(odom)
-            adapter.on_state(state)
-            rclpy.spin_once(observer, timeout_sec=0.05)
-        assert messages, 'no isolated foot TF published'
-        frames = messages[-1].transforms
-        assert [tf.child_frame_id for tf in frames] == list(mapper.initialize_frame_id)
-        for tf, foot in zip(frames, state.foot_position):
-            assert tf.header.frame_id == 'elevation_odom'
-            assert all(getattr(tf.transform.translation, axis) == getattr(foot, axis)
-                       for axis in ('x', 'y', 'z'))
+        yaw = 0.4
+        for frame, xyz, angle in [('test_lidar', [0.0, 0.0, sensor_z], 0.0),
+                                  ('elevation_base', [0.1, -0.1, 0.55], yaw)]:
+            tf = TransformStamped()
+            tf.header.stamp = stamp
+            tf.header.frame_id = 'elevation_odom'
+            tf.child_frame_id = frame
+            tf.transform.translation.x, tf.transform.translation.y, tf.transform.translation.z = xyz
+            tf.transform.rotation.z = math.sin(angle / 2)
+            tf.transform.rotation.w = math.cos(angle / 2)
             mapper._tf_buffer.set_transform(tf, 'initializer_test')
-        stamp = frames[0].header.stamp
-        mapper._map.move_to(np.array([0.1, -0.1, 0.55]), np.eye(3))
+        mapper._last_t = stamp
+        mapper.pose_update()
         m = mapper._map
         center = cp.asnumpy(m.center)
-        # 초기화 범위 안의 기존 장애물 높이도 지우면 안 된다.
         idx = ((np.array([0.0, 0.0]) - center[:2]) / m.resolution + m.cell_n / 2).astype(int)
         m.elevation_map[0, idx[0], idx[1]] = 0.42
         m.elevation_map[1, idx[0], idx[1]] = 0.004
         m.elevation_map[2, idx[0], idx[1]] = 1.0
+        before = m.elevation_map.copy()
         mapper.last_initializer_attempt = -math.inf
-        mapper.try_initialize_from_feet(stamp)
+        mapper.try_initialize_from_ground(create_cloud_xyz32(header, []))
+        assert mapper.initializer_pending, 'empty cloud must not create a zero-height floor'
+        assert bool(cp.array_equal(before, m.elevation_map).item())
+        mapper.last_initializer_attempt = -math.inf
+        mapper.try_initialize_from_ground(cloud)
         assert not mapper.initializer_pending
         valid = m.elevation_map[2] > 0.5
-        count = int(cp.count_nonzero(valid).item())
-        assert 10 < count < m.cell_n * m.cell_n // 2, count
-        assert abs(float(m.elevation_map[0, idx[0], idx[1]].item()) - 0.42) < 1e-6
-        assert abs(float(m.elevation_map[1, idx[0], idx[1]].item()) - 0.004) < 1e-6
-        seeded = valid.copy()
-        seeded[idx[0], idx[1]] = False
-        assert float(cp.max(cp.abs(m.elevation_map[0, seeded] + center[2] - 0.03)).item()) < 1e-5
-        assert not bool(valid[1, 1].item()), 'initializer filled entire map'
+        seeded = valid & (before[2] <= 0.5)
+        count = int(cp.count_nonzero(seeded).item())
+        assert 300 < count < 420, count
+        assert bool(cp.array_equal(before[:3, idx[0], idx[1]],
+                                   m.elevation_map[:3, idx[0], idx[1]]).item()), 'observed obstacle changed'
+        assert float(cp.max(cp.abs(m.elevation_map[0, seeded] + center[2] - ground_z)).item()) < 1e-5
+        ix, iy = np.nonzero(cp.asnumpy(seeded))
+        xy = (np.column_stack((ix, iy)) - m.cell_n / 2) * m.resolution + center[:2]
+        c, s = math.cos(yaw), math.sin(yaw)
+        local = (xy - [0.1, -0.1]) @ np.array([[c, -s], [s, c]])
+        assert np.max(np.abs(local[:, 0])) <= 0.6 + 1e-6
+        assert np.max(np.abs(local[:, 1])) <= 0.4 + 1e-6
         saved = m.elevation_map.copy()
         mapper.last_initializer_attempt = -math.inf
-        mapper.try_initialize_from_feet(stamp)
-        assert bool(cp.array_equal(saved, m.elevation_map).item()), 'initializer ran repeatedly'
+        mapper.try_initialize_from_ground(cloud)
+        assert bool(cp.array_equal(saved, m.elevation_map).item()), 'initializer repeated'
+        # 일반 센서 경로로 초기화 셀도 새 관측을 받는지 확인한다.
+        points[:, 2] += 0.01
+        update = create_cloud_xyz32(header, points)
+        for _ in range(3):
+            ElevationMappingNode.pointcloud_callback(mapper, update, 'lidar')
+        fused = seeded & (m.elevation_map[2] > 0.5) & (m.elevation_map[1] < saved[1])
+        assert int(cp.count_nonzero(fused).item()) > 20, 'seeded cells did not accept LiDAR updates'
+        assert float(cp.max(cp.abs(m.elevation_map[0, fused] - saved[0, fused])).item()) > 0.001
         response = mapper.handle_clear_map(Trigger.Request(), Trigger.Response())
         assert response.success and mapper.initializer_pending
         assert int(cp.count_nonzero(m.elevation_map[2]).item()) == 0
         mapper.use_initializer_at_start = False
         response = mapper.handle_clear_map(Trigger.Request(), Trigger.Response())
         assert response.success and not mapper.initializer_pending
-        print(f'PASS GPU initializer: {count} valid cells, foot TF, world z, existing obstacle preserved, '
-              'one-shot, missing TF, clear/reset, disabled mode')
+        print(f'PASS GPU ground initializer: {count} cells, observed floor z, yaw/size bounds, '
+              'obstacle preserved, one-shot, deferred TF/cloud, LiDAR updates, clear/disable')
     finally:
-        observer.destroy_subscription(subscription)
-        observer.destroy_node()
-        adapter.destroy_node()
         mapper.destroy_node()
         rclpy.shutdown()
 

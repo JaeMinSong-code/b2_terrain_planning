@@ -13,12 +13,12 @@
     resolution: 0.05
     map_length: 4.0
 
-    # raw 입력 비교 중 발 TF 기반 시작 초기화를 끈다.
-    use_initializer_at_start: false
+    # 평지 출발: 주변 LiDAR 바닥 높이로 몸통 아래 미관측 셀만 한 번 채운다.
+    use_initializer_at_start: true
     initialize_method: 'linear'
-    initialize_frame_id: ['FL_foot', 'FR_foot', 'RL_foot', 'RR_foot']
-    initialize_tf_offset: [0.0, 0.0, 0.0, 0.0]
-    dilation_size_initialize: 2
+    initialize_patch_length: 1.2
+    initialize_patch_width: 0.8
+    dilation_size_initialize: 0
 
     # === Phase 4: handoff 3수정 ===
     # 수정1: protection zone — base 아래 박스 셀은 시간 무효화 skip(발밑 기억).

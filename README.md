@@ -17,8 +17,8 @@ GUI·RViz·지도·TAMOLS·시각화 TF를 함께 실행하고, 지도 입력은
 비평지 sim `--tamols --rviz`의 기본 표시는 `RawElevationMap`이며,
 `CorrectedElevationMap`을 별도로 켜서 실제 SQP 입력과 비교한다.
 `map_datum_reanchor.enabled: false`, `support_patch.enabled: true`로 planner 입력에만
-반폭 0.05m 접촉 패치를 적용한다. CuPy raw 셀은 바꾸지 않는다. CuPy 시작 초기화도
-`use_initializer_at_start: false`로 끈다. odom 추정기와 CuPy 내부 융합 설정은 바꾸지 않는다.
+반폭 0.05m 접촉 패치를 적용한다. CuPy raw 셀은 바꾸지 않는다. CuPy 시작 초기화는
+`use_initializer_at_start: true`로 켜 로봇 아래 미관측 영역만 한 번 채운다. odom 추정기와 CuPy 내부 융합 설정은 바꾸지 않는다.
 sim `--tamols`는 원본·보정 지도와 발 상태·odom 전체 메시지를 deploy의
 `runtime_logs/map_history_*` rosbag으로 기록한다. 원본 지도 보정이나 보행 개선 자체를 뜻하지 않는다.
 아래의 GT/실기 센서 전용 맵 실행은 개별 진단용 경로다.
@@ -45,20 +45,19 @@ WBC·모터 제어·MuJoCo 실행파일은 별도 `b2_deploy_ws`가 소유한다
 
 ## 시작 시 CuPy 발밑 초기화
 
-통합 elevation map 설정은 raw 입력 비교 중 `use_initializer_at_start: false`로 둔다.
-기존 초기화 셀이 남지 않도록 맵 노드를 포함한 실행을 다시 시작한다.
-다시 true로 켤 경우 `initialize_method: linear`,
-`initialize_frame_id: [FL_foot, FR_foot, RL_foot, RR_foot]`,
-`initialize_tf_offset: [0.0, 0.0, 0.0, 0.0]`, `dilation_size_initialize: 2`를 사용한다.
-adapter가 `/robot/locomotion_state`의 발 위치를 `/elevation/tf`로 전달하므로 RViz나
-robot_state_publisher가 없어도 된다. 입력 odom과 발 상태의 좌표계가 같아야 한다.
+평지에서 출발한다는 전제로 `use_initializer_at_start: true`를 기본으로 사용한다.
+`initialize_patch_length: 1.2`, `initialize_patch_width: 0.8`로 몸통 중심·yaw에 맞춘
+1.2×0.8m 사각형의 미관측 셀만 한 번 채운다. 발 TF의 중심 높이나 고정 0을 쓰지 않고,
+같은 시각의 LiDAR 점군에서 주변 바닥 높이 중앙값을 측정해 초기 평면으로 사용한다.
 
-초기화를 켠 경우 runner는 네 발 TF가 준비되면 CuPy의 기존 선형 보간과 dilation으로 미관측 영역을
-한 번 초기화한다. 이미 관측된 셀은 덮어쓰지 않으며 발 TF를 기다리는 중에도 LiDAR
-융합은 계속한다. 로그 `Foot initializer complete: ... filled=N cells`로 실행을 확인한다.
-초기화가 켜져 있으면 map clear 후 다시 초기화한다. 주기적인 평탄화나 스윙마다 새 평면을 만드는 기능은 아니다.
-초기화 셀은 실제 CuPy 원본 지도에 들어가므로 raw·보정 지도와 rosbag 양쪽에서 확인된다.
-설정 파일은 `b2_terrain_planner/config/elevation_map_sim.yaml`이며 false로 끌 수 있다.
+runner는 CuPy의 기존 linear 초기화기를 별도 버퍼에서 실행한다. dilation 없이 지정한
+사각형 안만 채우며 기존 관측 셀·장애물 높이는 보존한다. TF 또는 바닥 관측을 기다릴
+때에도 LiDAR 융합은 계속한다. 초기화 후 셀은 일반 지도 셀처럼 센서 관측으로 갱신된다.
+`Ground initializer complete: height=..., patch=1.20x0.80 m, filled=N cells` 로그로 확인한다.
+map clear 후에는 다시 한 번 초기화하며, 보행·접촉 전환마다 평면을 재생성하지 않는다.
+초기화 셀은 CuPy 원본 지도에 들어가므로 raw·보정 지도와 rosbag에서 확인할 수 있다.
+설정은 `b2_terrain_planner/config/elevation_map_sim.yaml`에 있으며 false로 끌 수 있다.
+설치 설정 반영 후 맵 노드를 포함해 실행을 재시작한다. 비평지 출발에는 이 가정을 사용하지 않는다.
 
 ## 접촉 발의 작은 영역과 높이 기억
 
