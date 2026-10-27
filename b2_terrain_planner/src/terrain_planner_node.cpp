@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.26
+ * @version 0.0.27
+ * @update 2026-10-27: 보정된 계획 입력 지도를 RViz 진단 토픽으로 발행함.
  * @update 2026-10-25: 착지 대기는 계획 입력만 0으로 덮고 사용자 램프는 계속 진행하도록 수정함.
- * @update 2026-10-25: 반걸음 명령 확정 대신 몸통 시각 기반 XY·yaw 속도 목표 램프를 적용함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -128,6 +128,9 @@ class TerrainPlannerNode : public rclcpp::Node {
     map_sub_ = create_subscription<grid_map_msgs::msg::GridMap>(
         map_topic_, rclcpp::QoS(1).best_effort(),
         [this](grid_map_msgs::msg::GridMap::SharedPtr msg) { OnMap(*msg); });
+    corrected_map_pub_ = create_publisher<grid_map_msgs::msg::GridMap>(
+        "/terrain_planner/elevation_map_corrected",
+        rclcpp::QoS(1).reliable().transient_local());
     plan_pub_ = create_publisher<b2_terrain_planner::msg::LocomotionPlan>(plan_topic_, 1);
     solve_status_pub_ = create_publisher<std_msgs::msg::String>("~/solve_status", 10);
     pipeline_status_pub_ = create_publisher<std_msgs::msg::String>("~/pipeline_status", 100);
@@ -497,6 +500,51 @@ class TerrainPlannerNode : public rclcpp::Node {
     map_stamp_ = msg.header.stamp;
   }
 
+  // 실제 SQP 입력을 표시한다. 원본 시각을 보존하고 미관측 셀은 NaN으로 유지한다.
+  // 진단 발행만 최대 10 Hz로 제한하며 계산·계획 발행 조건에는 관여하지 않는다.
+  void PublishCorrectedMap(const HeightMap& map,
+                           const builtin_interfaces::msg::Time& stamp) {
+    const auto wall_now = std::chrono::steady_clock::now();
+    if (last_corrected_map_publish_ &&
+        wall_now - *last_corrected_map_publish_ < std::chrono::milliseconds(100)) return;
+    last_corrected_map_publish_ = wall_now;
+    grid_map_msgs::msg::GridMap msg;
+    msg.header.stamp = stamp;
+    msg.header.frame_id = map.frame;
+    const int rows = map.heights.cols();  // grid_map row는 -X 방향이다.
+    const int cols = map.heights.rows();  // grid_map col은 -Y 방향이다.
+    msg.info.resolution = map.resolution;
+    msg.info.length_x = rows * map.resolution;
+    msg.info.length_y = cols * map.resolution;
+    msg.info.pose.position.x = map.origin.x() + (rows - 1) * map.resolution / 2.0;
+    msg.info.pose.position.y = map.origin.y() + (cols - 1) * map.resolution / 2.0;
+    msg.info.pose.orientation.w = 1.0;
+    msg.layers = {"elevation", "variance"};
+    msg.basic_layers = {"elevation"};
+    msg.data.resize(2);
+    for (auto& layer : msg.data) {
+      layer.layout.dim.resize(2);
+      layer.layout.dim[0].label = "column_index";
+      layer.layout.dim[0].size = cols;
+      layer.layout.dim[0].stride = rows * cols;
+      layer.layout.dim[1].label = "row_index";
+      layer.layout.dim[1].size = rows;
+      layer.layout.dim[1].stride = rows;
+      layer.data.resize(rows * cols, std::numeric_limits<float>::quiet_NaN());
+    }
+    for (int col = 0; col < cols; ++col) {
+      for (int row = 0; row < rows; ++row) {
+        const int x = rows - 1 - row;
+        const int y = cols - 1 - col;
+        if (!map.valid(y, x)) continue;
+        const int index = row + col * rows;
+        msg.data[0].data[index] = map.heights(y, x);
+        msg.data[1].data[index] = map.variance(y, x);
+      }
+    }
+    corrected_map_pub_->publish(msg);
+  }
+
   // leg의 time t 발끝 위치(odom)와 접지 여부. 스탠스=정착 위치, 스윙=포물선 arc.
   std::pair<Eigen::Vector3d, bool> FootAt(const Result& r, const Feet& feet0,
                                           int leg, double t) const {
@@ -824,6 +872,9 @@ class TerrainPlannerNode : public rclcpp::Node {
           }
           return std::make_pair(std::move(result), clock->now().nanoseconds());
         });
+    if (pending_solve_->input.terrain) {
+      PublishCorrectedMap(*pending_solve_->input.terrain, pending_solve_->map_stamp);
+    }
   }
 
   void CompleteSolve() {
@@ -1136,6 +1187,8 @@ class TerrainPlannerNode : public rclcpp::Node {
 
   rclcpp::Subscription<b2_terrain_planner::msg::LocomotionState>::SharedPtr state_sub_;
   rclcpp::Subscription<grid_map_msgs::msg::GridMap>::SharedPtr map_sub_;
+  rclcpp::Publisher<grid_map_msgs::msg::GridMap>::SharedPtr corrected_map_pub_;
+  std::optional<std::chrono::steady_clock::time_point> last_corrected_map_publish_;
   rclcpp::Publisher<b2_terrain_planner::msg::LocomotionPlan>::SharedPtr plan_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr solve_status_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pipeline_status_pub_;
