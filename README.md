@@ -9,15 +9,15 @@ GUI·RViz·지도·TAMOLS·시각화 TF를 함께 실행하고, 지도 입력은
 속도와 yaw 속도이며, 기본 0.25초 동안 새 명령이 없으면 0으로 처리한다.
 `/terrain_planner_node/effective_command`에서 실제 계획 입력에 사용하는 값을 확인할 수 있다.
 단독 실행의 고정 `command` 파라미터는 `command_topic`이 비어 있을 때만 사용한다.
-통합 설정은 raw 입력 보행 비교를 위해 접촉 기억 패치와 전역 z 재정착을 모두 끈다.
+통합 설정은 raw 지도 진단 중 작은 접촉 기억 패치만 켜고 전역 z 재정착은 끈다.
 명령 전달 및 국소 지도 보정과 전체 폐루프 보행 성공은 별도로 검증한다.
 `/terrain_planner/elevation_map_corrected`는 실제 SQP 입력의 z 보정·접촉발 패치 적용 후
 지도를 최대 10 Hz로 발행한다(reliable/transient-local, 마지막 1개). 원본 지도 시각과
 좌표를 유지하며 미관측 셀은 NaN이다. 새 계획 입력이 없으면 마지막 지도만 유지한다.
 비평지 sim `--tamols --rviz`의 기본 표시는 `RawElevationMap`이며,
 `CorrectedElevationMap`을 별도로 켜서 실제 SQP 입력과 비교한다.
-`map_datum_reanchor.enabled: false`, `support_patch.enabled: false`로 raw 지도에
-planner의 높이 보정·접촉 패치를 추가하지 않는다. CuPy 시작 초기화도
+`map_datum_reanchor.enabled: false`, `support_patch.enabled: true`로 planner 입력에만
+반폭 0.05m 접촉 패치를 적용한다. CuPy raw 셀은 바꾸지 않는다. CuPy 시작 초기화도
 `use_initializer_at_start: false`로 끈다. odom 추정기와 CuPy 내부 융합 설정은 바꾸지 않는다.
 sim `--tamols`는 원본·보정 지도와 발 상태·odom 전체 메시지를 deploy의
 `runtime_logs/map_history_*` rosbag으로 기록한다. 원본 지도 보정이나 보행 개선 자체를 뜻하지 않는다.

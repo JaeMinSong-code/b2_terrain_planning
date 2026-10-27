@@ -17,8 +17,8 @@ terrain_planner_node:
     state_max_age: 0.25
     map_max_age: 1.0
     require_map: true
-    # raw 입력 보행 비교 중 접촉 기억 패치를 끈다(활성화 시 10x10 cm).
-    support_patch.enabled: false
+    # raw 지도 진단 중 planner 입력에만 작은 접촉 기억 패치를 켠다(10x10 cm).
+    support_patch.enabled: true
     support_patch.half_width: 0.05
     # 발 중심·접촉면 기준 검증 중 전역 z 재정착은 잠시 끈다.
     # CuPy 시작 초기화도 elevation_map_sim.yaml에서 별도로 끈다.
