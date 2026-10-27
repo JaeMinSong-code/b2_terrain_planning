@@ -1,7 +1,8 @@
 /**
  * @file support_patch_test.cpp
  * @brief 접촉 지도 보정의 조회 가능성·높이·범위·접촉 마스크를 검증한다.
- * @version 0.0.1
+ * @version 0.0.2
+ * @update 2026-10-27: 작은 발자국·이륙 후 기억·재착지·지도 이동과 초기화를 검증함.
  * @update 2026-10-17: 미관측/높이 오차/겹침/비접촉/경계/해상도 회귀 시험을 추가함.
  */
 #include "b2_terrain_planner/support_patch.h"
@@ -69,6 +70,83 @@ void Run(double resolution) {
   Check(ApplySupportPatches(&single, feet, {true, false, false, false}, half_width) == 0,
         "outside foot altered map");
 }
+void RunMemory(double resolution) {
+  HeightMap raw;
+  const int n = static_cast<int>(std::round(2.0 / resolution));
+  raw.resolution = resolution;
+  raw.origin = Eigen::Vector2d::Constant(-1.0 + 0.5 * resolution);
+  raw.heights = Eigen::MatrixXd::Constant(n, n, -0.032);
+  raw.valid = Eigen::ArrayXXi::Zero(n, n);
+  raw.variance = Eigen::MatrixXd::Constant(n, n, 0.01);
+  std::array<Eigen::Vector3d, 4> feet{};
+  feet[0] << 0.013, 0.021, 0.12;
+  const double width = SupportPatchHalfWidth(0.05, resolution, 0.5);
+  Check(width == 0.05, "filter enlarged the contact footprint");
+  SupportPatchMemory memory;
+  memory.SyncLayout(raw);
+  memory.Observe(feet, {true, false, false, false}, width);
+  auto first = raw;
+  const int count = memory.ApplyTo(&first);
+  Check(count > 0, "small footprint was not recorded");
+  for (int row = 0; row < n; ++row) {
+    for (int col = 0; col < n; ++col) {
+      const Eigen::Vector2d xy = raw.origin + resolution * Eigen::Vector2d(col, row);
+      const bool inside = (xy - feet[0].head<2>()).cwiseAbs().maxCoeff() <= width + 1e-12;
+      if (inside) {
+        Check(first.valid(row, col) && first.heights(row, col) == 0.12,
+              "contact height not stored");
+      } else {
+        Check(first.valid(row, col) == raw.valid(row, col) &&
+              first.heights(row, col) == raw.heights(row, col), "footprint expanded");
+      }
+    }
+  }
+  // 이륙한 발 높이를 저장하지 않으며 새 원본 지도가 와도 기존 접촉 높이를 유지한다.
+  feet[0].z() = 0.8;
+  memory.Observe(feet, {false, false, false, false}, width);
+  memory.SyncLayout(raw);
+  auto lifted = raw;
+  Check(memory.ApplyTo(&lifted) == count && lifted.heights.isApprox(first.heights),
+        "lifting or new raw map erased contact history");
+  auto shifted = raw;
+  shifted.origin += Eigen::Vector2d(2 * resolution, -resolution);
+  memory.SyncLayout(shifted);
+  Check(memory.ApplyTo(&shifted) == count, "rolling map lost overlapping contacts");
+  for (int row = 0; row < n - 1; ++row) {
+    for (int col = 2; col < n; ++col) {
+      if (first.valid(row, col)) {
+        Check(shifted.valid(row + 1, col - 2) &&
+              shifted.heights(row + 1, col - 2) == first.heights(row, col),
+              "contact moved in world coordinates with rolling map");
+      }
+    }
+  }
+  feet[0].z() = 0.22;
+  memory.Observe(feet, {true, false, false, false}, width);
+  auto landed = shifted;
+  memory.ApplyTo(&landed);
+  for (int row = 0; row < n; ++row) {
+    for (int col = 0; col < n; ++col) {
+      if (landed.valid(row, col)) Check(landed.heights(row, col) == 0.22, "recontact kept old height");
+    }
+  }
+  auto far = raw;
+  far.origin.x() += 10.0;
+  memory.SyncLayout(far);
+  Check(memory.ApplyTo(&far) == 0, "out-of-window contact retained");
+  memory.SyncLayout(raw);
+  auto returned = raw;
+  Check(memory.ApplyTo(&returned) == 0, "discarded contacts resurrected");
+  memory.Observe(feet, {true, false, false, false}, width);
+  auto other_frame = raw;
+  other_frame.frame = "new_odom";
+  memory.SyncLayout(other_frame);
+  Check(memory.ApplyTo(&other_frame) == 0, "old frame contacts reused");
+  memory.SyncLayout(raw);
+  memory.Observe(feet, {true, false, false, false}, width);
+  memory.Reset();
+  Check(memory.ApplyTo(&returned) == 0, "explicit reset retained contacts");
+}
 }  // namespace
 
 int main() {
@@ -76,7 +154,10 @@ int main() {
     Run(0.05);
     Run(0.10);
     Run(0.02);
-    std::cout << "PASS support patches: query/height, mask, overlap, bounds, untouched cells\n";
+    RunMemory(0.02);
+    RunMemory(0.05);
+    RunMemory(0.10);
+    std::cout << "PASS support patches: narrow footprint, retained contacts, recontact, rolling map, reset\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

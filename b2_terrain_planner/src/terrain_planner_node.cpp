@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.27
+ * @version 0.0.28
+ * @update 2026-10-27: 좁은 착지 영역을 기억하고 발 이륙·새 지도 수신 후에도 유지함.
  * @update 2026-10-27: 보정된 계획 입력 지도를 RViz 진단 토픽으로 발행함.
- * @update 2026-10-25: 착지 대기는 계획 입력만 0으로 덮고 사용자 램프는 계속 진행하도록 수정함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -88,7 +88,7 @@ class TerrainPlannerNode : public rclcpp::Node {
     swing_height_ = declare_parameter<double>("swing_height", 0.10);
     require_map_ = declare_parameter<bool>("require_map", true);
     support_patch_enabled_ = declare_parameter<bool>("support_patch.enabled", false);
-    support_patch_half_width_ = declare_parameter<double>("support_patch.half_width", 0.30);
+    support_patch_half_width_ = declare_parameter<double>("support_patch.half_width", 0.05);
     if (!std::isfinite(support_patch_half_width_) || support_patch_half_width_ <= 0) {
       throw std::invalid_argument("support_patch.half_width must be positive and finite");
     }
@@ -444,6 +444,19 @@ class TerrainPlannerNode : public rclcpp::Node {
     return -1;
   }
 
+  void RememberSupportContacts() {
+    if (!support_patch_enabled_ || !terrain_ || !state_ ||
+        !Fresh(state_->header.stamp, state_max_age_)) return;
+    std::array<Eigen::Vector3d, 4> feet;
+    std::array<bool, 4> contacts{};
+    for (int leg = 0; leg < 4; ++leg) {
+      const auto& foot = state_->foot_position[leg];
+      feet[leg] << foot.x, foot.y, foot.z;
+      contacts[leg] = state_->contact_confirmed[leg] && state_->contact_estimated[leg];
+    }
+    support_patch_memory_.Observe(feet, contacts, support_patch_half_width_);
+  }
+
   void OnMap(const grid_map_msgs::msg::GridMap& msg) {
     if (msg.header.frame_id != frame_ || !Fresh(msg.header.stamp, map_max_age_)) return;
     const int ev = LayerIndex(msg, elevation_layer_);
@@ -497,6 +510,10 @@ class TerrainPlannerNode : public rclcpp::Node {
       }
     }
     terrain_ = std::move(hm);
+    if (support_patch_enabled_) {
+      support_patch_memory_.SyncLayout(*terrain_);
+      RememberSupportContacts();
+    }
     map_stamp_ = msg.header.stamp;
   }
 
@@ -665,6 +682,7 @@ class TerrainPlannerNode : public rclcpp::Node {
       }
     }
     state_ = msg;
+    RememberSupportContacts();
     if (UpdateTouchdownStop(msg)) {
       replan = true;
       const char* event = "touchdown_stop_released";
@@ -689,6 +707,7 @@ class TerrainPlannerNode : public rclcpp::Node {
       swing_references_ = {};
       state_.reset();
       terrain_.reset();
+      support_patch_memory_.Reset();
       previous_.reset();
       DiscardRetrySeed();
       published_plans_.clear();
@@ -831,15 +850,10 @@ class TerrainPlannerNode : public rclcpp::Node {
       input.feet.row(leg) << foot.x, foot.y, foot.z;
     }
     if (support_patch_enabled_ && input.terrain) {
-      std::array<Eigen::Vector3d, 4> feet;
-      for (int leg = 0; leg < 4; ++leg) feet[leg] = input.feet.row(leg).transpose();
-      const double half_width = SupportPatchHalfWidth(support_patch_half_width_,
-          input.terrain->resolution, settings_.terrain.smoothing_sigma);
-      const int count = ApplySupportPatches(&*input.terrain, feet,
-                                           state.contact_estimated, half_width);
+      const int count = support_patch_memory_.ApplyTo(&*input.terrain);
       RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
-                          "Support patch: %d cells, half-width %.3f m (planner input only)",
-                          count, half_width);
+                          "Support contact memory: %d cells, half-width %.3f m (planner input only)",
+                          count, support_patch_half_width_);
     }
     if (state.gait_clock_valid && !CommitActiveSwingFootholds(robot_, swing_references_, &input)) {
       PublishPipelineStatus("deferred", "active_swing_reference_missing");
@@ -1182,7 +1196,8 @@ class TerrainPlannerNode : public rclcpp::Node {
   double plan_rate_hz_ = 10.0, sample_dt_ = 0.02, swing_height_ = 0.10;
   bool require_map_ = true;
   bool support_patch_enabled_ = false;
-  double support_patch_half_width_ = 0.30;
+  double support_patch_half_width_ = 0.05;
+  SupportPatchMemory support_patch_memory_;
   double state_max_age_ = 0.25, map_max_age_ = 1.0;
 
   rclcpp::Subscription<b2_terrain_planner::msg::LocomotionState>::SharedPtr state_sub_;

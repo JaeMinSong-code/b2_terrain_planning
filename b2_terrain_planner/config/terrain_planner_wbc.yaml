@@ -17,7 +17,7 @@ terrain_planner_node:
     state_max_age: 0.25
     map_max_age: 1.0
     require_map: true
-    # 현재 접촉 발 주변만 발 링크 높이와 같은 지면으로 가정한다.
+    # 확인 접촉 발 주변 10x10 cm만 발 높이로 기억한다(이륙 후에도 유지).
     support_patch.enabled: true
-    support_patch.half_width: 0.30
+    support_patch.half_width: 0.05
     publish_markers: true

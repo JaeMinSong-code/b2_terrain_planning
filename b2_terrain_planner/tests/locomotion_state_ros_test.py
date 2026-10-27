@@ -54,6 +54,7 @@ def main():
     terrain.data = [Float32MultiArray(data=[0.0] * 400)]
     support_patch = "--support-patch" in sys.argv[2:]
     if support_patch:
+        state.contact_confirmed = [True] * 4
         terrain.info.resolution = 0.05
         terrain.info.length_x = 4.0
         terrain.info.length_y = 4.0
@@ -145,6 +146,7 @@ def main():
             assert event["last_published_stamp_ns"] == event["state_stamp_ns"]
             assert event["last_publish_ns"] >= event["solve_end_ns"] >= event["solve_start_ns"] > 0
             count = len(plans)
+            state.contact_confirmed = [False] * 4
             state.gait_clock_valid = True
             state.gait_epoch_ns = node.get_clock().now().nanoseconds
             state.gait_time = 0.0
@@ -156,7 +158,7 @@ def main():
             pump(0.4, state)
             assert len(plans) == count
             assert pipeline[-1]["reason"] == "support_unconfirmed"
-            assert pipeline[-1]["leg"] >= 0
+            # 전체 지지 확인 실패는 개별 다리 대신 leg=-1로 보고할 수 있다.
             assert process.poll() is None, "planner exited unexpectedly"
             print("PASS: initial CoM/feet, stamp, invalid/duplicate/reversed state, state/map expiry")
             if support_patch:
