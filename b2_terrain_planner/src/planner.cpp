@@ -1,9 +1,9 @@
 /**
  * @file planner.cpp
  * @brief 접촉 조합별 생성 Jacobian과 지형 비용의 Gauss–Newton QP로 trot을 최적화한다.
- * @version 0.0.37
+ * @version 0.0.38
+ * @update 2026-10-27: 현재 발·확정 착지점의 지도 조회 거부를 없애고 확정 XYZ를 유지함.
  * @update 2026-10-25: 정지 전용 제약·초기값과 사후 지도·IK 검사 및 후처리 시간 초과 거부를 제거함.
- * @update 2026-10-25: 착지 대기 정지·정지 후 유지와 도달 여유를 최적화 및 최종 검사에 적용함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -352,19 +352,11 @@ class Problem {
         throw std::invalid_argument("terrain/input frame mismatch");
       }
       for (int leg = 0; leg < 4; ++leg) {
-        const Eigen::Vector2d xy = input_.feet.row(leg).head<2>().transpose();
-        // 현재 지지는 추정 발 위치를 사용한다. 지도와의 높이 차이로 재계획을 막지 않는다.
-        // 지도 조회 가능성 및 다음 착지점의 지형 제약·최종 검사는 유지한다.
-        if (!terrain_->IsQueryable(xy)) {
-          throw std::invalid_argument("input foot position not queryable");
-        }
+        // 현재 발은 측정 XYZ를 사용한다. 지지·스윙 모두 발 아래 지도 구멍으로
+        // 재계획을 막지 않으며, 새 착지점을 선택할 때만 관측 지형을 조회한다.
         if (input_.committed_footholds[leg]) {
-          // 지도가 갱신되어도 확정 Z를 지면 샘플로 다시 덮어쓰지 않는다.
-          // 지형 불일치는 기존 지형 제약/최종 검사로 보고한다.
+          // 확정 착지점은 지도 갱신·미관측 여부와 무관하게 전달받은 XYZ를 유지한다.
           const auto& committed = *input_.committed_footholds[leg];
-          if (!terrain_->IsQueryable(committed.head<2>())) {
-            throw std::invalid_argument("committed foothold not queryable");
-          }
           terrain_initial_.row(leg) = committed.transpose();
           continue;
         }
@@ -745,13 +737,17 @@ class Problem {
       group = kTerrain;
       for (int leg = 0; leg < 4; ++leg) {
         const int column = feet_offset_ + 3 * leg;
-        const auto residual = terrain_->Residual(x.segment<3>(column));
-        if (need_cost) out.cost += residual.values.squaredNorm();
-        if (full) {
-          out.gradient.segment<3>(column).noalias() +=
-              2 * residual.jacobian.transpose() * residual.values;
-          out.hessian.block<3, 3>(column, column).noalias() +=
-              2 * residual.jacobian.transpose() * residual.jacobian;
+        // 확정 XYZ에는 지형 비용을 다시 계산하지 않는다. 아래 Z 등식과 기존
+        // XY 등식은 유지하므로 지도 구멍이 생겨도 착지점은 변하지 않는다.
+        if (!input_.committed_footholds[leg]) {
+          const auto residual = terrain_->Residual(x.segment<3>(column));
+          if (need_cost) out.cost += residual.values.squaredNorm();
+          if (full) {
+            out.gradient.segment<3>(column).noalias() +=
+                2 * residual.jacobian.transpose() * residual.values;
+            out.hessian.block<3, 3>(column, column).noalias() +=
+                2 * residual.jacobian.transpose() * residual.jacobian;
+          }
         }
         double z_limit = robot_.leg_max;
         if (FootFixed(leg)) z_limit = 0.0;

@@ -1,11 +1,12 @@
 /**
  * @file committed_swing_test.cpp
  * @brief 명령·지도 변경 시 진행 중 착지점의 최적화 고정과 착지 후 해제를 검증한다.
- * @version 0.0.3
+ * @version 0.0.4
+ * @update 2026-10-27: 확정 착지점 아래 지도 관측이 사라져도 XYZ 유지와 재계획을 검증함.
  * @update 2026-10-21: 착지 대기 중 몸통 시간 진행과 유한 재계획·보행 재개 연속성을 반영함.
- * @update 2026-10-19: 연속 몸통 연결·구간 이동과 중단 반복값의 전체 재검증을 확인함.
  */
 #include "b2_terrain_planner/committed_swing.h"
+#include <cmath>
 #include <iostream>
 #include <stdexcept>
 
@@ -54,6 +55,27 @@ int main() {
           !input.committed_footholds[0] && !input.committed_footholds[3], "wrong committed legs");
     const auto baseline = Solve(robot, input, settings, &first);
     Check(baseline.success, "baseline: " + baseline.status);
+    Input missing_committed = input;
+    auto& missing_map = *missing_committed.terrain;
+    for (int leg : {1, 2}) {
+      const Eigen::Vector2d index =
+          (references[leg].target.head<2>() - missing_map.origin) / missing_map.resolution;
+      const int col = static_cast<int>(std::floor(index.x()));
+      const int row = static_cast<int>(std::floor(index.y()));
+      missing_map.valid.block<2, 2>(row, col).setZero();
+    }
+    const TerrainModel missing_terrain(missing_map, settings.terrain);
+    for (int leg : {1, 2}) {
+      Check(!missing_terrain.IsQueryable(references[leg].target.head<2>()),
+            "committed test location is still observed");
+    }
+    const auto unobserved_result = Solve(robot, missing_committed, settings, &first);
+    Check(unobserved_result.success && unobserved_result.optimization_started,
+          "unobserved committed foothold blocked planning: " + unobserved_result.status);
+    for (int leg : {1, 2}) {
+      Check((unobserved_result.footholds.row(leg).transpose() - references[leg].target).norm() < 1e-7,
+            "unobserved committed touchdown changed");
+    }
     input.command.x() = -.15;
     input.command.y() = .03;
     input.terrain->origin += Eigen::Vector2d(.05, -.05);

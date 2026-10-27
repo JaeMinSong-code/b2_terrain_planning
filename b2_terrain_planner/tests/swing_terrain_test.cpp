@@ -1,9 +1,9 @@
 /**
  * @file swing_terrain_test.cpp
  * @brief 스윙·지지발의 높이 불일치 허용과 다음 착지점의 지형 검사를 검증한다.
- * @version 0.0.4
+ * @version 0.0.5
+ * @update 2026-10-27: 현재 지지·스윙 발 아래 미관측 셀이 있어도 SQP 진입을 검증함.
  * @update 2026-10-25: 사후 지도 검사 없이 기존 지형 비용과 착지점 계산이 유지되는지 검증함.
- * @update 2026-10-23: 지지발 높이 차이에서 정지 계획 생성과 지도 조회 오류 거부를 검증함.
  */
 #include "b2_terrain_planner/planner.h"
 
@@ -55,14 +55,31 @@ void Run(double gait_time) {
     Check(std::abs(result.footholds(leg, 2)) < settings.terrain.contact_tolerance,
           "future landing is above flat terrain");
   }
-  // 현재 발의 지도 조회 가능성은 높이 일치 검사와 별도로 유지한다.
-  Input outside = input;
-  outside.feet(0, 0) = 100.0;
-  const auto rejected = Solve(robot, outside, settings);
-  Check(!rejected.success && !rejected.optimization_started &&
-            rejected.stage == "problem_setup" &&
-            rejected.status == "input foot position not queryable",
-        "out-of-map input foot was not rejected before optimization");
+  // 측정된 현재 발 아래는 지지·스윙 모두 미관측이어도 된다. 다음 착지점은
+  // 주변의 관측된 영역에서 선택하며, 현재 발 위치를 지도에 투영하지 않는다.
+  Input unobserved = input;
+  auto& map = *unobserved.terrain;
+  for (int leg = 0; leg < 4; ++leg) {
+    const Eigen::Vector2d index =
+        (input.feet.row(leg).head<2>().transpose() - map.origin) / map.resolution;
+    const int col = static_cast<int>(std::floor(index.x()));
+    const int row = static_cast<int>(std::floor(index.y()));
+    map.valid.block<2, 2>(row, col).setZero();
+  }
+  const TerrainModel terrain(map, settings.terrain);
+  for (int leg = 0; leg < 4; ++leg) {
+    Check(!terrain.IsQueryable(input.feet.row(leg).head<2>().transpose()),
+          "current foot test location is still observed");
+  }
+  const auto replanned = Solve(robot, unobserved, settings);
+  Check(replanned.optimization_started && replanned.iterations > 0,
+        "unobserved current foot blocked optimization: " + replanned.status);
+  Check(replanned.seed_context.initial_feet.isApprox(input.feet),
+        "measured current feet changed on unobserved terrain");
+  // 새 착지 후보의 지형 비용과 SQP 수렴은 별개다. 현재 위치 조회 때문에
+  // problem_setup에서 거부하지 않는지 검증하며, 계산 성공으로 해석하지 않는다.
+  std::cout << "PASS unobserved current feet reached SQP, gait_time=" << gait_time
+            << " status=" << replanned.status << '\n';
   auto invalid_settings = settings;
   invalid_settings.time_limit = 0;
   const auto invalid = Solve(robot, input, invalid_settings);
