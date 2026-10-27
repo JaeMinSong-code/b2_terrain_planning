@@ -1,10 +1,9 @@
 /**
  * @file terrain.h
  * @brief 정적 높이맵의 보간·유효성·착지 비용과 후보 검색 계약.
- * @version 0.0.7
+ * @version 0.0.8
+ * @update 2026-10-27: 분산 상한 설정을 제거하고 분산을 지도 메타데이터로 유지함.
  * @update 2026-10-26: 착지 높이 조회 유효성과 평활·경계 비용 유효성을 분리함.
- * @update 2026-10-14: 맵 조회 가능 여부와 비용 계약에서 추가 하드 판정 설정을 제거함.
- * @update 2026-10-14: 예측 도달성 조건을 후보 검색에 선택적으로 적용함.
  */
 #ifndef B2_TERRAIN_PLANNER_TERRAIN_H_
 #define B2_TERRAIN_PLANNER_TERRAIN_H_
@@ -20,7 +19,7 @@ namespace b2_terrain_planner {
 struct HeightMap {
   Eigen::MatrixXd heights;
   Eigen::ArrayXXi valid;
-  Eigen::MatrixXd variance;
+  Eigen::MatrixXd variance;  // 지도 메타데이터. 계획의 셀 사용 여부를 제한하지 않는다.
   Eigen::Vector2d origin = Eigen::Vector2d::Zero();
   double resolution = 0.05;
   std::string frame = "odom";
@@ -28,7 +27,6 @@ struct HeightMap {
 
 struct TerrainSettings {
   double smoothing_sigma = 0.05;  // m, Gaussian 표준편차.
-  double max_variance = 0.0025;   // m².
   double contact_tolerance = 0.005;  // m.
   double ground_weight = 1e4;
   double edge_weight = 3.0;

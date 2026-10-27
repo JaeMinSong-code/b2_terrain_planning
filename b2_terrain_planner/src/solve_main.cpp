@@ -1,9 +1,9 @@
 /**
  * @file solve_main.cpp
  * @brief ROS 없이 평지·지형 입력을 읽고 검증된 몸통 계획을 YAML로 출력한다.
- * @version 0.0.24
+ * @version 0.0.25
+ * @update 2026-10-27: 셀 분산 상한 설정의 YAML 입력을 제거함.
  * @update 2026-10-15: B2 YAML 실행과 warm start를 유지하고 합성 모델·재생·제약 해제·상세 추적 도구를 제거함.
- * @update 2026-10-14: 폐기한 추가 접촉력 검증기와 전용 시간의 YAML 출력을 제거함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -137,7 +137,6 @@ void ReadInput(const std::string& path, b2_terrain_planner::Robot* robot,
     auto& t = settings->terrain;
     for (auto item : {
              std::make_pair("smoothing_sigma", &t.smoothing_sigma),
-             {"max_variance", &t.max_variance},
              {"contact_tolerance", &t.contact_tolerance},
              {"ground_weight", &t.ground_weight}, {"edge_weight", &t.edge_weight},
              {"collision_weight", &t.collision_weight},

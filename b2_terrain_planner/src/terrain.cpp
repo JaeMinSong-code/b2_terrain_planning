@@ -1,10 +1,9 @@
 /**
  * @file terrain.cpp
  * @brief 유효성 보존 높이맵 필터와 일관된 보간 미분·착지 후보 검색.
- * @version 0.0.8
+ * @version 0.0.9
+ * @update 2026-10-27: 셀 분산에 따른 지형 사용 거부를 제거하고 관측 높이로 유효성을 판단함.
  * @update 2026-10-26: 착지 높이 조회(관측 셀)와 경계 비용(필터 지원 영역) 유효성을 분리함.
- * @update 2026-10-14: 모서리 비용을 유지하고 주변 평탄성·기울기 하드 판정을 제거함.
- * @update 2026-10-14: 지지면 후보에 호출자가 제공한 도달성 조건을 적용함.
  */
 #include "b2_terrain_planner/terrain.h"
 
@@ -46,7 +45,7 @@ TerrainModel::TerrainModel(const HeightMap& map,
       !std::isfinite(map.resolution) || map.resolution <= 0 || map.frame.empty()) {
     throw std::invalid_argument("invalid terrain geometry");
   }
-  for (double value : {settings.smoothing_sigma, settings.max_variance,
+  for (double value : {settings.smoothing_sigma,
                        settings.contact_tolerance,
                        settings.ground_weight, settings.collision_distance}) {
     if (!std::isfinite(value) || value <= 0) {
@@ -70,9 +69,7 @@ TerrainModel::TerrainModel(const HeightMap& map,
       if (map.valid(row, col) != 0 && map.valid(row, col) != 1) {
         throw std::invalid_argument("terrain valid must contain 0 or 1");
       }
-      if (map.valid(row, col) && std::isfinite(map.heights(row, col)) &&
-          std::isfinite(map.variance(row, col)) && map.variance(row, col) >= 0 &&
-          map.variance(row, col) <= settings.max_variance) {
+      if (map.valid(row, col) && std::isfinite(map.heights(row, col))) {
         known(row, col) = 1;
         heights(row, col) = map.heights(row, col);
       }

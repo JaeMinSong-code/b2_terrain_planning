@@ -1,13 +1,15 @@
 /**
  * @file terrain_validity_test.cpp
  * @brief 착지 높이 조회 유효성과 경계 비용 유효성의 분리를 검증한다.
- * @version 0.0.1
+ * @version 0.0.2
+ * @update 2026-10-27: 분산값이 높이 조회·경계 비용·착지 후보를 차단하지 않음을 검증함.
  * @update 2026-10-26: 관측 착지 셀이 주변 미관측에도 조회 가능하고, 경계 비용은
  *                     필터 지원 영역이 known일 때만 적용됨을 검증함.
  */
 #include "b2_terrain_planner/terrain.h"
 
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -46,6 +48,26 @@ void Run() {
   const auto full_sample = full.Sample(probe);
   Check(full_sample.edge.squaredNorm() > 1e-6,
         "observed step lost its boundary cost");
+
+  // 기록된 CuPy 범위와 비정상 분산 메타데이터 모두 관측 높이를 차단하지 않는다.
+  for (double variance : {0.012455, 0.107074, 0.474787, -1.0,
+                          std::numeric_limits<double>::infinity(),
+                          std::numeric_limits<double>::quiet_NaN()}) {
+    HeightMap uncertain = StepMap();
+    uncertain.variance.setConstant(variance);
+    const TerrainModel terrain(uncertain, settings);
+    Check(terrain.IsQueryable(probe), "variance blocked observed terrain");
+    const auto sample = terrain.Sample(probe);
+    Check(std::abs(sample.height - full_sample.height) < 1e-12,
+          "variance changed observed height");
+    Check((sample.edge - full_sample.edge).norm() < 1e-12,
+          "variance changed the boundary cost");
+    const Eigen::Vector2d nominal = CellCenter(uncertain, 10, 16);
+    const auto found = terrain.FindFoothold(
+        nominal, nominal.array() - 0.10, nominal.array() + 0.10);
+    Check(std::abs(found.z() - 0.1) < 1e-6,
+          "variance blocked an observed foothold candidate");
+  }
 
   // 같은 질의점을 포함하지 않는 이웃 셀 하나만 미관측으로 바꾼다.
   // (14,7)은 (10,11)의 필터 지원 영역(halo=4) 안이지만 2x2 착지 블록 밖이다.

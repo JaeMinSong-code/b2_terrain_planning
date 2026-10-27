@@ -192,9 +192,11 @@ RBDL로 FK·CoM·질량·CoM 기준 관성을 계산한다. 관절 순서는 FL/
 
 정적 지형은 `terrain`의 `frame`, `resolution`, `origin`, `heights`, `variance`, `valid`로
 전달한다. 배열은 행=Y, 열=X 증가 방향이며, `origin`은 최소 모서리 좌표다.
-입력 `frame`과 지형 `frame`이 일치해야 한다. `terrain_settings`에서 평활 폭·분산 상한·
+입력 `frame`과 지형 `frame`이 일치해야 한다. `terrain_settings`에서 평활 폭·
 접촉 오차·지형 비용을 조정할 수 있다. 필드와 기본값은
 [terrain.h](b2_terrain_planner/include/b2_terrain_planner/terrain.h)를 따른다.
+셀의 `variance`는 메타데이터로 보존하며 값에 따라 지형을 제외하지 않는다.
+유효 표시와 유한한 관측 높이로 셀을 사용하며, 기존 `max_variance` 설정은 제거됐다.
 
 출력은 상태·시간·제약 위반·모델 정보이며, 성공할 때만 착지점과 구간별 다항식 계수가
 포함된다. 좌표 순서는 CoM XYZ, yaw/pitch/roll(ZYX)이고 계수의 시간 단위는 실제 초다.
