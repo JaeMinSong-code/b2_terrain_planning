@@ -14,7 +14,11 @@ GUI·RViz·지도·TAMOLS·시각화 TF를 함께 실행하고, 지도 입력은
 `/terrain_planner/elevation_map_corrected`는 실제 SQP 입력의 z 보정·접촉발 패치 적용 후
 지도를 최대 10 Hz로 발행한다(reliable/transient-local, 마지막 1개). 원본 지도 시각과
 좌표를 유지하며 미관측 셀은 NaN이다. 새 계획 입력이 없으면 마지막 지도만 유지한다.
-비평지 sim `--tamols --rviz`의 기본 표시는 이 지도이며, 원본은 `RawElevationMap`을 켜서 본다.
+비평지 sim `--tamols --rviz`의 기본 표시는 `RawElevationMap`이며,
+`CorrectedElevationMap`을 별도로 켜서 실제 SQP 입력과 비교한다.
+발 중심·접촉면 기준 검증 중에는 `map_datum_reanchor.enabled: false`로 전역 z 재정착을
+잠시 끈다. 접촉 기억 패치와 CuPy 시작 초기화는 유지하므로 SQP 입력이 raw와 완전히
+같아지는 설정은 아니다. odom 추정기와 CuPy 내부 융합 설정은 바꾸지 않는다.
 sim `--tamols`는 원본·보정 지도와 발 상태·odom 전체 메시지를 deploy의
 `runtime_logs/map_history_*` rosbag으로 기록한다. 원본 지도 보정이나 보행 개선 자체를 뜻하지 않는다.
 아래의 GT/실기 센서 전용 맵 실행은 개별 진단용 경로다.

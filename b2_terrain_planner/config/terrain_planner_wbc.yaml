@@ -20,4 +20,7 @@ terrain_planner_node:
     # 확인 접촉 발 주변 10x10 cm만 발 높이로 기억한다(이륙 후에도 유지).
     support_patch.enabled: true
     support_patch.half_width: 0.05
+    # 발 중심·접촉면 기준 검증 중 전역 z 재정착은 잠시 끈다.
+    # 접촉 기억 패치와 CuPy 시작 초기화는 별도이며 유지한다.
+    map_datum_reanchor.enabled: false
     publish_markers: true
