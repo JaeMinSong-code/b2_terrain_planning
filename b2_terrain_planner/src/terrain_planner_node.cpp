@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.28
+ * @version 0.0.29
+ * @update 2026-10-27: 접촉 패치 전 지형으로 발 크기를 고려한 스윙 통과 경로를 생성함.
  * @update 2026-10-27: 좁은 착지 영역을 기억하고 발 이륙·새 지도 수신 후에도 유지함.
- * @update 2026-10-27: 보정된 계획 입력 지도를 RViz 진단 토픽으로 발행함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -86,6 +86,9 @@ class TerrainPlannerNode : public rclcpp::Node {
     plan_rate_hz_ = declare_parameter<double>("plan_rate_hz", 10.0);
     sample_dt_ = declare_parameter<double>("sample_dt", 0.02);
     swing_height_ = declare_parameter<double>("swing_height", 0.10);
+    // B2 MuJoCo 발 충돌 cylinder의 반경과 반길이. 발 중심 경로의 지면 여유에 사용한다.
+    swing_foot_radius_ = declare_parameter<double>("swing_foot_radius", 0.0351);
+    swing_foot_half_width_ = declare_parameter<double>("swing_foot_half_width", 0.0275);
     require_map_ = declare_parameter<bool>("require_map", true);
     support_patch_enabled_ = declare_parameter<bool>("support_patch.enabled", false);
     support_patch_half_width_ = declare_parameter<double>("support_patch.half_width", 0.05);
@@ -156,6 +159,7 @@ class TerrainPlannerNode : public rclcpp::Node {
     builtin_interfaces::msg::Time map_stamp;
     std::uint64_t generation = 0;
     bool touchdown_stop = false;
+    std::optional<HeightMap> swing_terrain;
   };
 
   struct PublishedPlan {
@@ -581,7 +585,8 @@ class TerrainPlannerNode : public rclcpp::Node {
   }
 
   void UpdateSwingReferences(const Result& r, const Feet& feet0,
-                             const b2_terrain_planner::msg::LocomotionState& state) {
+                             const b2_terrain_planner::msg::LocomotionState& state,
+                             const HeightMap* swing_terrain = nullptr) {
     const double now_phase = r.seed_context.gait_time;
     for (int leg = 0; leg < 4; ++leg) {
       for (std::size_t k = 0; k < r.phases.size(); ++k) {
@@ -611,6 +616,10 @@ class TerrainPlannerNode : public rclcpp::Node {
           next.velocity = Eigen::Vector3d(v.x, v.y, v.z);
         } else {
           next.apex_z = std::max(next.position.z(), next.target.z()) + swing_height_;
+        }
+        if (swing_terrain) {
+          next.ShapeOverTerrain(*swing_terrain, swing_height_, swing_foot_radius_,
+                                swing_foot_half_width_, settings_.terrain.contact_tolerance);
         }
         swing_references_[leg] = next;
         break;
@@ -849,6 +858,7 @@ class TerrainPlannerNode : public rclcpp::Node {
       const auto& foot = state.foot_position[leg];
       input.feet.row(leg) << foot.x, foot.y, foot.z;
     }
+    const auto swing_terrain = input.terrain;
     if (support_patch_enabled_ && input.terrain) {
       const int count = support_patch_memory_.ApplyTo(&*input.terrain);
       RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
@@ -865,7 +875,8 @@ class TerrainPlannerNode : public rclcpp::Node {
     same_state_retry_used_ = stamp_ns == last_planned_ns_;
     last_planned_ns_ = stamp_ns;
     retry_requested_ = false;
-    pending_solve_ = PendingSolve{input, state, map_stamp_, generation_, touchdown_stop_};
+    pending_solve_ = PendingSolve{input, state, map_stamp_, generation_,
+                                  touchdown_stop_, swing_terrain};
     ++attempt_seq_;
     solve_state_stamp_ns_ = stamp_ns;
     solve_start_ns_ = now().nanoseconds();
@@ -989,7 +1000,11 @@ class TerrainPlannerNode : public rclcpp::Node {
       retry_requested_ = true;
     } else {
       active_frame_ = state.header.frame_id;
-      Publish(result, input, state);
+      const HeightMap* swing_terrain = nullptr;
+      if (pending.swing_terrain) {
+        swing_terrain = &*pending.swing_terrain;
+      }
+      Publish(result, input, state, swing_terrain);
       // 실제 발행한 몸통 곡선을 다음 계산의 초기값으로 보관한다.
       previous_ = published_plans_.back().body;
       DiscardRetrySeed();
@@ -1001,7 +1016,8 @@ class TerrainPlannerNode : public rclcpp::Node {
   }
 
   void Publish(const Result& solved, const Input& input,
-               const b2_terrain_planner::msg::LocomotionState& state) {
+               const b2_terrain_planner::msg::LocomotionState& state,
+               const HeightMap* swing_terrain = nullptr) {
     const rclcpp::Time stamp(state.header.stamp);
     const Feet& feet0 = input.feet;
     // 발 접촉 스케줄은 원래 solver 결과로 만들고 몸통만 정확히 이어 붙인다.
@@ -1010,7 +1026,7 @@ class TerrainPlannerNode : public rclcpp::Node {
       foot_plan.phases = MakeHorizon(input.gait_time, robot_.period, robot_.duty);
     }
     const bool hold_gait = input.gait_hold_duration >= robot_.period;
-    if (!hold_gait) UpdateSwingReferences(foot_plan, feet0, state);
+    if (!hold_gait) UpdateSwingReferences(foot_plan, feet0, state, swing_terrain);
     Result r = solved;
     if (input.reference_prefix) {
       r = SpliceBody(*input.reference_prefix,
@@ -1193,6 +1209,7 @@ class TerrainPlannerNode : public rclcpp::Node {
   // 파라미터.
   std::string state_topic_, state_frame_, map_topic_, elevation_layer_, plan_topic_, frame_;
   std::string active_frame_ = "odom";
+  double swing_foot_radius_ = 0.0351, swing_foot_half_width_ = 0.0275;
   double plan_rate_hz_ = 10.0, sample_dt_ = 0.02, swing_height_ = 0.10;
   bool require_map_ = true;
   bool support_patch_enabled_ = false;
