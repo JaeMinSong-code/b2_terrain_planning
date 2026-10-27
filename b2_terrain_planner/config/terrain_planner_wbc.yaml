@@ -21,6 +21,6 @@ terrain_planner_node:
     support_patch.enabled: false
     support_patch.half_width: 0.05
     # 발 중심·접촉면 기준 검증 중 전역 z 재정착은 잠시 끈다.
-    # CuPy 시작 초기화는 유지하고 planner의 높이 보정은 모두 끈다.
+    # CuPy 시작 초기화도 elevation_map_sim.yaml에서 별도로 끈다.
     map_datum_reanchor.enabled: false
     publish_markers: true

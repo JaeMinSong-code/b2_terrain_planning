@@ -13,8 +13,8 @@
     resolution: 0.05
     map_length: 4.0
 
-    # 네 발 사이의 미관측 영역을 시작 시 한 번 초기화한다.
-    use_initializer_at_start: true
+    # raw 입력 비교 중 발 TF 기반 시작 초기화를 끈다.
+    use_initializer_at_start: false
     initialize_method: 'linear'
     initialize_frame_id: ['FL_foot', 'FR_foot', 'RL_foot', 'RR_foot']
     initialize_tf_offset: [0.0, 0.0, 0.0, 0.0]
