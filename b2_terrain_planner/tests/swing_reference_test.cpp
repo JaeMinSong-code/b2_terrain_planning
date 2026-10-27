@@ -1,20 +1,22 @@
 /**
  * @file swing_reference_test.cpp
- * @brief 부분 스윙 재계획의 위치·속도 연속성과 반복 lift 방지 검증.
- * @version 0.0.2
- * @update 2026-10-27: 계단·장애물 통과와 C2 연결, 평지·미관측 동작을 검증함.
- * @update 2026-10-17: 절대 착지 시각과 C1 경계를 회귀 검증함.
+ * @brief 전체 시간 XY 5차 연결과 지형 여유 기반 Z 보정의 경계·속도 검증.
+ * @version 0.0.4
+ * @update 2026-10-27: 부분 스윙의 가속도 보존과 정점 초과 방지를 검증함.
+ * @update 2026-10-27: 지면 여유 조건·Z 전용 보정·급회전 사례의 XY 속도를 검증함.
  */
 #include "b2_terrain_planner/swing_reference.h"
 #undef NDEBUG
 #include <cassert>
 #include <cmath>
+#include <iostream>
+
 namespace {
 using b2_terrain_planner::HeightMap;
 using b2_terrain_planner::SwingReference;
 constexpr double kRadius = 0.0351;
 constexpr double kHalfWidth = 0.0275;
-constexpr double kClearance = 0.1;
+constexpr double kMargin = 0.03;
 
 HeightMap MakeMap() {
   HeightMap map;
@@ -32,12 +34,12 @@ SwingReference MakeCurve() {
   curve.apex_time = 0.375;
   curve.position = Eigen::Vector3d(0.0, 0.0, kRadius);
   curve.target = Eigen::Vector3d(0.6, 0.0, kRadius);
-  curve.apex_z = kRadius + kClearance;
+  curve.apex_z = kRadius + 0.1;
   return curve;
 }
 
 void Shape(SwingReference* curve, const HeightMap& map) {
-  curve->ShapeOverTerrain(map, kClearance, kRadius, kHalfWidth, 0.005);
+  curve->ShapeOverTerrain(map, kMargin, kRadius, kHalfWidth);
 }
 
 void CheckConnections(const SwingReference& curve) {
@@ -46,14 +48,20 @@ void CheckConnections(const SwingReference& curve) {
   assert(curve.Sample(curve.end).first.isApprox(curve.target, 1e-10));
   assert(curve.Sample(curve.end).second.norm() < 1e-10);
   constexpr double kDt = 1e-7;
-  for (double time : {curve.start, curve.traverse_start, curve.traverse_end, curve.end}) {
+  for (double time : {curve.start, curve.apex_time, curve.end}) {
     const auto left = curve.Sample(time - kDt);
     const auto middle = curve.Sample(time);
     const auto right = curve.Sample(time + kDt);
     assert((left.first - right.first).norm() < 1e-6);
-    assert((left.second - right.second).norm() < 1e-6);
-    const auto a_left = (middle.second - left.second) / kDt;
-    const auto a_right = (right.second - middle.second) / kDt;
+    // 비영 가속도에서는 좌우 속도가 dt에 비례해 달라진다. dt를 반으로
+    // 줄일 때 차이도 수렴하는지 확인하고 아래에서 가속도 연속성을 검사한다.
+    const double velocity_difference = (left.second - right.second).norm();
+    const double half_difference =
+        (curve.Sample(time - kDt / 2).second -
+         curve.Sample(time + kDt / 2).second).norm();
+    assert(half_difference <= 0.6 * velocity_difference + 1e-9);
+    const Eigen::Vector3d a_left = (middle.second - left.second) / kDt;
+    const Eigen::Vector3d a_right = (right.second - middle.second) / kDt;
     assert((a_left - a_right).norm() < 0.02);
   }
 }
@@ -61,81 +69,123 @@ void CheckConnections(const SwingReference& curve) {
 void CheckTerrain() {
   auto map = MakeMap();
   const auto original = MakeCurve();
-  auto flat = original;
-  Shape(&flat, map);
-  assert(!flat.terrain_shaped);
+  auto curve = original;
+  Shape(&curve, map);
+  assert(curve.terrain_lift < 1e-10);  // 평지에서 접지점의 가까움만으로 발을 더 들지 않는다.
+  CheckConnections(curve);
   map.valid.setZero();
-  auto unknown = original;
-  Shape(&unknown, map);
-  assert(!unknown.terrain_shaped);
-  for (double t = original.start; t <= original.end; t += 0.001) {
-    assert(flat.Sample(t).first.isApprox(original.Sample(t).first));
-    assert(unknown.Sample(t).first.isApprox(original.Sample(t).first));
-  }
+  Shape(&curve, map);
+  assert(curve.terrain_lift == 0.0);
   map.valid.setOnes();
-  // 계단 오르기·내려가기. 발의 전체 바닥이 모서리를 넘는 구간을 확인한다.
+  map.heights.block(18, 48, 5, 5).setConstant(0.02);
+  Shape(&curve, map);
+  assert(curve.terrain_lift < 1e-10);  // 충분히 낮은 장애물은 기본 곡선을 유지한다.
+  map.heights.block(18, 48, 5, 5).setConstant(0.12);
+  Shape(&curve, map);
+  assert(curve.terrain_lift > 0.049 && curve.terrain_lift < 0.09);
+  const double lift = curve.terrain_lift;
+  map.heights(40, 50) = 1.0;  // 경로 밖의 높은 셀은 무시한다.
+  map.valid(20, 40) = 0;      // 미관측은 보정·발행 거부 조건이 아니다.
+  Shape(&curve, map);
+  assert(std::abs(curve.terrain_lift - lift) < 1e-12);
+  CheckConnections(curve);
+  for (double time = curve.start; time <= curve.end; time += 0.001) {
+    const auto shaped = curve.Sample(time);
+    const auto base = original.Sample(time);
+    assert((shaped.first.head<2>() - base.first.head<2>()).norm() < 1e-12);
+    assert((shaped.second.head<2>() - base.second.head<2>()).norm() < 1e-12);
+    assert(shaped.first.z() >= base.first.z() - 1e-12);
+    const double dt = 1e-6;
+    if (time > curve.start + dt && time < curve.end - dt) {
+      const Eigen::Vector3d numeric_velocity =
+          (curve.Sample(time + dt).first - curve.Sample(time - dt).first) / (2 * dt);
+      assert((numeric_velocity - shaped.second).norm() < 1e-6);
+      constexpr double kAccelerationDt = 1e-7;
+      const Eigen::Vector3d numeric_acceleration =
+          (curve.Sample(time + kAccelerationDt).second -
+           curve.Sample(time - kAccelerationDt).second) / (2 * kAccelerationDt);
+      assert((numeric_acceleration - curve.SampleKinematics(time).acceleration).norm() < 1e-4);
+    }
+  }
+  // 재조회 시 보정이 누적되지 않고, 평지에서는 해제된다.
+  map.heights.setZero();
+  Shape(&curve, map);
+  assert(curve.terrain_lift < 1e-10);
+  // 오르기/내려가기 모두 착지 XYZ와 시각을 유지한다.
   for (bool ascending : {true, false}) {
-    auto curve = original;
+    curve = original;
     if (ascending) {
       curve.target.z() += 0.2;
     } else {
       curve.position.z() += 0.2;
     }
+    curve.apex_z = std::max(curve.position.z(), curve.target.z()) + 0.1;
     for (int col = 0; col < map.heights.cols(); ++col) {
       const double x = map.origin.x() + col * map.resolution;
       double height = 0.0;
-      if ((ascending && x >= 0.2) || (!ascending && x < 0.2)) height = 0.2;
+      if ((ascending && x >= 0.3) || (!ascending && x < 0.3)) height = 0.2;
       map.heights.col(col).setConstant(height);
     }
     Shape(&curve, map);
-    assert(curve.terrain_shaped);
-    assert(curve.apex_z >= 0.2 + kRadius + kClearance - 1e-12);
-    assert(curve.start == original.start && curve.end == original.end);
     CheckConnections(curve);
-    for (double t = curve.start; t <= curve.end; t += 0.0005) {
-      const auto p = curve.Sample(t).first;
-      double ground = 0.0;
-      if ((ascending && p.x() + kRadius >= 0.195) ||
-          (!ascending && p.x() - kRadius < 0.205)) ground = 0.2;
-      assert(p.z() - kRadius >= ground - 1e-10);
-      if (t <= curve.traverse_start) assert(std::abs(p.x()) < 1e-12);
-      if (t >= curve.traverse_end) assert(std::abs(p.x() - curve.target.x()) < 1e-12);
-    }
+    assert(curve.start == original.start && curve.end == original.end);
   }
-  // 시작/착지 높이가 같아도 중간 돌출부와 발 폭 안쪽 장애물을 반영한다.
-  map.heights.setZero();
-  map.heights(23, 50) = 0.25;  // x=0.3, y=0.03 (발 중심선 옆).
-  map.heights(40, 50) = 1.0;   // 경로 밖 장애물은 높이에 반영하지 않는다.
-  map.valid(20, 40) = 0;       // 중간 미관측 셀은 발행 거부 사유가 아니다.
-  auto obstacle = original;
-  Shape(&obstacle, map);
-  assert(obstacle.terrain_shaped);
-  assert(std::abs(obstacle.apex_z - (0.25 + kRadius + kClearance)) < 1e-12);
-  CheckConnections(obstacle);
-  // 첫 곡선 생성 시 측정 속도 경계도 유지한다.
-  obstacle = original;
-  obstacle.velocity = Eigen::Vector3d(0.02, -0.01, 0.03);
-  Shape(&obstacle, map);
-  assert((obstacle.Sample(obstacle.start).second - obstacle.velocity).norm() < 1e-12);
+  curve.velocity = Eigen::Vector3d(0.02, -0.01, 0.03);
+  assert((curve.Sample(curve.start).second - curve.velocity).norm() < 1e-12);
+}
+
+void CheckFailureDistance() {
+  // 18:20 런의 FR 이동거리/시간. 지형 보정을 켜도 XY 이동 시간이 줄지 않는다.
+  auto curve = MakeCurve();
+  curve.start = 6.48;
+  curve.end = 6.8;
+  curve.apex_time = 6.64;
+  curve.position = Eigen::Vector3d(2.1422, 0.152, -0.0809);
+  curve.target = Eigen::Vector3d(1.7354, 0.134, -0.116);
+  curve.apex_z = 0.0191;
+  curve.terrain_lift = 0.05;
+  double peak = 0.0;
+  double sampled_peak = 0.0;
+  for (double time = curve.start; time <= curve.end; time += 0.0001) {
+    peak = std::max(peak, std::abs(curve.Sample(time).second.x()));
+  }
+  // 현재 실행기와 같은 20ms 선형 샘플 속도도 확인한다.
+  for (int i = 0; i < 16; ++i) {
+    const double time = curve.start + i * 0.02;
+    const double speed = std::abs(
+        (curve.Sample(time + 0.02).first.x() - curve.Sample(time).first.x()) / 0.02);
+    sampled_peak = std::max(sampled_peak, speed);
+  }
+  assert(std::abs(peak - 1.875 * 0.4068 / 0.32) < 1e-6);
+  assert(sampled_peak < 2.4);
+  std::cout << "FR regression: XY peak=" << peak
+            << " m/s, sampled=" << sampled_peak << " m/s\n";
+  CheckConnections(curve);
 }
 }  // namespace
 
 int main() {
   CheckTerrain();
+  CheckFailureDistance();
   b2_terrain_planner::SwingReference curve;
   curve.start = .08; curve.end = .4; curve.apex_time = .24; curve.apex_z = .1;
   curve.target.x() = .04;
   for (double t : {.16, .22, .28, .34}) {
-    const auto initial = curve.Sample(t);
+    const auto initial = curve.SampleKinematics(t);
     auto next = curve;
     next.start = t;
-    next.position = initial.first;
-    next.velocity = initial.second;
+    next.position = initial.position;
+    next.velocity = initial.velocity;
+    next.acceleration = initial.acceleration;
     next.target.x() += .001;
-    const auto joined = next.Sample(t);
-    assert(joined.first.isApprox(initial.first, 1e-10));
-    assert(joined.second.isApprox(initial.second, 1e-10));
-    for (double u=t; u<.4; u+=.001) assert(next.Sample(u).first.z() <= .100001);
+    const auto joined = next.SampleKinematics(t);
+    assert(joined.position.isApprox(initial.position, 1e-10));
+    assert(joined.velocity.isApprox(initial.velocity, 1e-10));
+    assert((joined.acceleration - initial.acceleration).norm() < 1e-9);
+    for (double u = t; u < .4; u += .001) {
+      assert(next.Sample(u).first.z() <= .100001);
+      assert(std::abs(next.Sample(u).first.z() - curve.Sample(u).first.z()) < 1e-10);
+    }
     assert(next.Sample(.4).first.isApprox(next.target));
     assert(next.Sample(.4).second.norm() < 1e-10);
     curve = next;

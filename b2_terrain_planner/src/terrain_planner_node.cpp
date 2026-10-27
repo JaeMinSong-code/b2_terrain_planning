@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.29
+ * @version 0.0.30
+ * @update 2026-10-27: 지형 여유 기준을 분리하고 XY 시간 압축 없는 Z 보정을 연결함.
  * @update 2026-10-27: 접촉 패치 전 지형으로 발 크기를 고려한 스윙 통과 경로를 생성함.
- * @update 2026-10-27: 좁은 착지 영역을 기억하고 발 이륙·새 지도 수신 후에도 유지함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -87,6 +87,7 @@ class TerrainPlannerNode : public rclcpp::Node {
     sample_dt_ = declare_parameter<double>("sample_dt", 0.02);
     swing_height_ = declare_parameter<double>("swing_height", 0.10);
     // B2 MuJoCo 발 충돌 cylinder의 반경과 반길이. 발 중심 경로의 지면 여유에 사용한다.
+    swing_terrain_clearance_ = declare_parameter<double>("swing_terrain_clearance", 0.03);
     swing_foot_radius_ = declare_parameter<double>("swing_foot_radius", 0.0351);
     swing_foot_half_width_ = declare_parameter<double>("swing_foot_half_width", 0.0275);
     require_map_ = declare_parameter<bool>("require_map", true);
@@ -618,8 +619,8 @@ class TerrainPlannerNode : public rclcpp::Node {
           next.apex_z = std::max(next.position.z(), next.target.z()) + swing_height_;
         }
         if (swing_terrain) {
-          next.ShapeOverTerrain(*swing_terrain, swing_height_, swing_foot_radius_,
-                                swing_foot_half_width_, settings_.terrain.contact_tolerance);
+          next.ShapeOverTerrain(*swing_terrain, swing_terrain_clearance_,
+                                swing_foot_radius_, swing_foot_half_width_);
         }
         swing_references_[leg] = next;
         break;
@@ -1209,6 +1210,7 @@ class TerrainPlannerNode : public rclcpp::Node {
   // 파라미터.
   std::string state_topic_, state_frame_, map_topic_, elevation_layer_, plan_topic_, frame_;
   std::string active_frame_ = "odom";
+  double swing_terrain_clearance_ = 0.03;
   double swing_foot_radius_ = 0.0351, swing_foot_half_width_ = 0.0275;
   double plan_rate_hz_ = 10.0, sample_dt_ = 0.02, swing_height_ = 0.10;
   bool require_map_ = true;
