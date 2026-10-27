@@ -68,7 +68,8 @@ def main():
         valid = m.elevation_map[2] > 0.5
         seeded = valid & (before[2] <= 0.5)
         count = int(cp.count_nonzero(seeded).item())
-        assert 300 < count < 420, count
+        expected = mapper.initialize_patch_length * mapper.initialize_patch_width / m.resolution**2
+        assert 0.9 * expected < count < 1.1 * expected, count
         assert bool(cp.array_equal(before[:3, idx[0], idx[1]],
                                    m.elevation_map[:3, idx[0], idx[1]]).item()), 'observed obstacle changed'
         assert float(cp.max(cp.abs(m.elevation_map[0, seeded] + center[2] - ground_z)).item()) < 1e-5
@@ -76,8 +77,8 @@ def main():
         xy = (np.column_stack((ix, iy)) - m.cell_n / 2) * m.resolution + center[:2]
         c, s = math.cos(yaw), math.sin(yaw)
         local = (xy - [0.1, -0.1]) @ np.array([[c, -s], [s, c]])
-        assert np.max(np.abs(local[:, 0])) <= 0.6 + 1e-6
-        assert np.max(np.abs(local[:, 1])) <= 0.4 + 1e-6
+        assert np.max(np.abs(local[:, 0])) <= mapper.initialize_patch_length / 2 + 1e-6
+        assert np.max(np.abs(local[:, 1])) <= mapper.initialize_patch_width / 2 + 1e-6
         saved = m.elevation_map.copy()
         mapper.last_initializer_attempt = -math.inf
         mapper.try_initialize_from_ground(cloud)

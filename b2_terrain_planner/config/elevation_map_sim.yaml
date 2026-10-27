@@ -16,8 +16,8 @@
     # 평지 출발: 주변 LiDAR 바닥 높이로 몸통 아래 미관측 셀만 한 번 채운다.
     use_initializer_at_start: true
     initialize_method: 'linear'
-    initialize_patch_length: 1.2
-    initialize_patch_width: 0.8
+    initialize_patch_length: 2.4
+    initialize_patch_width: 1.6
     dilation_size_initialize: 0
 
     # === Phase 4: handoff 3수정 ===

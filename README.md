@@ -46,14 +46,14 @@ WBC·모터 제어·MuJoCo 실행파일은 별도 `b2_deploy_ws`가 소유한다
 ## 시작 시 CuPy 발밑 초기화
 
 평지에서 출발한다는 전제로 `use_initializer_at_start: true`를 기본으로 사용한다.
-`initialize_patch_length: 1.2`, `initialize_patch_width: 0.8`로 몸통 중심·yaw에 맞춘
-1.2×0.8m 사각형의 미관측 셀만 한 번 채운다. 발 TF의 중심 높이나 고정 0을 쓰지 않고,
+`initialize_patch_length: 2.4`, `initialize_patch_width: 1.6`로 몸통 중심·yaw에 맞춘
+2.4×1.6m 사각형의 미관측 셀만 한 번 채운다. 발 TF의 중심 높이나 고정 0을 쓰지 않고,
 같은 시각의 LiDAR 점군에서 주변 바닥 높이 중앙값을 측정해 초기 평면으로 사용한다.
 
 runner는 CuPy의 기존 linear 초기화기를 별도 버퍼에서 실행한다. dilation 없이 지정한
 사각형 안만 채우며 기존 관측 셀·장애물 높이는 보존한다. TF 또는 바닥 관측을 기다릴
 때에도 LiDAR 융합은 계속한다. 초기화 후 셀은 일반 지도 셀처럼 센서 관측으로 갱신된다.
-`Ground initializer complete: height=..., patch=1.20x0.80 m, filled=N cells` 로그로 확인한다.
+`Ground initializer complete: height=..., patch=2.40x1.60 m, filled=N cells` 로그로 확인한다.
 map clear 후에는 다시 한 번 초기화하며, 보행·접촉 전환마다 평면을 재생성하지 않는다.
 초기화 셀은 CuPy 원본 지도에 들어가므로 raw·보정 지도와 rosbag에서 확인할 수 있다.
 설정은 `b2_terrain_planner/config/elevation_map_sim.yaml`에 있으며 false로 끌 수 있다.
