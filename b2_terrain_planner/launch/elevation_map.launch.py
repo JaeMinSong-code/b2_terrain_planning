@@ -51,9 +51,7 @@ def launch_nodes(context):
                     str(share / 'config/elevation_map_sim.yaml'), {
                         'map_frame': 'elevation_odom', 'base_frame': 'elevation_base',
                         'corrected_map_frame': 'elevation_odom',
-                        'initialize_frame_id': ['elevation_base'],
                         'service_namespace': '/elevation_mapping_node',
-                        'use_initializer_at_start': False,
                         'subscribers.lidar.topic_name': '/elevation/points',
                         'use_sim_time': False,
                     }],

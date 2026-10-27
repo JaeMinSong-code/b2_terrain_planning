@@ -39,6 +39,21 @@ B2 센서 또는 MuJoCo의 점군·odometry로 GPU 높이맵을 만들고, C++ T
 WBC·모터 제어·MuJoCo 실행파일은 별도 `b2_deploy_ws`가 소유한다.
 이 저장소에는 pRbLibrary 소스나 서브모듈이 없으며, B2 URDF 복제본만 포함한다.
 
+## 시작 시 CuPy 발밑 초기화
+
+통합 elevation map 설정은 `use_initializer_at_start: true`, `initialize_method: linear`,
+`initialize_frame_id: [FL_foot, FR_foot, RL_foot, RR_foot]`,
+`initialize_tf_offset: [0.0, 0.0, 0.0, 0.0]`, `dilation_size_initialize: 2`를 사용한다.
+adapter가 `/robot/locomotion_state`의 발 위치를 `/elevation/tf`로 전달하므로 RViz나
+robot_state_publisher가 없어도 된다. 입력 odom과 발 상태의 좌표계가 같아야 한다.
+
+runner는 네 발 TF가 준비되면 CuPy의 기존 선형 보간과 dilation으로 미관측 영역을
+한 번 초기화한다. 이미 관측된 셀은 덮어쓰지 않으며 발 TF를 기다리는 중에도 LiDAR
+융합은 계속한다. 로그 `Foot initializer complete: ... filled=N cells`로 실행을 확인한다.
+map clear 후에는 다시 초기화한다. 주기적인 평탄화나 스윙마다 새 평면을 만드는 기능은 아니다.
+초기화 셀은 실제 CuPy 원본 지도에 들어가므로 raw·보정 지도와 rosbag 양쪽에서 확인된다.
+설정 파일은 `b2_terrain_planner/config/elevation_map_sim.yaml`이며 false로 끌 수 있다.
+
 ## 접촉 발의 작은 영역과 높이 기억
 
 `terrain_planner_wbc.yaml`의 `support_patch.enabled: true`이면,

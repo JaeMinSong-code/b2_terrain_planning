@@ -14,6 +14,7 @@ from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
+from b2_terrain_planner.msg import LocomotionState
 from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
@@ -55,6 +56,7 @@ class ElevationInputAdapter(Node):
         defaults = {
             'cloud_topic': '/rslidar_points', 'odom_topic': '/dog_odom',
             'body_frame': '', 'max_odom_gap': 0.3, 'max_age': 1.0,
+            'state_topic': '/robot/locomotion_state',
             'queue_wait': 0.35, 'reset_distance': 1.0, 'reset_angle': 1.2,
             'extrinsic_parent': '', 'extrinsic_child': '',
             'extrinsic_child_from_cloud': False,
@@ -81,6 +83,8 @@ class ElevationInputAdapter(Node):
         self.cloud_frame = None
         self.last_good = time.monotonic()
         self.create_subscription(Odometry, self.cfg['odom_topic'], self.on_odom,
+                                 qos_profile_sensor_data)
+        self.create_subscription(LocomotionState, self.cfg['state_topic'], self.on_state,
                                  qos_profile_sensor_data)
         self.create_subscription(PointCloud2, self.cfg['cloud_topic'], self.on_cloud,
                                  qos_profile_sensor_data)
@@ -118,6 +122,23 @@ class ElevationInputAdapter(Node):
             self.poses.append(pose)
         except ValueError as exc:
             self.status('invalid odometry: ' + str(exc))
+
+    def on_state(self, msg):
+        """지도 odom과 같은 좌표의 발 위치를 초기화용 격리 TF로 전달한다."""
+        if not self.poses or msg.header.frame_id != self.poses[-1].parent:
+            return
+        age = self.get_clock().now().nanoseconds * 1e-9 - seconds(msg.header.stamp)
+        if not 0 <= age <= self.cfg['max_age']:
+            return
+        feet = [vector(foot) for foot in msg.foot_position]
+        if not all(np.isfinite(foot).all() for foot in feet):
+            return
+        frames = ('FL_foot', 'FR_foot', 'RL_foot', 'RR_foot')
+        identity = np.array([0.0, 0.0, 0.0, 1.0])
+        self.tf_pub.publish(TFMessage(transforms=[
+            transform(msg.header.stamp, 'elevation_odom', frame, foot, identity)
+            for frame, foot in zip(frames, feet)
+        ]))
 
     def on_cloud(self, msg):
         stamp = seconds(msg.header.stamp)

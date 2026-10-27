@@ -5,11 +5,14 @@ import time
 import signal
 import math
 import numpy as np
+import cupy as cp
+from scipy.spatial import QhullError
 import rclpy
 from rclpy.duration import Duration
 from rclpy.executors import ExternalShutdownException
 from tf2_ros import TransformException
 from elevation_mapping_cupy.elevation_mapping_node import ElevationMappingNode
+from elevation_mapping_cupy.traversability_polygon import transform_to_map_index
 from geometry_msgs.msg import PointStamped
 from elevation_common import decode_xyz, rotation, flat_ground_height
 
@@ -19,6 +22,8 @@ class StrictElevationMappingNode(ElevationMappingNode):
         self.pending_clouds = deque(maxlen=5)
         self.last_accepted = 0.0
         super().__init__()
+        self.initializer_pending = self.use_initializer_at_start
+        self.last_initializer_attempt = -math.inf
         self.flat_plane_pub = self.create_publisher(PointStamped, '/elevation/observed_plane', 10)
         self.input_timer = self.create_timer(0.01, self.flush_inputs)
 
@@ -38,10 +43,55 @@ class StrictElevationMappingNode(ElevationMappingNode):
         self.pending_clouds.popleft()
         self._last_t = msg.header.stamp
         self.pose_update()
+        self.try_initialize_from_feet(msg.header.stamp)
         super().pointcloud_callback(msg, key)
         if self.flat_plane_pub.get_subscription_count() > 0:
             self.publish_observed_plane(msg)
         self.last_accepted = time.monotonic()
+
+    def try_initialize_from_feet(self, stamp):
+        """기존 CuPy 초기화기를 한 번 실행하되 이미 관측된 셀은 보존한다."""
+        if not self.initializer_pending:
+            return
+        wall_now = time.monotonic()
+        if wall_now - self.last_initializer_attempt < 1.0:
+            return
+        self.last_initializer_attempt = wall_now
+        points = []
+        for frame, offset in zip(self.initialize_frame_id, self.initialize_tf_offset):
+            tf = self.safe_lookup_transform(self.map_frame, frame, stamp)
+            if tf is None:
+                self.get_logger().info(f'Initializer waiting for {frame}; LiDAR mapping continues',
+                                       throttle_duration_sec=5.0)
+                return
+            t = tf.transform.translation
+            points.append([t.x, t.y, t.z + offset])
+        try:
+            # initialize_map()은 기존 지도까지 clear하므로 native 초기화기·dilation을
+            # 별도 버퍼에 실행하고 미관측 셀만 합친다. 지형 보간 알고리즘은 바꾸지 않는다.
+            with self._map.map_lock:
+                seeds = cp.asarray(points, dtype=self._map.data_type)
+                seeds[:, :2] = transform_to_map_index(
+                    seeds[:, :2], self._map.center[:2], self._map.cell_n, self._map.resolution)
+                seeds[:, 2] -= self._map.center[2]
+                initialized = cp.zeros_like(self._map.elevation_map)
+                self._map.map_initializer(initialized, seeds, self.initialize_method)
+                if self.param.dilation_size_initialize > 0:
+                    for _ in range(2):
+                        self._map.dilation_filter_kernel_initializer(
+                            initialized[0], initialized[2], initialized[0], initialized[2],
+                            size=self._map.cell_n * self._map.cell_n)
+                missing = (self._map.elevation_map[2] <= 0.5) & (initialized[2] > 0.5)
+                count = int(cp.count_nonzero(missing).item())
+                self._map.elevation_map[:, missing] = initialized[:, missing]
+                self._map.update_upper_bound_with_valid_elevation()
+                self._map.plugin_manager.reset_layers()
+            self.initializer_pending = False
+            self.get_logger().info(
+                f'Foot initializer complete: method={self.initialize_method}, '
+                f'frames={list(self.initialize_frame_id)}, filled={count} cells')
+        except (ValueError, AssertionError, QhullError) as error:
+            self.get_logger().warning(f'Foot initializer retry: {error}', throttle_duration_sec=5.0)
 
     def publish_observed_plane(self, msg):
         """누적 fusion과 독립적으로 최신 점군/TF의 평면을 같은 source stamp로 보낸다."""
@@ -93,6 +143,9 @@ class StrictElevationMappingNode(ElevationMappingNode):
         self.last_accepted = 0.0
         self.pending_clouds.clear()
         response = super().handle_clear_map(request, response)
+        if response.success:
+            self.initializer_pending = self.use_initializer_at_start
+            self.last_initializer_attempt = -math.inf
         self._map_t = None
         self._map_q = None
         self._last_t = None
