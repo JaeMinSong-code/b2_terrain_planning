@@ -101,7 +101,7 @@ flowchart TD
     Node --> Solve["C++ Solve<br/>지형 처리 · 보행 구간 · 초기 궤적"]
     Yaml["B2 상태 YAML"] --> CLI["tamols_solve"]
     CLI --> Solve
-    Codegen["CasADi 코드 생성<br/>개발 시 실행"] --> Kernel["generated/tamols_kernels.c"]
+    Codegen["CasADi 코드 생성<br/>개발 시 실행"] --> Kernel["development/generated/tamols_kernels.c"]
     Kernel --> SQP["SQP 반복 · OSQP<br/>몸통 궤적과 착지점 최적화"]
     Solve --> SQP
     SQP -->|ROS 호출 성공| Sample["몸통·발 궤적 샘플링"]
@@ -127,17 +127,22 @@ SQP가 실행 가능하다고 판정한 계획을 별도 지도·IK 사후 검�
 b2_terrain_planning/
 ├── b2_terrain_planner/
 │   ├── src/, include/    # SQP, 지형, RBDL 모델, CLI, ROS 노드
-│   ├── codegen/         # CasADi 수식과 C 미분 커널 생성기
-│   ├── generated/       # 일반 빌드에서 사용하는 생성 C 코드
+│   ├── development/
+│   │   ├── codegen/    # CasADi 수식과 C 미분 커널 생성기
+│   │   ├── generated/  # 일반 빌드에서 사용하는 생성 C 코드
+│   │   └── tests/      # 계약·회귀·ROS 통합 검증 소스
 │   ├── model/           # B2 URDF와 출처
-│   ├── msg/             # LocomotionPlan 메시지
+│   ├── msg/             # LocomotionPlan·LocomotionState 메시지
 │   ├── config/          # 센서·맵·RViz·B2 상태 설정
 │   └── scripts/, launch/# 실기·시뮬 맵 실행
+├── AGENTS.md            # 이 저장소의 단일 작업 규칙
 └── docs/                # 맵 운영 절차와 외부 소스 기준
 ```
 
 기존 누적 실험 기록과 Python 참조 구현은 제거했다. 현재 계약 시험과 평지 재현 도구는
-`b2_terrain_planner/tests/`에 유지하고, 변경 이력은 Git에서 관리한다.
+`b2_terrain_planner/development/tests/`에 유지하고, 변경 이력은 Git에서 관리한다.
+`development/`에는 생성기·빌드에 필요한 생성 소스·검증 소스를 모으며 임시 파일을 보관하지 않는다.
+작업 규칙은 저장소 루트의 `AGENTS.md` 하나에서 관리한다.
 ROS 빌드·설치·로그는 워크스페이스의 `build/`, `install/`, `log/`를 사용한다.
 CPU 단독 시험은 `/tmp`에 빌드한다. 저장소 내부에 별도 빌드·설치 경로를 만들지 않는다.
 
@@ -357,12 +362,12 @@ GPU 맵·RViz·실기 WBC 통합 실행은 수행하지 않았다. 상세 변경
 
 ## 커널 생성과 외부 소스 관리
 
-`codegen/generate_kernels.py`는 Python 참조 구현 없이 독립적으로 C 커널을 생성한다.
-일반 빌드에는 이미 포함된 `generated/`를 사용한다. 수식 변경 시 CasADi 3.7.2와 NumPy가
+`development/codegen/generate_kernels.py`는 Python 참조 구현 없이 독립적으로 C 커널을 생성한다.
+일반 빌드에는 이미 포함된 `development/generated/`를 사용한다. 수식 변경 시 CasADi 3.7.2와 NumPy가
 있는 환경에서 다음 명령을 실행하고 생성 C·헤더·manifest를 함께 검토한다.
 
 ```bash
-python3 b2_terrain_planner/codegen/generate_kernels.py
+python3 b2_terrain_planner/development/codegen/generate_kernels.py
 ```
 
 B2 모델의 기준 커밋·해시는 [모델 출처](b2_terrain_planner/model/README.md),
@@ -375,7 +380,7 @@ B2 모델의 기준 커밋·해시는 [모델 출처](b2_terrain_planner/model/R
 다른 로봇 저장소는 별도 요청 없이 수정하거나 동기화하지 않는다.
 
 2026-10-16 공통 상태 토픽 연결 검증: `LocomotionState` 생성과 계획기 빌드,
-실제 ROS 노드 통합 시험(`b2_terrain_planner/tests/locomotion_state_ros_test.py`)을 통과했다.
+실제 ROS 노드 통합 시험(`b2_terrain_planner/development/tests/locomotion_state_ros_test.py`)을 통과했다.
 전달한 CoM·발 위치가 첫 계획에 반영되는지, 원래 시각 보존, NaN·잘못된 자세/프레임·미래/오래된
 상태·중복/역순 메시지 거부, 상태/지도 만료 시 발행 중단을 확인했다.
 통합 시험은 메시지 계약 검증을 위해 time_limit=3초, 입력 유효기간=4초로 실행했다.
@@ -385,7 +390,7 @@ MuJoCo 지형 폐루프 보행 성공을 의미하지 않는다. 온보드 배�
 ```bash
 # 별도 ROS domain에서 실행: 실제 WBC에 연결하지 않는 합성 상태/지도 시험
 ROS_DOMAIN_ID=174 RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
-  /usr/bin/python3 src/b2_terrain_planning/b2_terrain_planner/tests/locomotion_state_ros_test.py \
+  /usr/bin/python3 src/b2_terrain_planning/b2_terrain_planner/development/tests/locomotion_state_ros_test.py \
   install/b2_terrain_planner/lib/b2_terrain_planner/terrain_planner_node
 ```
 

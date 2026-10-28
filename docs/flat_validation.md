@@ -199,7 +199,7 @@ ROS 메시지 시험은 다음처럼 실행한다(다른 domain 188 시험은 �
 
 ```bash
 ROS_DOMAIN_ID=188 ROS_LOCALHOST_ONLY=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
-  /usr/bin/python3 src/b2_terrain_planning/b2_terrain_planner/tests/committed_swing_ros_test.py \
+  /usr/bin/python3 src/b2_terrain_planning/b2_terrain_planner/development/tests/committed_swing_ros_test.py \
   "$PWD" /tmp/b2-committed-swing-v2/states.json
 ```
 

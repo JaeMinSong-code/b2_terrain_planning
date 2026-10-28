@@ -9,7 +9,7 @@ import unittest
 
 import yaml
 
-PACKAGE = Path(__file__).resolve().parents[1]
+PACKAGE = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PACKAGE / 'scripts'))
 from generate_config import generate_configs, load_configs, merge_parameters
 

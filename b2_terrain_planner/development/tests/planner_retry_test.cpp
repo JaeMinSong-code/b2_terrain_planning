@@ -1,12 +1,12 @@
 /**
  * @file planner_retry_test.cpp
  * @brief 지연·실패를 주입해 비동기 재계획과 성공해 보존 및 발행 차단을 검증한다.
- * @version 0.0.15
+ * @version 0.0.16
+ * @update 2026-10-28: development 폴더 이동에 맞춰 플래너 노드 소스 포함 경로를 조정함.
  * @update 2026-10-25: 반복 착지 대기에도 사용자 목표에 도달하고 해제 시 유지된 램프를 쓰는지 검증함.
- * @update 2026-10-25: 스윙 중 명령 램프·XY 변화율·방향 반전·대기 후 램프 복귀를 검증함.
  */
 #define B2_TERRAIN_PLANNER_NO_MAIN
-#include "../src/terrain_planner_node.cpp"
+#include "../../src/terrain_planner_node.cpp"
 
 #include <atomic>
 #include <iostream>

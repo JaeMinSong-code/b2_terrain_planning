@@ -91,10 +91,11 @@
 - `pKIRO_PongBotR`에서 `pRbLibrary` 최신 포인터를 반영할 때는 PongBot 고유 설정/YAML과 `quadruped_robot_system` 계약이 깨지지 않는지 빌드와 기본 실행 경로를 확인한다.
 - 한쪽 패키지에만 임시 구조, 임시 topic, 임시 CMake path, 임시 simulator wrapper를 추가한 채 방치하지 않는다.
 
-## AGENTS 동기화 규칙
-- 워크스페이스 루트 `AGENTS.md`를 기준 원본으로 사용한다.
-- 각 로봇 패키지 루트에도 `AGENTS.md` 복제본을 유지한다.
-- 루트 `AGENTS.md`가 수정되면 각 패키지 루트 `AGENTS.md`도 동일 내용으로 즉시 동기화한다.
+## AGENTS 관리 규칙
+- 이 저장소의 작업 규칙은 저장소 루트의 `AGENTS.md` 하나에서 관리한다.
+- `b2_terrain_planner/`를 포함한 하위 디렉터리에 복제본을 두지 않는다.
+- 하위 디렉터리 작업에도 저장소 루트의 `AGENTS.md`를 적용한다.
+- 다른 저장소의 `AGENTS.md`는 별도 요청 없이 수정하거나 동기화하지 않는다.
 - `pRbLibrary` 하위에는 `AGENTS.md`를 두지 않는다.
 - `pRbLibrary` 관련 운영 규약은 `pRbLibrary/CONVENTIONS.md`에서 관리한다.
 

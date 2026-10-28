@@ -9,7 +9,7 @@ import unittest
 from grid_map_msgs.msg import GridMap
 from std_msgs.msg import Float32MultiArray, MultiArrayDimension
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
 from flat_elevation_map import flatten_map, PlaneHeightTracker, FlatElevationMap
 from elevation_common import flat_ground_height
 import numpy as np
