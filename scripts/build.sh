@@ -8,11 +8,12 @@ fi
 if [[ "${1:-}" == --cpu-only ]]; then
     shift
     [[ $# == 0 ]] || { echo '지원하지 않는 인자' >&2; exit 2; }
-    mkdir -p "$TERRAIN_ROOT/build"
-    touch "$TERRAIN_ROOT/build/COLCON_IGNORE"
-    cmake -S "$TERRAIN_ROOT/b2_terrain_planner" -B "$TERRAIN_ROOT/build" \
+    TERRAIN_CPU_BUILD="$TERRAIN_ROOT/.perception/cpu-build"
+    mkdir -p "$TERRAIN_CPU_BUILD"
+    touch "$TERRAIN_ROOT/.perception/COLCON_IGNORE"
+    cmake -S "$TERRAIN_ROOT/b2_terrain_planner" -B "$TERRAIN_CPU_BUILD" \
         -DB2_TERRAIN_STANDALONE=ON -DCMAKE_BUILD_TYPE=Release
-    exec cmake --build "$TERRAIN_ROOT/build" -j "${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
+    exec cmake --build "$TERRAIN_CPU_BUILD" -j "${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
 fi
 [[ $# == 0 ]] || { echo '지원하지 않는 인자' >&2; exit 2; }
 TERRAIN_WS="${B2_WS_ROOT:-$(cd "$TERRAIN_ROOT/../.." && pwd)}"

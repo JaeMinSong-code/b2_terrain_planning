@@ -133,13 +133,13 @@ b2_terrain_planning/
 │   ├── config/          # 센서·맵·RViz·B2 상태 설정
 │   └── scripts/, launch/# 실기·시뮬 맵 실행
 ├── scripts/build.sh     # CPU 또는 ROS overlay 빌드
-├── docs/                # 맵 운영 절차와 외부 소스 기준
-└── patches/             # 외부 CuPy 포크 재현용 패치
+└── docs/                # 맵 운영 절차와 외부 소스 기준
 ```
 
 기존 누적 실험 기록과 Python 참조 구현은 제거했다. 현재 계약 시험과 평지 재현 도구는
 `b2_terrain_planner/tests/`에 유지하고, 변경 이력은 Git에서 관리한다.
-실행 로그·임시 산출물은 `build/`, `.perception/` 등 Git 제외 경로에 둔다.
+저장소 내부의 빌드·설치·로그 산출물은 Git에서 제외한 `.perception/`에 모은다.
+루트의 `build/`, `build-blas/`, `build-native/`, `log/`는 과거 시험 산출물로 정리했다.
 
 ## 빌드
 
@@ -156,7 +156,9 @@ OSQP 1.x는 C API가 달라 직접 호환되지 않는다.
 ./scripts/build.sh
 ```
 
-CPU 산출물은 `build/`, ROS 산출물은 `.perception/`에 생성한다.
+CPU 산출물은 `.perception/cpu-build/`에 생성한다.
+`.perception/`은 이 저장소 전용 ROS overlay이며, ROS 산출물은 그 안의
+`build/`, `install/`, `log/`에 생성한다. 워크스페이스의 `~/ros2_ws/install`과는 별개다.
 `b2_deploy_ws`의 기본 MuJoCo 런처는 워크스페이스 `~/ros2_ws/install`의 노드를 실행하므로
 이 런처로 시험할 때는 아래 경로도 빌드해야 한다. `.perception`만 갱신하면 반영되지 않는다.
 
@@ -179,9 +181,9 @@ ROS 빌드는 같은 워크스페이스의 `elevation_mapping_cupy`와 `ros2_num
 ## B2 YAML 계획 실행
 
 ```bash
-./build/tamols_solve --input b2_terrain_planner/config/planner_b2_example.yaml
-./build/tamols_solve --speed 0.1 --fast-replanning
-./build/tamols_solve --help
+./.perception/cpu-build/tamols_solve --input b2_terrain_planner/config/planner_b2_example.yaml
+./.perception/cpu-build/tamols_solve --speed 0.1 --fast-replanning
+./.perception/cpu-build/tamols_solve --help
 ```
 
 `model_state`는 base 위치·quaternion, 월드 선속도, 몸통 각속도, 관절 위치·속도를 받는다.
@@ -343,9 +345,11 @@ python3 b2_terrain_planner/codegen/generate_kernels.py
 
 B2 모델의 기준 커밋·해시는 [모델 출처](b2_terrain_planner/model/README.md),
 외부 맵 저장소의 기준은 [source_manifest.json](docs/source_manifest.json)에 기록한다.
-`patches/elevation_mapping_cupy.patch`는 외부 CuPy 포크의 발밑 보호·정책 크롭을
-재현하는 자료다. 기존 환경에는 적용되어 있으므로 중복 적용하지 않는다.
-새 환경에서는 기록된 기준 커밋에서 `git apply --check` 후 적용한다.
+외부 CuPy 포크의 발밑 보호·정책 크롭 재현용 패치 파일은 작업 트리에서 제거했다.
+필요하면 삭제 전 커밋 `4490451`의 `patches/elevation_mapping_cupy.patch`에서 확인한다.
+패치 SHA-256은 `source_manifest.json`에 유지한다. 기존 환경에는 적용되어 있으므로
+중복 적용하지 않는다. 새 환경에서는 패치를 Git 이력에서 꺼내 해시를 확인하고,
+기록된 기준 커밋에서 `git apply --check` 후 적용한다.
 다른 로봇 저장소는 별도 요청 없이 수정하거나 동기화하지 않는다.
 
 2026-10-16 공통 상태 토픽 연결 검증: `LocomotionState` 생성과 계획기 빌드,
