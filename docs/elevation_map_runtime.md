@@ -14,11 +14,18 @@
 
 ## 빌드와 실행
 
-`b2_terrain_planning/b2_terrain_planner`에서 실행한다. 기존 WBC 빌드/설치 디렉터리는 변경하지 않는다.
+맵·planner는 제어기와 같은 워크스페이스 설치 경로를 사용한다.
+아래 빌드를 마친 뒤 `b2_terrain_planning/b2_terrain_planner`에서 맵 실행기를 사용한다.
 
 ```bash
-# 맵·상위 계획 전용 빌드
-../scripts/build.sh
+# 워크스페이스에서 맵·상위 계획과 의존 패키지 빌드
+cd ~/ros2_ws
+source /opt/ros/humble/setup.bash
+colcon build --base-paths src \
+  --packages-up-to b2_terrain_planner elevation_map_msgs elevation_mapping_cupy ros2_numpy \
+  --executor sequential \
+  --cmake-args -DCMAKE_BUILD_TYPE=Release -DPython3_EXECUTABLE=/usr/bin/python3
+cd src/b2_terrain_planning/b2_terrain_planner
 
 # MuJoCo는 일반 workspace 빌드/설치본을 사용한다.
 # 별도 터미널에서 실행한 뒤 아래 지도만 연결한다.
@@ -34,16 +41,16 @@
 ```
 
 시뮬의 `--xml`, `--headless`는 `run_robot.sh` 옵션이다.
-지도 실행기의 `--start-sim`은 선택한 ROS overlay의 `b2_deploy` 실행파일을 찾는다.
+지도 실행기의 `--start-sim`은 선택한 workspace install의 `b2_deploy` 실행파일을 찾는다.
 GT 지도 단독 진단에서만 사용하며 WBC 보행은 두 역할 실행기를 사용한다.
 
-맵 산출물은 상위 저장소의 `.perception/build`, `.perception/install`에 저장한다.
-제어 저장소의 별도 `.perception/runtime_build` 선택과 지도 래퍼는 제거했다.
+ROS 산출물은 워크스페이스의 `build/`, `install/`, `log/`에 저장한다.
+맵·planner 전용 빌드 wrapper와 별도 맵 설치 경로는 사용하지 않는다.
 `PKIRO_SIM_EXECUTABLE`로 진단용 실행파일을 명시할 수 있다.
 
-맵 도구만 빌드하려면 `../scripts/build.sh`를 사용한다. 맵 도구에는 PCL 의존성이 없다.
-`ELEVATION_BUILD_ROOT`로 산출물 위치를 바꿨다면 실행 시
-`ELEVATION_PREFIX=<산출물>/install`을 지정한다.
+맵 도구만 빌드하려면 위 `colcon` 명령 또는 `b2_deploy_ws/scripts/build.sh --elevation`을
+사용한다. 맵 도구에는 PCL 의존성이 없다. 별도 설치본으로 단독 실행할 때는
+`ELEVATION_PREFIX=<설치 경로>`를 지정한다.
 
 CuPy 실행 Python은 기본 `~/miniforge3/envs/elevation_map/bin/python`이며
 `ELEVATION_PYTHON`으로 변경할 수 있다. ROS launch는 시스템 Python, 맵은 지정한
@@ -69,15 +76,16 @@ B2에서 조사에 사용한 CycloneDDS 설정 경로는
 ### 1. 노트북 전용 빌드
 
 Ubuntu 22.04 / ROS 2 Humble, NVIDIA GPU·CUDA·CuPy와 기존 맵 의존성이 준비된
-노트북에서 실행한다. 아래 빌드는 상위 저장소의 `.perception`에 맵·상위 계획 도구를 설치한다.
+노트북에서 실행한다. 아래 빌드는 워크스페이스의 `install`에 맵·상위 계획 도구를 설치한다.
 `--with-sim-runtime`은 실기 토픽 수신에 필요하지 않다.
 
 ```bash
 # CycloneDDS가 없는 노트북에서 한 번 설치
 sudo apt install ros-humble-rmw-cyclonedds-cpp
 
-# b2_terrain_planning/b2_terrain_planner에서
-../scripts/build.sh
+# b2_deploy_ws에서 (내부에서 colcon을 직접 호출)
+cd ~/ros2_ws/src/b2_deploy_ws
+./scripts/build.sh --elevation
 ```
 
 ### 2. 유선 연결과 시간 확인
@@ -112,7 +120,7 @@ chrony 사용 환경이면 `chronyc tracking`, `chronyc sources -v`로 동기화
 
 ```bash
 source /opt/ros/humble/setup.bash
-source ../.perception/install/local_setup.bash
+source ~/ros2_ws/install/local_setup.bash
 export ROS_DOMAIN_ID=0 ROS_LOCALHOST_ONLY=0
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 ELEVATION_NIC=enp3s0

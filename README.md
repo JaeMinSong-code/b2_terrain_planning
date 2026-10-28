@@ -133,14 +133,13 @@ b2_terrain_planning/
 │   ├── msg/             # LocomotionPlan 메시지
 │   ├── config/          # 센서·맵·RViz·B2 상태 설정
 │   └── scripts/, launch/# 실기·시뮬 맵 실행
-├── scripts/build.sh     # CPU 또는 ROS overlay 빌드
 └── docs/                # 맵 운영 절차와 외부 소스 기준
 ```
 
 기존 누적 실험 기록과 Python 참조 구현은 제거했다. 현재 계약 시험과 평지 재현 도구는
 `b2_terrain_planner/tests/`에 유지하고, 변경 이력은 Git에서 관리한다.
-저장소 내부의 빌드·설치·로그 산출물은 Git에서 제외한 `.perception/`에 모은다.
-루트의 `build/`, `build-blas/`, `build-native/`, `log/`는 과거 시험 산출물로 정리했다.
+ROS 빌드·설치·로그는 워크스페이스의 `build/`, `install/`, `log/`를 사용한다.
+CPU 단독 시험은 `/tmp`에 빌드한다. 저장소 내부에 별도 빌드·설치 경로를 만들지 않는다.
 
 ## 설정
 
@@ -171,22 +170,22 @@ OSQP 1.x는 C API가 달라 직접 호환되지 않는다.
 
 ```bash
 # 저장소 루트에서 CPU 계획기만 빌드
-./scripts/build.sh --cpu-only
-
-# ROS 2 Humble + 맵 overlay 빌드
-./scripts/build.sh
+cmake -S b2_terrain_planner -B /tmp/b2-terrain-cpu-build \
+  -DB2_TERRAIN_STANDALONE=ON -DCMAKE_BUILD_TYPE=Release -DPython3_EXECUTABLE=/usr/bin/python3
+cmake --build /tmp/b2-terrain-cpu-build -j2
 ```
 
-CPU 산출물은 `.perception/cpu-build/`에 생성한다.
-`.perception/`은 이 저장소 전용 ROS overlay이며, ROS 산출물은 그 안의
-`build/`, `install/`, `log/`에 생성한다. 워크스페이스의 `~/ros2_ws/install`과는 별개다.
-`b2_deploy_ws`의 기본 MuJoCo 런처는 워크스페이스 `~/ros2_ws/install`의 노드를 실행하므로
-이 런처로 시험할 때는 아래 경로도 빌드해야 한다. `.perception`만 갱신하면 반영되지 않는다.
+ROS 맵·상위 계획은 같은 워크스페이스에서 `colcon`으로 빌드한다.
+`b2_deploy_ws/scripts/build.sh --elevation` 또는 `--tamols`도 같은 경로로 직접
+`colcon`을 호출한다. `--all`은 제어기·맵 패키지를 함께 빌드한 뒤 GUI를 빌드한다.
+맵·제어기·TAMOLS 실행기는 모두 `~/ros2_ws/install`을 사용한다.
 
 ```bash
 cd ~/ros2_ws
 source /opt/ros/humble/setup.bash
-colcon build --base-paths src --packages-select b2_terrain_planner --executor sequential \
+colcon build --base-paths src \
+  --packages-up-to b2_terrain_planner elevation_map_msgs elevation_mapping_cupy ros2_numpy \
+  --executor sequential \
   --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DPython3_EXECUTABLE=/usr/bin/python3
 ctest --test-dir build/b2_terrain_planner --output-on-failure
 ```
@@ -197,14 +196,15 @@ RBDL 위치는 `RBDL_DIR` 또는 `CUSTOM_RBDL_PATH`로 지정할 수 있다.
 
 ROS 빌드는 같은 워크스페이스의 `elevation_mapping_cupy`와 `ros2_numpy`도 사용한다.
 맵 실행에는 NVIDIA GPU·CUDA·CuPy와 해당 Python 환경이 필요하다.
-`B2_WS_ROOT`로 워크스페이스, `ELEVATION_BUILD_ROOT`로 overlay 산출물 위치를 바꿀 수 있다.
+맵 실행은 기본으로 워크스페이스 설치본을 찾으며, 별도 설치본을 쓸 때는
+`ELEVATION_PREFIX=<설치 경로>`를 지정한다. 통합 실행기는 자신이 사용하는 install로 고정한다.
 
 ## B2 YAML 계획 실행
 
 ```bash
-./.perception/cpu-build/tamols_solve --input b2_terrain_planner/config/b2_terrain.yaml
-./.perception/cpu-build/tamols_solve --speed 0.1 --fast-replanning
-./.perception/cpu-build/tamols_solve --help
+/tmp/b2-terrain-cpu-build/tamols_solve --input b2_terrain_planner/config/b2_terrain.yaml
+/tmp/b2-terrain-cpu-build/tamols_solve --speed 0.1 --fast-replanning
+/tmp/b2-terrain-cpu-build/tamols_solve --help
 ```
 
 `model_state`는 base 위치·quaternion, 월드 선속도, 몸통 각속도, 관절 위치·속도를 받는다.

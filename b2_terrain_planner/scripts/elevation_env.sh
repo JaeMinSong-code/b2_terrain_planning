@@ -4,7 +4,7 @@ set -euo pipefail
 ELEVATION_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ELEVATION_PACKAGE_ROOT="$(cd "${ELEVATION_SCRIPT_DIR}/.." && pwd)"
 if [[ -z "${ELEVATION_PREFIX:-}" ]]; then
-    ELEVATION_PREFIX="${ELEVATION_PACKAGE_ROOT}/../.perception/install"
+    ELEVATION_PREFIX=''
     # 소스 workspace의 install 또는 install-only 번들의 colcon 루트를 찾는다.
     ELEVATION_SEARCH="$ELEVATION_PACKAGE_ROOT"
     for _level in 1 2 3 4 5; do
@@ -18,6 +18,10 @@ if [[ -z "${ELEVATION_PREFIX:-}" ]]; then
         fi
         ELEVATION_SEARCH="$(dirname "$ELEVATION_SEARCH")"
     done
+    if [[ -z "$ELEVATION_PREFIX" ]]; then
+        echo '[오류] workspace install을 찾지 못했습니다. workspace 루트에서 colcon build를 실행하세요.' >&2
+        exit 2
+    fi
 fi
 export ELEVATION_PREFIX
 if [[ -z "${ELEVATION_PYTHON:-}" ]]; then
@@ -48,7 +52,7 @@ from ament_index_python.packages import get_package_prefix
 try:
     import numpy
     if int(numpy.__version__.split('.')[0]) >= 2:
-        raise RuntimeError('ROS Humble cv_bridge requires NumPy 1.x; scripts/build.sh 참고')
+        raise RuntimeError('ROS Humble cv_bridge requires NumPy 1.x; README의 맵 의존성 참고')
     import rclpy, cv_bridge, tf_transformations, rosbag2_py
     import elevation_mapping_cupy, elevation_map_msgs, ros2_numpy
     import cupy
@@ -59,7 +63,7 @@ try:
     cupy.arange(4).sum().item()
 except Exception as exc:
     print('[오류] elevation 의존성 검사 실패:', exc, file=sys.stderr)
-    print('scripts/build.sh로 전용 overlay를 빌드하고 CUDA 드라이버를 확인하세요.',
+    print('workspace install의 맵 패키지와 ELEVATION_PYTHON·CUDA 드라이버를 확인하세요.',
           file=sys.stderr)
     sys.exit(2)
 PY
