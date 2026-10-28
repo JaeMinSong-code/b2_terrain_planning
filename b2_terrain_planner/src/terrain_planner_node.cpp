@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.30
+ * @version 0.0.34
+ * @update 2026-10-28: CoM 중심에 맞춘 중립 발 XY를 착지점 계획에 반영함.
  * @update 2026-10-27: 지형 여유 기준을 분리하고 XY 시간 압축 없는 Z 보정을 연결함.
- * @update 2026-10-27: 접촉 패치 전 지형으로 발 크기를 고려한 스윙 통과 경로를 생성함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -413,6 +413,11 @@ class TerrainPlannerNode : public rclcpp::Node {
     }
     state.base_position.z() = -model->Evaluate(state).feet.col(2).mean();
     model->PopulatePlanner(state, &robot_, &nominal_input_);
+    // CoM 기준 중립 발 배치의 XY 중심을 맞춰 명목 자세의 편심을 물려주지 않는다.
+    // 실제 초기 발 위치와 운동학 기준 다리, 발 높이는 모델 값을 유지한다.
+    const Eigen::RowVector2d neutral_center =
+        robot_.nominal_offsets.leftCols<2>().colwise().mean();
+    robot_.nominal_offsets.leftCols<2>().rowwise() -= neutral_center;
   }
 
   void ConfigureSettings() {

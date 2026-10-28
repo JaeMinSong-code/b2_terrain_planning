@@ -289,6 +289,10 @@ RViz의 Fixed Frame과 연결되는 TF도 같은 좌표 계약에 맞춰야 한�
 - `LocomotionState`의 전신 CoM 위치·속도와 네 발 위치를 최적화 초기 상태로 사용한다.
   WBC 실행 노드는 실기에서도 얻는 IMU·관절 q/dq·모터 토크 추정값과 KF/운동학만 사용한다.
   simulator GT base·발·접촉·GRF는 이 메시지의 입력이 아니다.
+- ROS 계획기의 중립 발 XY 배치는 명목 자세에서 계산한 CoM 기준 발 오프셋의
+  평균 XY를 빼서 중심을 맞춘다. 이 기준으로 새 착지점을 최적화하고 지형 높이와
+  스윙 궤적을 계산한다. 현재 측정 발 위치, 확정된 착지점, 명목 발 Z와 운동학 모델은
+  유지한다. 변경 적용에는 `terrain_planner_node` 재시작이 필요하다.
 - 몸통 자세와 world 각속도를 받아 Euler 변화율로 변환한다. 명목 base→CoM 변환은 제거했다.
   질량·관성·도달성 모델의 명목 관절 근사는 여전히 남아 있다.
 - 네 발 속도와 `contact_estimated`, `contact_confirmed`를 전달한다. WBC가 착지 확인에 따라
