@@ -52,7 +52,9 @@ WBC epoch 변경 또는 상태 시계 역행/1초 이상 공백은 오프셋을 
 중복·역순 지도도 재발행하지 않는다. 입력이 끊겨도 마지막 평면의 시각을 갱신하지 않는다.
 지도 구조와 원본 stamp는 그대로 유지한다. 이 모드는 평지 관측을 전제로 하며,
 일반 지형의 경사·장애물 모델이나 KF 드리프트 보정기는 아니다.
-`terrain_planner_flat.yaml`은 국소 support patch를 끄고 10 Hz/100 ms 계산 제한을 유지한다.
+`config/b2_terrain.yaml`의 `planner.common`과 `planner.flat`은 국소 support patch를
+끄고 10 Hz/100 ms 계산 제한을 유지한다. 빌드 시 설치용 `terrain_planner_flat.yaml`을
+자동 생성하므로 설정 변경 후 사용하는 ROS 설치 경로를 다시 빌드한다.
 기존 CuPy/CUDA 실행 환경이 필요하다.
 
 ## 이전 궤적 재사용

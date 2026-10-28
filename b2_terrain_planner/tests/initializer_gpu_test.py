@@ -3,6 +3,7 @@
 import math
 from pathlib import Path
 import sys
+import tempfile
 
 import cupy as cp
 import numpy as np
@@ -16,14 +17,17 @@ from std_srvs.srv import Trigger
 package = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(package / 'scripts'))
 from elevation_mapping_runner import StrictElevationMappingNode
+from generate_config import generate_configs
 from elevation_mapping_cupy.elevation_mapping_node import ElevationMappingNode
 
 
 def main():
     core = Path(get_package_share_directory('elevation_mapping_cupy')) / 'config/core/core_param.yaml'
-    rclpy.init(args=['--ros-args', '--params-file', str(core), '--params-file',
-                    str(package / 'config/elevation_map_sim.yaml'),
-                    '-p', 'map_frame:=elevation_odom', '-p', 'base_frame:=elevation_base'])
+    with tempfile.TemporaryDirectory(prefix='b2-initializer-config-') as directory:
+        generate_configs(package / 'config/b2_terrain.yaml', directory)
+        rclpy.init(args=['--ros-args', '--params-file', str(core), '--params-file',
+                        str(Path(directory) / 'elevation_map_sim.yaml'),
+                        '-p', 'map_frame:=elevation_odom', '-p', 'base_frame:=elevation_base'])
     mapper = StrictElevationMappingNode()
     try:
         assert mapper.use_initializer_at_start and mapper.initializer_pending

@@ -1,9 +1,9 @@
 /**
  * @file solve_main.cpp
- * @brief ROS 없이 평지·지형 입력을 읽고 검증된 몸통 계획을 YAML로 출력한다.
- * @version 0.0.25
+ * @brief ROS 없이 단일 설정의 예제 또는 개별 평지·지형 입력을 읽고 몸통 계획을 YAML로 출력한다.
+ * @version 0.0.26
+ * @update 2026-10-28: 통합 설정의 example 필드와 기존 개별 입력 YAML을 함께 지원함.
  * @update 2026-10-27: 셀 분산 상한 설정의 YAML 입력을 제거함.
- * @update 2026-10-15: B2 YAML 실행과 warm start를 유지하고 합성 모델·재생·제약 해제·상세 추적 도구를 제거함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -62,7 +62,14 @@ void InitializeB2(b2_terrain_planner::Robot* robot, b2_terrain_planner::Input* i
 void ReadInput(const std::string& path, b2_terrain_planner::Robot* robot,
                b2_terrain_planner::Input* input,
                b2_terrain_planner::Settings* settings) {
-  const auto node = YAML::LoadFile(path);
+  const auto document = YAML::LoadFile(path);
+  YAML::Node node = document;
+  if (document["example"]) {
+    node = document["example"];
+  }
+  if (!node.IsMap()) {
+    throw std::invalid_argument("input or example must be a mapping");
+  }
   if (robot->model) {
     if (node["robot"] || node["position"] || node["velocity"] || node["feet"]) {
       throw std::invalid_argument("B2 input requires model_state; legacy robot/position/velocity/feet keys are unsupported");

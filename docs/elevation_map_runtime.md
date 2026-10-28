@@ -187,7 +187,10 @@ ros2 topic hz /elevation_mapping_node/elevation_map_raw
 
 ## 입력 계약과 장애 처리
 
-`config/elevation_input_real.yaml`이 실기 입력 계약을 소유한다.
+`config/b2_terrain.yaml`의 `input.real`이 실기 입력 계약을 소유한다.
+맵 설정은 같은 파일의 `mapping`, 시뮬 입력은 `input.sim`에서 관리한다.
+변경 후 사용하는 ROS 설치 경로를 다시 빌드하면 기존 파일명의 파라미터 YAML이 자동 생성된다.
+`--config`는 별도로 작성한 ROS 파라미터 파일을 지정할 때 사용한다.
 
 | 설정 | 의미 |
 |---|---|

@@ -4,6 +4,19 @@ project(b2_terrain_planner LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(B2_TERRAIN_STANDALONE "Build the CPU planner without ROS or GPU dependencies" OFF)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(B2_CONFIG_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/config/b2_terrain.yaml")
+set(B2_CONFIG_GENERATOR "${CMAKE_CURRENT_SOURCE_DIR}/scripts/generate_config.py")
+set(B2_GENERATED_CONFIG_DIR "${CMAKE_CURRENT_BINARY_DIR}/config")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${B2_CONFIG_SOURCE}" "${B2_CONFIG_GENERATOR}")
+execute_process(
+    COMMAND "${Python3_EXECUTABLE}" "${B2_CONFIG_GENERATOR}"
+        --input "${B2_CONFIG_SOURCE}" --output-dir "${B2_GENERATED_CONFIG_DIR}"
+    RESULT_VARIABLE B2_CONFIG_RESULT ERROR_VARIABLE B2_CONFIG_ERROR)
+if(NOT B2_CONFIG_RESULT STREQUAL "0")
+    message(FATAL_ERROR "B2 config generation failed (Python3 and PyYAML required): ${B2_CONFIG_ERROR}")
+endif()
 find_package(Eigen3 3.3 REQUIRED NO_MODULE)
 find_package(yaml-cpp REQUIRED)
 set(BLA_SIZEOF_INTEGER 4)
@@ -30,7 +43,7 @@ endif()
 unset(CMAKE_REQUIRED_INCLUDES)
 unset(CMAKE_REQUIRED_LIBRARIES)
 
-# 생성 C 소스를 배포한다. 일반 빌드/실행에는 CasADi나 Python이 필요하지 않다.
+# 생성 C 소스를 배포한다. CasADi는 불필요하며 Python은 설정 생성 빌드에만 사용한다.
 add_library(tamols_kernels SHARED generated/tamols_kernels.c)
 target_include_directories(tamols_kernels PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/generated>)
@@ -55,6 +68,7 @@ install(TARGETS tamols_sqp tamols_kernels
 install(TARGETS tamols_solve DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include/${PROJECT_NAME})
 install(DIRECTORY launch config model DESTINATION share/${PROJECT_NAME})
+install(DIRECTORY "${B2_GENERATED_CONFIG_DIR}/" DESTINATION share/${PROJECT_NAME}/config)
 install(DIRECTORY scripts/ DESTINATION share/${PROJECT_NAME}/scripts USE_SOURCE_PERMISSIONS
     PATTERN "__pycache__" EXCLUDE)
 install(PROGRAMS scripts/elevation_input_adapter.py scripts/elevation_mapping_runner.py
@@ -64,6 +78,8 @@ install(FILES scripts/elevation_common.py DESTINATION lib/${PROJECT_NAME})
 
 include(CTest)
 if(BUILD_TESTING)
+    add_test(NAME config_generation_test COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/config_generation_test.py")
     add_executable(touchdown_stop_test tests/touchdown_stop_test.cpp)
     target_compile_definitions(touchdown_stop_test PRIVATE
         B2_BUILD_MODEL_PATH="${CMAKE_CURRENT_SOURCE_DIR}/model/unitree_b2/b2.urdf")

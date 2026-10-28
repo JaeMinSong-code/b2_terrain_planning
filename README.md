@@ -56,12 +56,13 @@ runner는 CuPy의 기존 linear 초기화기를 별도 버퍼에서 실행한다
 `Ground initializer complete: height=..., patch=2.40x1.60 m, filled=N cells` 로그로 확인한다.
 map clear 후에는 다시 한 번 초기화하며, 보행·접촉 전환마다 평면을 재생성하지 않는다.
 초기화 셀은 CuPy 원본 지도에 들어가므로 raw·보정 지도와 rosbag에서 확인할 수 있다.
-설정은 `b2_terrain_planner/config/elevation_map_sim.yaml`에 있으며 false로 끌 수 있다.
+설정은 `b2_terrain_planner/config/b2_terrain.yaml`의 `mapping`에 있으며
+`use_initializer_at_start: false`로 끌 수 있다.
 설치 설정 반영 후 맵 노드를 포함해 실행을 재시작한다. 비평지 출발에는 이 가정을 사용하지 않는다.
 
 ## 접촉 발의 작은 영역과 높이 기억
 
-`terrain_planner_wbc.yaml`의 `support_patch.enabled: true`이면,
+`b2_terrain.yaml`의 `planner.wbc`에서 `support_patch.enabled: true`이면,
 `contact_confirmed && contact_estimated`인 발 주변 셀을 발의 Z 높이로 기억한다.
 기본 `support_patch.half_width: 0.05`는 X/Y 각 방향 5 cm(10×10 cm) 영역이다.
 필터·미분·보간을 위해 영역을 자동으로 넓히지 않는다. 해당 영역 안의 셀 중심만
@@ -141,10 +142,30 @@ b2_terrain_planning/
 저장소 내부의 빌드·설치·로그 산출물은 Git에서 제외한 `.perception/`에 모은다.
 루트의 `build/`, `build-blas/`, `build-native/`, `log/`는 과거 시험 산출물로 정리했다.
 
+## 설정
+
+설정 원본은 `b2_terrain_planner/config/b2_terrain.yaml` 하나로 관리한다.
+
+| 필드 | 용도 |
+|---|---|
+| `input.sim`, `input.real`, `input.wbc` | 입력 점군·odometry·센서 장착값 |
+| `mapping` | CuPy 맵 해상도·초기화·보호 영역·발행 설정 |
+| `planner.common` | WBC·평지 계획기의 공통 파라미터 |
+| `planner.wbc`, `planner.flat` | 공통값에 덧씌우는 모드별 차이 |
+| `example` | 독립 CLI의 B2 상태·속도 명령 예제 |
+
+빌드할 때 `scripts/generate_config.py`가 빌드 경로의 `config/` 아래에 기존 이름의
+ROS 파라미터 YAML과 CLI 예제 YAML 7개를 생성하고 설치 경로의 `config/`에 배치한다.
+기존 launch와 `b2_deploy_ws` 실행기는 설치된 파일명을 그대로 사용한다.
+생성 파일을 직접 수정하지 않고 원본을 수정한 뒤 사용하는 설치 경로를 다시 빌드한다.
+원본 변경 시 CMake가 설정을 재생성하며, 중복 키나 누락된 모드는 빌드 설정 단계에서 거부한다.
+RViz 화면 설정은 기존 `.rviz` 파일에서 관리한다.
+
 ## 빌드
 
 CPU 계획기에는 CMake, C++17, Eigen3, yaml-cpp, LAPACK(LP64), pkg-config, tinyxml2,
 RBDL 및 URDF reader, **OSQP 0.6.x double-precision C API(PROFILING 포함)**가 필요하다.
+설정 파일 생성에는 Python 3와 PyYAML(`python3-yaml`)이 필요하다.
 기존 환경의 기준은 OSQP 0.6.3, RBDL 3.3.1, tinyxml2 9.0.0이다.
 OSQP 1.x는 C API가 달라 직접 호환되지 않는다.
 
@@ -181,7 +202,7 @@ ROS 빌드는 같은 워크스페이스의 `elevation_mapping_cupy`와 `ros2_num
 ## B2 YAML 계획 실행
 
 ```bash
-./.perception/cpu-build/tamols_solve --input b2_terrain_planner/config/planner_b2_example.yaml
+./.perception/cpu-build/tamols_solve --input b2_terrain_planner/config/b2_terrain.yaml
 ./.perception/cpu-build/tamols_solve --speed 0.1 --fast-replanning
 ./.perception/cpu-build/tamols_solve --help
 ```
@@ -190,6 +211,7 @@ ROS 빌드는 같은 워크스페이스의 `elevation_mapping_cupy`와 `ros2_num
 RBDL로 FK·CoM·질량·CoM 기준 관성을 계산한다. 관절 순서는 FL/FR/RL/RR × hip/thigh/calf다.
 `model_path`는 입력 YAML 기준 상대 경로 또는 절대 경로이며, 생략하면 포함된 B2 URDF를 쓴다.
 `command`는 몸통 기준 `[vx, vy, yaw_rate]`다. `gait_time`, `nominal`, `fixed`도 입력할 수 있다.
+통합 설정은 `example` 필드를 읽으며, 기존 개별 입력 YAML도 계속 지원한다.
 
 정적 지형은 `terrain`의 `frame`, `resolution`, `origin`, `heights`, `variance`, `valid`로
 전달한다. 배열은 행=Y, 열=X 증가 방향이며, `origin`은 최소 모서리 좌표다.
