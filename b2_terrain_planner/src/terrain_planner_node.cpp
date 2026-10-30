@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.40
+ * @version 0.0.41
+ * @update 2026-10-30: 이전 착지점 유지 ROS 기본 가중치를 논문 기준 0.01로 통일함.
  * @update 2026-10-30: 지형 처리 설정과 단계별 시간 진단 및 실제 h/h_s1/h_s2 지도 출력을 연결함.
- * @update 2026-10-29: 지도 지면과 발 중심의 높이 계약 및 반경 변환을 통일함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -510,7 +510,7 @@ class TerrainPlannerNode : public rclcpp::Node {
     settings_.foothold_backward_weight =
         declare_parameter<double>("foothold_backward_weight", 1.4);
     settings_.previous_foothold_weight =
-        declare_parameter<double>("previous_foothold_weight", 0.35);
+        declare_parameter<double>("previous_foothold_weight", 0.01);
     settings_.vz_weight = declare_parameter<double>("vz_weight", 0.0);
     settings_.graduated_initialization = declare_parameter<bool>("terrain.graduated_initialization", true);
     settings_.graduated_budget_fraction = declare_parameter<double>("terrain.graduated_budget_fraction", 0.25);

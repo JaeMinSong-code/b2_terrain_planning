@@ -1,9 +1,9 @@
 /**
  * @file terrain.h
  * @brief 정적 높이맵의 보간·유효성·착지 비용과 후보 검색 계약.
- * @version 0.0.10
+ * @version 0.0.11
+ * @update 2026-10-30: 발 충돌 회피 기본 가중치를 TAMOLS 논문 Table I의 0.001로 통일함.
  * @update 2026-10-30: 원본 관측 마스크와 TAMOLS 처리·평활·가상 바닥 및 후보 비용 계약을 추가함.
- * @update 2026-10-29: 지도 지면과 발 중심의 높이 계약 및 반경 변환을 통일함.
  */
 #ifndef B2_TERRAIN_PLANNER_TERRAIN_H_
 #define B2_TERRAIN_PLANNER_TERRAIN_H_
@@ -54,7 +54,7 @@ struct TerrainSettings {
   double contact_tolerance = 0.005;  // m.
   double ground_weight = 1e4;
   double edge_weight = 3.0;
-  double collision_weight = 100.0;
+  double collision_weight = 0.001;  // TAMOLS Table I.
   double collision_distance = 0.20;  // 비용이 활성화되는 발 사이 거리, m.
 };
 

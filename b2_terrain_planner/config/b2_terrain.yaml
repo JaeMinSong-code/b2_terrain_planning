@@ -121,7 +121,7 @@ planner:
     terrain.graduated_budget_fraction: 0.25
     # 직전 해의 같은 착지 슬롯 foothold에 대한 거리 제곱 비용(논문 V-B.6).
     # 이전 해의 같은 착지 슬롯에만 적용하며 midstance nominal 비용과 별도다.
-    previous_foothold_weight: 0.35
+    previous_foothold_weight: 0.01  # TAMOLS Table I.
     # 논문 식 (33): 지지 중간 시각의 월드 엉덩이–발 벡터 비용.
     nominal_kinematics_weight: 7.0
     # 명령 0 유지 중 CoM 앵커 위치 유지: 이탈 × gain을 ±max_velocity로 잘라

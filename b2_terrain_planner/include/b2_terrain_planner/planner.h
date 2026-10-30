@@ -1,9 +1,9 @@
 /**
  * @file planner.h
  * @brief 평지·지형 trot의 SQP 입력·출력 및 시간 구간 계획 계약.
- * @version 0.0.32
+ * @version 0.0.33
+ * @update 2026-10-30: 이전 착지점 유지 기본 가중치를 TAMOLS 논문 Table I의 0.01로 통일함.
  * @update 2026-10-30: 공유 지형 처리와 제한된 단계별 초기화의 설정·진단을 추가함.
- * @update 2026-10-29: nominal 전용 중립 다리 기준점과 높이로 B2 옆방향 링크를 반영함.
  */
 #ifndef B2_TERRAIN_PLANNER_PLANNER_H_
 #define B2_TERRAIN_PLANNER_PLANNER_H_
@@ -105,7 +105,7 @@ struct Settings {
   double foothold_backward_weight = 1.4;  // nominal 뒤쪽 거리 제곱의 추가 비용, 0이면 비활성.
   // 직전 해의 같은 착지 슬롯 foothold와의 거리 제곱 비용(TAMOLS 논문 V-B.6).
   // 인접 solve 간 발 목표 점프를 눌러 commit 결정이 여러 solve의 합의가 되게 한다.
-  double previous_foothold_weight = 0.0;  // 0이면 비활성(기존 동작).
+  double previous_foothold_weight = 0.01;  // TAMOLS Table I. 0이면 비활성.
   double qp_regularization = 0.01;
   double qp_eps_abs = 1e-9;
   double qp_eps_rel = 1e-9;

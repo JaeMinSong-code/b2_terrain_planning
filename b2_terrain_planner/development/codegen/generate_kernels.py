@@ -52,7 +52,8 @@ def make_kernel(name, contacts):
     gia = ca.DM([0, 0, -9.81]) - acceleration[:3]
     heading = ca.vertcat(ca.horzcat(ca.cos(q[3]), ca.sin(q[3])),
                         ca.horzcat(-ca.sin(q[3]), ca.cos(q[3])))
-    residuals = [np.sqrt(20) * (heading @ velocity[:2] - command[:2]),
+    # TAMOLS Table I: 수평 속도 오차의 최종 제곱 비용 계수는 2다.
+    residuals = [np.sqrt(2) * (heading @ velocity[:2] - command[:2]),
                  2 * (velocity[3] - command[2]), .1 * acceleration[:3],
                  .1 * alpha, p[42] * q[4], p[43] * q[5]]
     constraints, lower, upper = [], [], []
@@ -166,7 +167,7 @@ def main():
         raise RuntimeError('unsupported conditional expression in generated C')
     generated.write_text(text)
     header = Path('tamols_kernels.h')
-    header.write_text('/**\n * @file tamols_kernels.h\n * @brief 대각선 두 지지·세 지지 네 조합·전체 지지의 잔차·제약·미분 C API.\n * @version 0.0.8\n * @update 2026-10-30: 지형 몸통 정렬 기준점 미분과 수평 roll 비용 선택을 추가함.\n * @update 2026-10-29: 표본 다리 비용을 분리하고 midstance nominal 미분 함수를 추가함.\n */\n' + header.read_text())
+    header.write_text('/**\n * @file tamols_kernels.h\n * @brief 대각선 두 지지·세 지지 네 조합·전체 지지의 잔차·제약·미분 C API.\n * @version 0.0.9\n * @update 2026-10-30: 수평 속도 추종의 최종 비용 계수를 TAMOLS 논문 기준 2로 통일함.\n * @update 2026-10-30: 지형 몸통 정렬 기준점 미분과 수평 roll 비용 선택을 추가함.\n */\n' + header.read_text())
     for path in (generated, header):
         path.write_text('\n'.join(line.rstrip() for line in path.read_text().splitlines()) + '\n')
     manifest = {'casadi_version' : ca.__version__, 'z_size': 31, 'parameter_size': 54,
