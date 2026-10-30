@@ -1,9 +1,9 @@
 /**
  * @file planner.cpp
  * @brief 접촉 조합별 생성 Jacobian과 지형 비용의 Gauss–Newton QP로 trot을 최적화한다.
- * @version 0.0.38
- * @update 2026-10-27: 현재 발·확정 착지점의 지도 조회 거부를 없애고 확정 XYZ를 유지함.
- * @update 2026-10-25: 정지 전용 제약·초기값과 사후 지도·IK 검사 및 후처리 시간 초과 거부를 제거함.
+ * @version 0.0.43
+ * @update 2026-10-30: 처리 지도를 공유하고 가상 바닥 정렬·후보 보정·시간 제한 초기화를 연결함.
+ * @update 2026-10-29: 지도 지면과 발 중심의 높이 계약 및 반경 변환을 통일함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -235,6 +235,8 @@ Eigen::Matrix<double, 4, 2, Eigen::RowMajor> NominalFootholds(
   Eigen::Matrix<double, 4, 2, Eigen::RowMajor> nominal;
   Eigen::Vector3d command(input.command.x(), input.command.y(), 0);
   command = Eigen::AngleAxisd(input.position[3], Eigen::Vector3d::UnitZ()) * command;
+  // 명령 속도와 착지 시각으로 nominal을 구성하고 최적화에서 착지점을 선택한다.
+  const Eigen::Vector2d command_xy = command.head<2>();
   for (int leg = 0; leg < 4; ++leg) {
     double touchdown = robot.period;
     for (const auto& phase : phases) {
@@ -242,8 +244,14 @@ Eigen::Matrix<double, 4, 2, Eigen::RowMajor> NominalFootholds(
     }
     Eigen::Vector3d offset = robot.hips.row(leg).transpose();
     if (robot.use_reference_legs) offset = robot.nominal_offsets.row(leg).transpose();
-    nominal.row(leg) = (input.position.head<3>() + Rotation(input.position) * offset +
-        command * (touchdown + .5 * robot.period * robot.duty)).head<2>().transpose();
+    // 오프셋은 yaw만으로 회전한다(수평 투영). full 자세 회전은 CoM→발 오프셋의
+    // z(≈−0.55m) 때문에 roll/pitch 기울기를 0.55m/rad 비율의 수평 이동으로 바꿔,
+    // 기운 쪽 반대로 발을 보내는 양성 피드백(기울기 발산)을 만든다.
+    nominal.row(leg) =
+        (input.position.head<3>() +
+         Eigen::AngleAxisd(input.position[3], Eigen::Vector3d::UnitZ()) * offset)
+            .head<2>().transpose() +
+        (command_xy * (touchdown + .5 * robot.period * robot.duty)).transpose();
   }
   return nominal;
 }
@@ -253,13 +261,14 @@ class Problem {
   Problem(const Robot& robot, const Input& input, int intervals,
           Profile* profile, bool full_evaluation, const TerrainModel* terrain,
           bool block_assembly, bool polynomial_tail,
-          double pitch_weight, double leg_vertical_weight, double orientation_limit,
-          double backward_weight, double vz_weight)
+          double pitch_weight, double nominal_kinematics_weight, double orientation_limit,
+          double backward_weight, double vz_weight,
+          TerrainLayer terrain_layer = TerrainLayer::kGround)
       : robot_(robot), input_(input), intervals_(intervals),
         phases_(MakeHorizon(input.gait_time, robot.period, robot.duty,
             input.gait_hold_duration, input.hold_contacts)),
         profile_(profile), full_evaluation_(full_evaluation), terrain_(terrain),
-        block_assembly_(block_assembly), polynomial_tail_(polynomial_tail) {
+        block_assembly_(block_assembly), polynomial_tail_(polynomial_tail), terrain_layer_(terrain_layer) {
     std::vector<double> splits;
     if (input_.reference_prefix) {
       splits.push_back(input_.prefix_duration);
@@ -330,7 +339,13 @@ class Problem {
     parameters_.segment<12>(29) = Eigen::Map<const Vector>(robot.reference_legs.data(), 12);
     if (robot.use_reference_legs) parameters_[41] = 1;
     parameters_[42] = std::sqrt(pitch_weight);
-    parameters_[43] = std::sqrt(leg_vertical_weight);
+    parameters_[43] = std::sqrt(30.0);
+    if (terrain_ && terrain_->settings().pipeline_enabled &&
+        terrain_->settings().body_alignment_weight > 0) {
+      parameters_[42] = 0.0;
+      parameters_[43] = 0.0;
+    }
+    nominal_kinematics_weight_ = nominal_kinematics_weight;
     parameters_[44] = orientation_limit;
     parameters_.segment<4>(45) = robot.reach_min;
     parameters_.segment<4>(49) = robot.reach_max;
@@ -365,7 +380,7 @@ class Problem {
         const Eigen::Vector2d nominal = nominal_.row(leg).transpose();
         terrain_initial_.row(leg) = terrain_->FindFoothold(
             nominal, nominal.array() - limit, nominal.array() + limit,
-            direction_, backward_weight_).transpose();
+            direction_, backward_weight_, {}, terrain_layer_).transpose();
       }
     }
   }
@@ -556,7 +571,7 @@ class Problem {
         try {
           selected_terrain.row(leg) = terrain_->FindFoothold(
               nominal, nominal.array() - .30, nominal.array() + .30,
-              direction_, backward_weight_, reach_accept[leg]).transpose();
+              direction_, backward_weight_, reach_accept[leg], terrain_layer_).transpose();
           if ((selected_terrain.row(leg) - terrain_initial_.row(leg)).norm() > 1e-10) {
             ++diagnostic->reach_reselected_footholds;
           }
@@ -585,17 +600,17 @@ class Problem {
         // 현재 범위·관측 지형 높이에 유효할 때만 복사하고 아니면 새 후보를 유지한다.
         if ((foot.head<2>() - nominal_.row(leg).transpose()).cwiseAbs().maxCoeff() > .30 ||
             !terrain_->IsQueryable(foot.head<2>()) ||
-            std::abs(foot.z() - terrain_->Sample(foot.head<2>()).height) >
+            std::abs(foot.z() - terrain_->LandingHeight(foot.head<2>(), terrain_layer_)) >
                 terrain_->settings().contact_tolerance) continue;
         if (reach_accept[leg] && !reach_accept[leg](foot)) continue;
         // 재시도 반복값의 최적화된 발을 nominal 후보로 되돌리지 않는다.
         if (old.success && backward_weight_ > 0 && direction_.squaredNorm() > 0) {
           const Eigen::Vector2d nominal = nominal_.row(leg).transpose();
           const double old_score = terrain_->FootholdCost(
-              foot.head<2>(), nominal, direction_, backward_weight_);
+              foot.head<2>(), nominal, direction_, backward_weight_, terrain_layer_);
           const double new_score = terrain_->FootholdCost(
               selected_terrain.row(leg).head<2>().transpose(), nominal,
-              direction_, backward_weight_);
+              direction_, backward_weight_, terrain_layer_);
           if (new_score + 1e-10 < old_score) continue;
         }
         x.segment<3>(feet_offset_ + 3 * leg) = foot;
@@ -636,6 +651,89 @@ class Problem {
 
   void ReplaceFootholdSeed(int leg, const Eigen::Vector3d& seed, Vector* x) const {
     x->segment<3>(feet_offset_ + 3 * leg) = seed;
+  }
+
+  // 가상 바닥에서 각 hip 투영점의 높이를 조회해 몸통 높이·자세를 함께 정렬한다.
+  // 지도 밖 몸통 기준점은 이 비용만 생략한다. 새 발행 거부 조건을 만들지 않는다.
+  void AddTerrainAlignment(const Vector6& pose, int phase, double time, double weight,
+                           bool derivatives, Evaluation* out) const {
+    if (!terrain_ || !terrain_->settings().pipeline_enabled ||
+        terrain_->settings().body_alignment_weight == 0) return;
+    const auto basis = Basis(time, phases_[phase].duration, 0);
+    for (int leg = 0; leg < 4; ++leg) {
+      Eigen::Vector3d hip = robot_.hips.row(leg).transpose();
+      if (robot_.nominal_hips) hip = robot_.nominal_hips->row(leg).transpose();
+      Eigen::Vector3d point;
+      Eigen::Matrix<double, 3, 6> jacobian;
+      const double* arguments[] = {pose.data(), hip.data()};
+      double* outputs[] = {point.data(), jacobian.data()};
+      tamols_terrain_alignment(arguments, outputs, nullptr, nullptr, 0);
+      if (!terrain_->IsQueryable(point.head<2>())) continue;
+      const auto floor = terrain_->Sample(point.head<2>(), TerrainLayer::kVirtualFloor);
+      const double height = robot_.height + hip.z() + terrain_->settings().foot_radius;
+      const double residual = point.z() - height - floor.height;
+      const double scale = weight * terrain_->settings().body_alignment_weight;
+      out->cost += scale * residual * residual;
+      if (derivatives) {
+        const Eigen::Matrix<double, 1, 6> j = jacobian.row(2) - floor.gradient.transpose() * jacobian.topRows<2>();
+        Eigen::Matrix<double, 1, 30> row;
+        for (int axis = 0; axis < 6; ++axis) row.segment<5>(5 * axis) = j[axis] * basis.transpose();
+        out->gradient.segment(30 * phase, 30).noalias() += 2 * scale * residual * row.transpose();
+        out->hessian.block(30 * phase, 30 * phase, 30, 30).noalias() += 2 * scale * row.transpose() * row;
+      }
+    }
+  }
+
+  // 논문 식 (33)은 지지 구간 중점에서 한 번만 평가한다. 도달거리 등 제약은
+  // 기존 표본에서 유지하며, 초기 추정용 nominal XY를 비용 목표로 쓰지 않는다.
+  void AddNominalKinematics(const Vector& x, bool derivatives, Evaluation* out) const {
+    if (nominal_kinematics_weight_ == 0.0) return;
+    for (int leg = 0; leg < 4; ++leg) {
+      for (double time : StanceMidpoints(phases_, leg)) {
+        if (input_.reference_prefix && time < input_.prefix_duration - 1e-9) continue;
+        int k = 0;
+        while (k + 1 < static_cast<int>(phases_.size()) &&
+               time >= phases_[k].start + phases_[k].duration - 1e-10) ++k;
+        const auto& phase = phases_[k];
+        const auto basis = Basis((time - phase.start) / phase.duration, phase.duration, 0);
+        Eigen::Matrix<double, 9, 1> state;
+        for (int axis = 0; axis < 6; ++axis) {
+          state[axis] = basis.dot(x.segment<5>(30 * k + 5 * axis));
+        }
+        state.tail<3>() = input_.feet.row(leg).transpose();
+        if (phase.landed[leg]) {
+          state.segment(6, foot_dimensions_) =
+              x.segment(feet_offset_ + foot_dimensions_ * leg, foot_dimensions_);
+        }
+        Eigen::Vector4d parameters;
+        parameters.head<3>() = robot_.hips.row(leg).transpose();
+        parameters[3] = robot_.height;
+        if (robot_.nominal_hips.has_value()) {
+          parameters.head<3>() = robot_.nominal_hips->row(leg).transpose();
+          // Convert CoM height to the nominal leg-origin height on level ground.
+          parameters[3] += parameters[2];
+        }
+        Eigen::Vector3d residual;
+        Eigen::Matrix<double, 3, 9> derivative;
+        const double* arguments[] = {state.data(), parameters.data()};
+        double* outputs[] = {residual.data(), nullptr};
+        if (derivatives) outputs[1] = derivative.data();
+        tamols_nominal_kinematics(arguments, outputs, nullptr, nullptr, 0);
+        out->cost += nominal_kinematics_weight_ * residual.squaredNorm();
+        if (!derivatives) continue;
+        Matrix jacobian = Matrix::Zero(3, size_);
+        for (int axis = 0; axis < 6; ++axis) {
+          jacobian.block<3, 5>(0, 30 * k + 5 * axis) =
+              derivative.col(axis) * basis.transpose();
+        }
+        if (phase.landed[leg]) {
+          jacobian.block(0, feet_offset_ + foot_dimensions_ * leg, 3, foot_dimensions_) =
+              derivative.block(0, 6, 3, foot_dimensions_);
+        }
+        out->gradient.noalias() += 2 * nominal_kinematics_weight_ * jacobian.transpose() * residual;
+        out->hessian.noalias() += 2 * nominal_kinematics_weight_ * jacobian.transpose() * jacobian;
+      }
+    }
   }
 
   Matrix SampleTransform(int k, double s) const {
@@ -721,11 +819,14 @@ class Problem {
       }
       for (int axis = 0; axis < 2; ++axis) {
         const int column = feet_offset_ + foot_dimensions_ * leg + axis;
-        const double residual = x[column] - nominal_(leg, axis);
-        if (need_cost) out.cost += 0.7 * residual * residual;
-        if (full) {
-          out.gradient[column] += 1.4 * residual;
-          out.hessian(column, column) += 1.4;
+        // 직전 해 anchor 비용: 인접 solve 간 발 목표 점프를 누른다(논문 V-B.6).
+        if (previous_footholds_[leg] && previous_foothold_weight_ > 0) {
+          const double held = x[column] - (*previous_footholds_[leg])[axis];
+          if (need_cost) out.cost += previous_foothold_weight_ * held * held;
+          if (full) {
+            out.gradient[column] += 2 * previous_foothold_weight_ * held;
+            out.hessian(column, column) += 2 * previous_foothold_weight_;
+          }
         }
         double limit = 0.30;
         if (FootFixed(leg)) limit = 0.0;
@@ -740,7 +841,7 @@ class Problem {
         // 확정 XYZ에는 지형 비용을 다시 계산하지 않는다. 아래 Z 등식과 기존
         // XY 등식은 유지하므로 지도 구멍이 생겨도 착지점은 변하지 않는다.
         if (!input_.committed_footholds[leg]) {
-          const auto residual = terrain_->Residual(x.segment<3>(column));
+          const auto residual = terrain_->Residual(x.segment<3>(column), terrain_layer_);
           if (need_cost) out.cost += residual.values.squaredNorm();
           if (full) {
             out.gradient.segment<3>(column).noalias() +=
@@ -864,7 +965,7 @@ class Problem {
       auto kernel = tamols_diagonal_a;
       auto values_kernel = tamols_diagonal_a_values;
       auto constraints_kernel = tamols_diagonal_a_constraint_jacobian;
-      int nr = 20;
+      constexpr int nr = 12;
       int ng = 17;
       const int contact_count =
           std::count(phases_[k].contacts.begin(), phases_[k].contacts.end(), true);
@@ -912,7 +1013,6 @@ class Problem {
       }
       int giac_end = 13;
       if (polygon_support) {
-        nr = 12 + 4 * contact_count;
         giac_end = 10 + 2 * contact_count;
         ng = giac_end + 2 * contact_count;
       }
@@ -960,6 +1060,7 @@ class Problem {
             z.segment<3>(18 + 3 * leg) = input_.feet.row(leg).transpose();
           }
         }
+        if (need_cost) AddTerrainAlignment(z.head<6>(), k, sample_time, weight, full, &out);
         Vector residual, constraints(ng), lo(ng), hi(ng);
         Matrix jr, jg;
         if (need_cost) residual.resize(nr);
@@ -1081,6 +1182,7 @@ class Problem {
         }
       }
     }
+    if (need_cost) AddNominalKinematics(x, full, &out);
     const int count = out.row_groups.size();
     out.values.resize(count);
     out.lower.resize(count);
@@ -1173,6 +1275,16 @@ class Problem {
   bool FootFixed(int leg) const {
     return input_.fixed[leg] || input_.committed_footholds[leg].has_value();
   }
+
+ public:
+  // 직전 해의 같은 착지 슬롯 발 목표를 비용 anchor로 등록한다. 평가 전에 호출한다.
+  void SetPreviousFootholds(
+      const std::array<std::optional<Eigen::Vector2d>, 4>& anchors, double weight) {
+    previous_footholds_ = anchors;
+    previous_foothold_weight_ = weight;
+  }
+
+ private:
   Robot robot_;
   Input input_;
   int intervals_;
@@ -1186,12 +1298,16 @@ class Problem {
   const TerrainModel* terrain_;
   bool block_assembly_;
   bool polynomial_tail_;
+  TerrainLayer terrain_layer_ = TerrainLayer::kGround;
   int foot_dimensions_ = 2;
   Feet terrain_initial_ = Feet::Zero();
   Eigen::Vector2d direction_ = Eigen::Vector2d::Zero();
   double backward_weight_ = 0.0;
+  double nominal_kinematics_weight_ = 7.0;
   Vector parameters_;
   Eigen::Matrix<double, 4, 2, Eigen::RowMajor> nominal_;
+  std::array<std::optional<Eigen::Vector2d>, 4> previous_footholds_{};
+  double previous_foothold_weight_ = 0.0;
 };
 
 double Violation(const Evaluation& eval, const Vector& scaling) {
@@ -1812,12 +1928,20 @@ void Validate(const Robot& r, const Input& input, const Settings& settings) {
   if (!std::isfinite(settings.foothold_backward_weight) || settings.foothold_backward_weight < 0) {
     throw std::invalid_argument("invalid foothold backward weight");
   }
+  if (!std::isfinite(settings.previous_foothold_weight) ||
+      settings.previous_foothold_weight < 0) {
+    throw std::invalid_argument("invalid previous foothold weight");
+  }
   if (!std::isfinite(settings.orientation_limit) || settings.orientation_limit <= 0 ||
       settings.orientation_limit >= std::acos(-1.0) / 2.0) {
     throw std::invalid_argument("invalid orientation limit");
   }
+  if (!std::isfinite(settings.graduated_budget_fraction) ||
+      settings.graduated_budget_fraction <= 0 || settings.graduated_budget_fraction >= 1) {
+    throw std::invalid_argument("graduated_budget_fraction must be between zero and one");
+  }
   if (!std::isfinite(settings.pitch_weight) || settings.pitch_weight < 0 ||
-      !std::isfinite(settings.leg_vertical_weight) || settings.leg_vertical_weight < 0 ||
+      !std::isfinite(settings.nominal_kinematics_weight) || settings.nominal_kinematics_weight < 0 ||
       !std::isfinite(settings.vz_weight) || settings.vz_weight < 0) {
     throw std::invalid_argument("invalid posture cost weight");
   }
@@ -1948,6 +2072,23 @@ std::string QpReuseModeName(QpReuseMode mode) {
   return "invalid";
 }
 
+std::vector<double> StanceMidpoints(const std::vector<Phase>& phases, int leg) {
+  std::vector<double> times;
+  for (std::size_t first = 0; first < phases.size();) {
+    if (!phases[first].contacts[leg]) {
+      ++first;
+      continue;
+    }
+    std::size_t last = first;
+    while (last + 1 < phases.size() && phases[last + 1].contacts[leg] &&
+           phases[last + 1].landed[leg] == phases[first].landed[leg]) ++last;
+    times.push_back(0.5 * (phases[first].start +
+                          phases[last].start + phases[last].duration));
+    first = last + 1;
+  }
+  return times;
+}
+
 std::vector<Phase> MakeHorizon(double time, double period, double duty,
     double hold_duration, const std::optional<std::array<bool, 4>>& hold_contacts) {
   if (!std::isfinite(hold_duration) || hold_duration < 0 || hold_duration > period) {
@@ -2048,7 +2189,10 @@ std::string TerrainSignature(const std::optional<HeightMap>& terrain) {
 
 static Result SolveAttempt(const Robot& robot, const Input& input, const Settings& settings,
                            const Result* previous, const TerrainAttempt* alternative,
-                           Feet* initial_feet) {
+                           Feet* initial_feet, const TerrainModel* prepared = nullptr,
+                           TerrainLayer layer = TerrainLayer::kGround,
+                           const Result* initializer = nullptr,
+                           const std::array<std::optional<Eigen::Vector3d>, 4>* refined = nullptr) {
   const auto begin = Clock::now();
   auto elapsed = [&]() { return std::chrono::duration<double>(Clock::now() - begin).count(); };
   Result result;
@@ -2070,8 +2214,8 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
     QpCache elastic_cache(&result.profile);
     StructureCache structure_cache;
     std::optional<TerrainModel> terrain;
-    const TerrainModel* terrain_pointer = nullptr;
-    if (input.terrain.has_value()) {
+    const TerrainModel* terrain_pointer = prepared;
+    if (input.terrain.has_value() && !prepared) {
       terrain.emplace(*input.terrain, settings.terrain);
       terrain_pointer = &*terrain;
     }
@@ -2079,12 +2223,40 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
     Problem problem(robot, input, settings.sample_intervals,
                     &result.profile, settings.full_evaluation, terrain_pointer,
                     settings.block_assembly, settings.polynomial_tail,
-                    settings.pitch_weight, settings.leg_vertical_weight, settings.orientation_limit,
-                    settings.foothold_backward_weight, settings.vz_weight);
+                    settings.pitch_weight, settings.nominal_kinematics_weight, settings.orientation_limit,
+                    settings.foothold_backward_weight, settings.vz_weight, layer);
     result.stage = "initialization";
     int replaced_leg = -1;
     if (alternative != nullptr) replaced_leg = alternative->leg;
-    Vector x = problem.Initial(previous, &result.warm_start, replaced_leg);
+    // 직전 해 anchor: warm start와 같은 "미소비 착지 슬롯" 판정으로, 이번 solve가
+    // 같은 착지를 계획할 때만 직전 발 목표에 비용으로 묶는다. 다음 주기의 새
+    // 슬롯이나 의도적으로 교체하는 다리에는 적용하지 않는다.
+    if (previous != nullptr && settings.previous_foothold_weight > 0 &&
+        previous->footholds.allFinite() && !previous->phases.empty()) {
+      const double anchor_shift = BodyTime(input) - BodyTime(previous->seed_context);
+      if (std::isfinite(anchor_shift) && anchor_shift >= 0 && anchor_shift < robot.period) {
+        std::array<std::optional<Eigen::Vector2d>, 4> anchors;
+        for (int leg = 0; leg < 4; ++leg) {
+          if (leg == replaced_leg || input.fixed[leg] ||
+              input.committed_footholds[leg]) continue;
+          double anchor_touchdown = robot.period;
+          for (const auto& phase : previous->phases) {
+            if (phase.landed[leg]) { anchor_touchdown = phase.start; break; }
+          }
+          if (anchor_touchdown <= anchor_shift + 1e-10) continue;
+          anchors[leg] = previous->footholds.row(leg).head<2>().transpose();
+        }
+        problem.SetPreviousFootholds(anchors, settings.previous_foothold_weight);
+      }
+    }
+    const Result* seed = previous;
+    if (initializer) seed = initializer;
+    Vector x = problem.Initial(seed, &result.warm_start, replaced_leg);
+    if (refined) {
+      for (int leg = 0; leg < 4; ++leg) {
+        if ((*refined)[leg]) problem.ReplaceFootholdSeed(leg, *(*refined)[leg], &x);
+      }
+    }
     if (alternative != nullptr) problem.ReplaceFootholdSeed(alternative->leg, alternative->seed, &x);
     if (initial_feet != nullptr && input.terrain.has_value()) {
       *initial_feet = problem.InitialFootholds(x);
@@ -2237,8 +2409,100 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
   const auto begin = Clock::now();
   auto elapsed = [&]() { return std::chrono::duration<double>(Clock::now() - begin).count(); };
   Feet initial = input.feet;
-  Result result = SolveAttempt(robot, input, settings, previous, nullptr, &initial);
-  if (!input.terrain.has_value() || !robot.model) return result;
+  try {
+    Validate(robot, input, settings);
+  } catch (const std::exception&) {
+    // 준비 예산을 차감하기 전 원래 입력의 오류와 진단 단계를 보존한다.
+    return SolveAttempt(robot, input, settings, previous, nullptr, &initial);
+  }
+  std::shared_ptr<const TerrainModel> terrain;
+  double processing_seconds = 0.0, initialization_seconds = 0.0;
+  std::string initialization_status = "not_needed";
+  if (input.terrain) {
+    try {
+      terrain = std::make_shared<TerrainModel>(*input.terrain, settings.terrain);
+    } catch (const std::exception&) {
+      // 기존 입력 오류 처리는 SolveAttempt에서 동일하게 수행한다.
+      return SolveAttempt(robot, input, settings, previous, nullptr, &initial);
+    }
+    processing_seconds = elapsed();
+  }
+  const TerrainModel* prepared = nullptr;
+  if (terrain) prepared = &*terrain;
+  bool new_slot = previous == nullptr;
+  if (previous) {
+    const double shift = BodyTime(input) - BodyTime(previous->seed_context);
+    for (int leg = 0; leg < 4; ++leg) {
+      if (input.fixed[leg] || input.committed_footholds[leg]) continue;
+      for (const auto& phase : previous->phases) {
+        if (!phase.landed[leg]) continue;
+        if (phase.start <= shift + 1e-10) new_slot = true;
+        break;
+      }
+    }
+  }
+  if (input.hold_contacts && std::all_of(input.hold_contacts->begin(), input.hold_contacts->end(),
+                                       [](bool contact) { return contact; })) new_slot = false;
+  std::optional<Result> coarse;
+  std::array<std::optional<Eigen::Vector3d>, 4> refined;
+  const double preparation_end = settings.time_limit * settings.graduated_budget_fraction;
+  if (prepared && settings.terrain.pipeline_enabled && settings.graduated_initialization &&
+      new_slot && elapsed() < preparation_end) {
+    const double stage_begin = elapsed();
+    Settings warm = settings;
+    warm.time_limit = preparation_end - elapsed();
+    Result candidate = SolveAttempt(robot, input, warm, previous, nullptr, nullptr,
+                                    prepared, TerrainLayer::kVirtualFloor);
+    initialization_status = "coarse_fallback:" + candidate.status;
+    if ((candidate.success || candidate.seed_available) && elapsed() < preparation_end) {
+      const auto phases = MakeHorizon(input.gait_time, robot.period, robot.duty,
+                                     input.gait_hold_duration, input.hold_contacts);
+      const auto nominal = NominalFootholds(robot, input, phases);
+      Eigen::Vector3d velocity(input.command.x(), input.command.y(), 0);
+      velocity = Eigen::AngleAxisd(input.position[3], Eigen::Vector3d::UnitZ()) * velocity;
+      Eigen::Vector2d direction = Eigen::Vector2d::Zero();
+      if (velocity.head<2>().norm() > 1e-6) direction = velocity.head<2>().normalized();
+      bool complete = true;
+      for (int leg = 0; leg < 4; ++leg) {
+        if (input.fixed[leg] || input.committed_footholds[leg]) continue;
+        if (elapsed() >= preparation_end) { complete = false; break; }
+        const Eigen::Vector2d center = candidate.footholds.row(leg).head<2>().transpose();
+        const Eigen::Vector2d n = nominal.row(leg).transpose();
+        const Eigen::Vector2d lower = (center.array() - .20).matrix().cwiseMax((n.array() - .30).matrix());
+        const Eigen::Vector2d upper = (center.array() + .20).matrix().cwiseMin((n.array() + .30).matrix());
+        try {
+          refined[leg] = prepared->FindFoothold(center, lower, upper, direction,
+                                              settings.foothold_backward_weight);
+        } catch (const TerrainDomainError&) { complete = false; break; }
+      }
+      if (complete) {
+        coarse = std::move(candidate);
+        initialization_status = "refined_virtual_floor";
+      } else {
+        refined = {};
+        initialization_status = "refinement_fallback";
+      }
+    }
+    initialization_seconds = elapsed() - stage_begin;
+  } else if (prepared && new_slot && settings.graduated_initialization) {
+    initialization_status = "direct_initialization_budget";
+  }
+  Settings final_settings = settings;
+  final_settings.time_limit = std::max(1e-6, settings.time_limit - elapsed());
+  const Result* initializer = nullptr;
+  const std::array<std::optional<Eigen::Vector3d>, 4>* refined_ptr = nullptr;
+  if (coarse) { initializer = &*coarse; refined_ptr = &refined; }
+  Result result = SolveAttempt(robot, input, final_settings, previous, nullptr, &initial,
+                              prepared, TerrainLayer::kGround, initializer, refined_ptr);
+  auto finish = [&]() {
+    result.terrain_snapshot = terrain;
+    result.terrain_processing_seconds = processing_seconds;
+    result.terrain_initialization_seconds = initialization_seconds;
+    result.terrain_initialization_status = initialization_status;
+    result.elapsed = elapsed();
+    return result;
+  };
+  if (!input.terrain.has_value() || !robot.model) return finish();
   std::vector<TerrainAttempt> attempts{{-1, Eigen::Vector3d::Zero(), result.status,
                                       result.elapsed, result.success}};
   const bool retryable = result.status == "line_search_failed" ||
@@ -2246,7 +2510,6 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
   if (!result.success && retryable && elapsed() < settings.time_limit) {
     // 같은 nominal과 목적함수를 유지하고, 각 다리의 다른 높이 지지면에서 시작한다.
     // 후보별로 남은 시간 안에서 몸통 SQP를 다시 수행한다.
-    TerrainModel terrain(*input.terrain, settings.terrain);
     const auto nominal = NominalFootholds(robot, input,
         MakeHorizon(input.gait_time, robot.period, robot.duty,
             input.gait_hold_duration, input.hold_contacts));
@@ -2267,7 +2530,7 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
       try {
         TerrainAttempt candidate;
         candidate.leg = leg;
-        candidate.seed = terrain.FindFoothold(center, center.array() - .30,
+        candidate.seed = prepared->FindFoothold(center, center.array() - .30,
             center.array() + .30, direction, settings.foothold_backward_weight, other_platform);
         const Eigen::Vector3d hip = input.position.head<3>() +
             Rotation(input.position) * robot.hips.row(leg).transpose();
@@ -2285,7 +2548,7 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
       if (retry.time_limit <= 0) break;
       // 지지면을 바꾸면 선형화도 크게 바뀌므로 5회 RTI 조기 종료를 기다리지 않는다.
       if (retry.realtime_iterations > 0) retry.realtime_iterations = std::max(20, retry.realtime_iterations);
-      auto trial = SolveAttempt(robot, input, retry, previous, &entry.second, nullptr);
+      auto trial = SolveAttempt(robot, input, retry, previous, &entry.second, nullptr, prepared);
       entry.second.status = trial.status;
       entry.second.elapsed = trial.elapsed;
       entry.second.success = trial.success;
@@ -2294,8 +2557,7 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
     }
   }
   result.terrain_attempts = std::move(attempts);
-  result.elapsed = elapsed();
-  return result;
+  return finish();
 }
 
 Vector6 Evaluate(const Result& result, double elapsed, int derivative) {

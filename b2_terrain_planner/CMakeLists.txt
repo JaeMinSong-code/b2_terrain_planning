@@ -49,7 +49,7 @@ target_include_directories(tamols_kernels PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/development/generated>)
 target_link_libraries(tamols_kernels PRIVATE m)
 add_library(tamols_sqp SHARED src/planner.cpp src/terrain.cpp src/robot_model.cpp src/dense_svd.cpp
-    src/support_patch.cpp)
+    src/support_patch.cpp src/map_datum.cpp)
 target_include_directories(tamols_sqp PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include/${PROJECT_NAME}> PRIVATE ${OSQP_INCLUDE_DIR} ${RBDL_INCLUDE_DIR})
@@ -78,6 +78,11 @@ install(FILES scripts/elevation_common.py DESTINATION lib/${PROJECT_NAME})
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(terrain_pipeline_test development/tests/terrain_pipeline_test.cpp)
+    target_link_libraries(terrain_pipeline_test PRIVATE tamols_sqp tamols_kernels)
+    add_test(NAME terrain_pipeline_test COMMAND terrain_pipeline_test)
+    set_tests_properties(terrain_pipeline_test PROPERTIES
+        ENVIRONMENT "OPENBLAS_NUM_THREADS=1;OMP_NUM_THREADS=1;LD_LIBRARY_PATH=$<TARGET_FILE_DIR:tamols_sqp>:$ENV{LD_LIBRARY_PATH}")
     add_test(NAME config_generation_test COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/development/tests/config_generation_test.py")
     add_executable(touchdown_stop_test development/tests/touchdown_stop_test.cpp)
@@ -109,8 +114,11 @@ if(BUILD_TESTING)
     add_executable(terrain_validity_test development/tests/terrain_validity_test.cpp)
     target_link_libraries(terrain_validity_test PRIVATE tamols_sqp)
     add_test(NAME terrain_validity_test COMMAND terrain_validity_test)
+    add_executable(map_datum_test development/tests/map_datum_test.cpp)
+    target_link_libraries(map_datum_test PRIVATE tamols_sqp)
+    add_test(NAME map_datum_test COMMAND map_datum_test)
     # ROS overlay의 설치본보다 방금 빌드한 라이브러리로 시험한다.
-    set_tests_properties(touchdown_stop_test support_combination_test committed_swing_test support_patch_test swing_terrain_test terrain_reuse_test terrain_validity_test PROPERTIES
+    set_tests_properties(touchdown_stop_test support_combination_test committed_swing_test support_patch_test swing_terrain_test terrain_reuse_test terrain_validity_test map_datum_test PROPERTIES
         ENVIRONMENT "OPENBLAS_NUM_THREADS=1;OMP_NUM_THREADS=1;LD_LIBRARY_PATH=$<TARGET_FILE_DIR:tamols_sqp>:$ENV{LD_LIBRARY_PATH}")
 endif()
 

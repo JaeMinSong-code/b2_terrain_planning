@@ -10,12 +10,11 @@ from grid_map_msgs.msg import GridMap
 from std_msgs.msg import Float32MultiArray, MultiArrayDimension
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
-from flat_elevation_map import flatten_map, PlaneHeightTracker, FlatElevationMap
+from flat_elevation_map import flatten_map, SupportPlaneTracker, FlatElevationMap
 from elevation_common import flat_ground_height
 import numpy as np
 from types import SimpleNamespace
 from unittest.mock import Mock
-from geometry_msgs.msg import PointStamped
 
 
 class FlatMapTest(unittest.TestCase):
@@ -77,18 +76,29 @@ class FlatMapTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             flatten_map(source, 0.0)
 
-    def test_current_cloud_tracks_drift_without_accumulated_map_or_foot_feedback(self):
-        ground = np.column_stack([np.linspace(-1, 1, 40), np.zeros(40), np.full(40, -.52)])
-        tracker = PlaneHeightTracker()
-        first = tracker.update(flat_ground_height(ground, [0, 0, 0], 2), -.485)
-        drifted = ground + [0, 0, .008]
-        updated = tracker.update(flat_ground_height(drifted, [0, 0, .008], 2), -.40)
-        self.assertAlmostEqual(updated-first, .008, places=6)
-        # 원본 누적 지도가 과거 높이에 있어도 출력 전체는 새 관측 평면을 따른다.
+    def test_support_feet_datum_tracks_drift_with_rate_limit(self):
+        tracker = SupportPlaneTracker(max_rate_mps=.01)
+        self.assertIsNone(tracker.update(0, [-.485, -.485]))  # 초기화 전에는 유지
+        tracker.initialize(0, -.485)
+        # 드리프트 속도(~1.4mm/s)는 제한 안에서 그대로 따라간다.
+        height = tracker.update(100_000_000, [-.4852, -.4851, -.4851])
+        self.assertAlmostEqual(height, -.4851, places=6)
+        # 접촉 오염으로 한 발이 튀어도 중앙값과 변화율 제한이 점프를 막는다.
+        height = tracker.update(200_000_000, [-.4851, -.4851, -.30, -.4850])
+        self.assertAlmostEqual(height, -.48505, places=6)
+        jumped = tracker.update(300_000_000, [-.30, -.31])
+        self.assertAlmostEqual(jumped, -.48505 + .001, places=6)
+        # 지지 2개 미만이나 시각 역행은 직전 높이를 유지한다.
+        self.assertAlmostEqual(tracker.update(400_000_000, [-.40]), jumped, places=9)
+        self.assertAlmostEqual(tracker.update(300_000_000, [-.40, -.40]), jumped, places=9)
+        # 상태 공백 후에는 dt 상한으로 한 번에 크게 움직이지 않는다.
+        held = tracker.update(5_000_000_000, [-.52, -.52])
+        self.assertAlmostEqual(held, jumped - .001, places=6)
+        # 원본 누적 지도가 과거 높이에 있어도 출력 전체는 지지발 기준을 따른다.
         source = self.source()
         source.data[1].data = [-.52] * 12
-        result = flatten_map(source, updated)
-        self.assertTrue(all(abs(z-updated) < 1e-6 for z in result.data[1].data))
+        result = flatten_map(source, held)
+        self.assertTrue(all(abs(z-held) < 1e-6 for z in result.data[1].data))
         self.assertEqual(result.info, source.info)
 
     def test_cloud_plane_rejects_missing_ground_and_ignores_body_outliers(self):
@@ -102,44 +112,66 @@ class FlatMapTest(unittest.TestCase):
             flat_ground_height(ground+10, [0, 0, 0], 2)
 
     def harness(self):
-        node = SimpleNamespace(state=SimpleNamespace(header=None),
-                               support_height=-.485, plane=PlaneHeightTracker(),
-                               last_map_stamp=None, pending_map=None, observations={},
+        from collections import deque
+        plane = SupportPlaneTracker()
+        plane.initialize(0, -.485)
+        node = SimpleNamespace(state=SimpleNamespace(header=None), plane=plane,
+                               last_map_stamp=None, calibration=deque(),
                                publisher=Mock(), fresh=lambda *args: True,
                                get_logger=lambda: Mock())
         node.on_map = lambda msg: FlatElevationMap.on_map(node, msg)
         return node
 
-    def test_map_waits_for_matching_cloud_stamp_and_does_not_republish(self):
+    def test_map_publishes_support_datum_and_does_not_republish(self):
         node = self.harness()
         message = self.source()
         node.on_map(message)
-        node.publisher.publish.assert_not_called()
-        plane = PointStamped()
-        plane.header = copy.deepcopy(message.header)
-        plane.header.stamp.nanosec += 1
-        plane.point.z = -.52
-        FlatElevationMap.on_plane(node, plane)
-        node.publisher.publish.assert_not_called()
-        plane.header = copy.deepcopy(message.header)
-        FlatElevationMap.on_plane(node, plane)
         node.publisher.publish.assert_called_once()
         self.assertAlmostEqual(node.publisher.publish.call_args.args[0].data[1].data[0], -.485)
-        node.on_map(message)
+        node.on_map(message)  # 같은 지도 stamp는 재발행하지 않는다.
+        node.publisher.publish.assert_called_once()
+        newer = copy.deepcopy(message)
+        newer.header.stamp.nanosec += 1
+        node.plane = SupportPlaneTracker()  # 초기화 전에는 발행하지 않는다.
+        node.on_map(newer)
         node.publisher.publish.assert_called_once()
 
-    def test_stale_plane_and_session_reset_do_not_reuse_old_offset(self):
+    def test_foot_centers_are_converted_once_during_calibration_and_tracking(self):
+        from b2_terrain_planner.msg import LocomotionState
+        for radius in (0.032, 0.05):
+            node = self.harness()
+            node.foot_radius = radius
+            node.plane = SupportPlaneTracker()
+            node.last_stamp = None
+            node.epoch = None
+            node.calibrate = lambda state, stamp: FlatElevationMap.calibrate(node, state, stamp)
+            state = LocomotionState()
+            state.contact_estimated = [True] * 4
+            state.contact_confirmed = [True] * 4
+            for foot in state.foot_position:
+                foot.z = 0.2 + radius
+            for tick in range(7):
+                state.header.stamp.nanosec = tick * 100_000_000
+                FlatElevationMap.on_state(node, state)
+            self.assertAlmostEqual(node.plane.height, 0.2)
+            state.header.stamp.nanosec = 700_000_000
+            for foot in state.foot_position:
+                foot.z += 0.0005
+            FlatElevationMap.on_state(node, state)
+            self.assertAlmostEqual(node.plane.height, 0.2005)
+            node.on_map(self.source())
+            cells = node.publisher.publish.call_args.args[0].data[1].data
+            self.assertTrue(all(abs(z - 0.2005) < 1e-6 for z in cells))
+
+    def test_session_reset_clears_support_datum(self):
         node = self.harness()
-        node.fresh = lambda *args: False
-        plane = PointStamped()
-        plane.point.z = -.52
-        FlatElevationMap.on_plane(node, plane)
-        self.assertEqual(node.observations, {})
-        node.plane.update(-.52, -.485)
-        node.calibration = []
+        node.last_map_stamp = 7
         FlatElevationMap.reset_plane(node)
-        self.assertIsNone(node.plane.offset)
-        self.assertIsNone(node.support_height)
+        self.assertIsNone(node.plane.height)
+        self.assertIsNone(node.last_map_stamp)
+        message = self.source()
+        node.on_map(message)
+        node.publisher.publish.assert_not_called()
 
 
 if __name__ == '__main__':

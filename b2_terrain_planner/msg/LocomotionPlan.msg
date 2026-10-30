@@ -11,7 +11,7 @@ geometry_msgs/Twist[] base_twist  # CoM 월드 선속도 + 몸통 Euler 변화�
 # 수신 bridge는 angular를 월드 각속도로 변환한다(euler_rates 설정).
 
 # 발 궤적: 4개 다리 × N 샘플, FL,FR,RL,RR 순으로 평탄화(길이 4*N).
-geometry_msgs/Point[] foot_position  # odom 프레임 발끝 위치
+geometry_msgs/Point[] foot_position  # odom 프레임 foot 링크 원점(구 중심), 지면점 아님
 bool[] foot_contact                  # true=접지(stance), false=스윙
 
 # 발 순서 상수.

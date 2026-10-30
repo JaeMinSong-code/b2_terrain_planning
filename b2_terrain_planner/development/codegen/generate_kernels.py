@@ -5,7 +5,7 @@ CasADi는 재생성 도구에서만 사용한다. z는 pose(6), velocity(6),
 acceleration(6), FL/FR/RL/RR 접촉점(12), 지지 여유(1)이다.
 p는 mass(1), column-major inertia(9), leg-major hips(12), height,
 mu, leg_min, leg_max, body-frame command(vx, vy, yaw_rate),
-기준 다리 벡터(12), 실제 모델 모드(1), pitch·수직 길이 비용의 제곱근(2), pitch/roll 한계(1), 다리별 최소·최대 도달 거리(4+4)이다.
+기준 다리 벡터(12), 실제 모델 모드(1), pitch 비용 제곱근과 예약 슬롯(2), pitch/roll 한계(1), 다리별 최소·최대 도달 거리(4+4)이다.
 대각선 두 지지, 착지 대기의 세 지지 네 조합, 전체 지지의 계산 함수를 생성한다.
 """
 
@@ -54,7 +54,7 @@ def make_kernel(name, contacts):
                         ca.horzcat(-ca.sin(q[3]), ca.cos(q[3])))
     residuals = [np.sqrt(20) * (heading @ velocity[:2] - command[:2]),
                  2 * (velocity[3] - command[2]), .1 * acceleration[:3],
-                 .1 * alpha, p[42] * q[4], np.sqrt(30) * q[5]]
+                 .1 * alpha, p[42] * q[4], p[43] * q[5]]
     constraints, lower, upper = [], [], []
 
     def bound(value, lo, hi):
@@ -92,10 +92,6 @@ def make_kernel(name, contacts):
         upper_reach = (1 - p[41]) * leg_max + p[41] * p[49 + leg_index]
         bound(ca.sumsqr(leg), lower_reach**2, upper_reach**2)
         bound(q[2] - feet[2, leg_index], .2, ca.inf)
-        target = ((1 - p[41]) * ca.vertcat(0, 0, height) +
-                  p[41] * rotation @ p[29 + 3 * leg_index:32 + 3 * leg_index])
-        residuals.extend([np.sqrt(3) * (leg - target),
-                          p[43] * (leg[2] - target[2])])
     # 월드 수직속도 규제(p[53]=sqrt(vz_weight)): 하강 runaway 억제. 잔차 맨 끝에 둔다.
     residuals.append(p[53] * velocity[2])
     residual = ca.vertcat(*residuals)
@@ -104,6 +100,27 @@ def make_kernel(name, contacts):
                ca.densify(ca.jacobian(constraint, z)), ca.vertcat(*lower), ca.vertcat(*upper)]
     return ca.Function(name, [z, p], outputs,
                        ['z', 'p'], ['r', 'jr', 'g', 'jg', 'lower', 'upper'])
+
+
+def make_nominal_kernel():
+    """식 (33): midstance의 월드 엉덩이-발 벡터와 수직 목표의 잔차."""
+    state = ca.SX.sym('state', 9)  # CoM pose(6), 발 링크 원점(3).
+    parameters = ca.SX.sym('parameters', 4)  # CoM 기준 hip 벡터(3), 목표 높이.
+    rotation, _, _ = rotation_rates(state[3:6], ca.SX.zeros(3), ca.SX.zeros(3))
+    residual = (state[:3] + rotation @ parameters[:3] - state[6:9] -
+                ca.vertcat(0, 0, parameters[3]))
+    return ca.Function('tamols_nominal_kinematics', [state, parameters],
+                       [residual, ca.densify(ca.jacobian(residual, state))])
+
+
+def make_terrain_alignment_kernel():
+    """식 (34)의 지면 투영 기준점과 자세 미분. 지도 미분은 C++에서 연결한다."""
+    state = ca.SX.sym('state', 6)
+    hip = ca.SX.sym('hip', 3)
+    rotation, _, _ = rotation_rates(state[3:6], ca.SX.zeros(3), ca.SX.zeros(3))
+    point = state[:3] + rotation @ hip
+    return ca.Function('tamols_terrain_alignment', [state, hip],
+                       [point, ca.densify(ca.jacobian(point, state))])
 
 
 def main():
@@ -131,6 +148,9 @@ def main():
                                   [outputs[i] for i in (0, 2, 4, 5)]))
         generator.add(ca.Function(kernel.name() + '_constraint_jacobian', [z, p],
                                   [outputs[i] for i in (2, 3, 4, 5)]))
+    nominal = make_nominal_kernel()
+    generator.add(nominal)
+    generator.add(make_terrain_alignment_kernel())
     generator.generate()
     # 저장소 스타일 계약: 생성기의 null-input 기본값 표현도 명시적 분기로 쓴다.
     generated = Path('tamols_kernels.c')
@@ -146,13 +166,15 @@ def main():
         raise RuntimeError('unsupported conditional expression in generated C')
     generated.write_text(text)
     header = Path('tamols_kernels.h')
-    header.write_text('/**\n * @file tamols_kernels.h\n * @brief 대각선 두 지지·세 지지 네 조합·전체 지지의 잔차·제약·미분 C API.\n * @version 0.0.6\n * @update 2026-10-23: 착지 대기의 세 지지 조합별 계산 함수를 추가함.\n * @update 2026-10-14: 다리별 관절 제한 거리를 제약 매개변수로 추가함.\n */\n' + header.read_text())
+    header.write_text('/**\n * @file tamols_kernels.h\n * @brief 대각선 두 지지·세 지지 네 조합·전체 지지의 잔차·제약·미분 C API.\n * @version 0.0.8\n * @update 2026-10-30: 지형 몸통 정렬 기준점 미분과 수평 roll 비용 선택을 추가함.\n * @update 2026-10-29: 표본 다리 비용을 분리하고 midstance nominal 미분 함수를 추가함.\n */\n' + header.read_text())
     for path in (generated, header):
         path.write_text('\n'.join(line.rstrip() for line in path.read_text().splitlines()) + '\n')
     manifest = {'casadi_version' : ca.__version__, 'z_size': 31, 'parameter_size': 54,
                 'evaluation_modes': ['full', 'values', 'constraint_jacobian'],
                 'kernels': {f.name(): {'residuals': f.size1_out(0),
                                       'constraints': f.size1_out(2)} for f in kernels}}
+    manifest['nominal_kinematics'] = {'state_size': 9, 'parameter_size': 4, 'residuals': 3}
+    manifest['terrain_alignment'] = {'state_size': 6, 'parameter_size': 3, 'outputs': 3}
     Path('manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
 
 

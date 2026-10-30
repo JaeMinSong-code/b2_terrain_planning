@@ -1,5 +1,22 @@
 # B2 지형 맵·상위 계획
 
+B2 맵은 `b2_terrain_planner/config/b2_terrain.yaml`의
+`mapping.publishers.elevation_map_raw.publish_on_update: true`로 융합 직후 발행합니다.
+고정 20Hz 타이머를 기다리거나 같은 지도를 반복 직렬화하지 않고, 처리 가능한 센서
+입력 속도를 따릅니다. 입력 adapter와 맵 runner의 대기 점군은 각각 최신 한 개입니다.
+adapter는 점군 수신 및 필요한 odom 도착 시 바로 처리하고, runner도 수신 시 바로
+융합합니다. 기존 20ms/10ms 타이머는 TF·odom 대기 중 재시도용으로 유지합니다.
+원본 측정 시각, 정확한 시각의 TF 조회, odom 보간·불연속 reset, 초기화 규칙과 기존
+시간 조건은 유지합니다. 맵과 TAMOLS 계산을 서로 동기화하거나 새 발행 거부 조건을
+추가하지 않습니다. 점군이 끊기면 새 지도도 없으며 planner의 기존 계획 처리가 적용됩니다.
+
+CuPy 패키지는 점군 수신·지도 발행 depth 1, raw 3개 층의 묶음 GPU 복사를 사용합니다.
+변경 후 두 패키지를 함께 빌드하고 맵 노드를 재시작합니다.
+검증은 기존 ROS·CuPy Python 환경에서
+`python b2_terrain_planner/development/tests/map_update_delivery_test.py b2_terrain_planner`
+및 `initializer_gpu_test.py`를 같은 인자로 실행합니다. GPU 테스트는 별도 ROS 도메인으로
+실행하여 사용 중인 시뮬레이션과 분리합니다.
+
 WBC와 함께 사용하는 통합 실행은 `b2_deploy_ws/scripts/run_laptop.sh`가 담당한다.
 GUI·RViz·지도·TAMOLS·시각화 TF를 함께 실행하고, 지도 입력은 `/kf/odom`으로 맞춘다.
 로봇 측은 `b2_deploy_ws/scripts/run_robot.sh`로 실행한다(개발 PC 기본 MuJoCo).
@@ -9,15 +26,17 @@ GUI·RViz·지도·TAMOLS·시각화 TF를 함께 실행하고, 지도 입력은
 속도와 yaw 속도이며, 기본 0.25초 동안 새 명령이 없으면 0으로 처리한다.
 `/terrain_planner_node/effective_command`에서 실제 계획 입력에 사용하는 값을 확인할 수 있다.
 단독 실행의 고정 `command` 파라미터는 `command_topic`이 비어 있을 때만 사용한다.
-통합 설정은 raw 지도 진단 중 작은 접촉 기억 패치만 켜고 전역 z 재정착은 끈다.
+통합 WBC 설정은 전역 지면 오프셋과 작은 접촉 기억 패치를 planner 입력에 적용한다.
 명령 전달 및 국소 지도 보정과 전체 폐루프 보행 성공은 별도로 검증한다.
 `/terrain_planner/elevation_map_corrected`는 실제 SQP 입력의 z 보정·접촉발 패치 적용 후
 지도를 최대 10 Hz로 발행한다(reliable/transient-local, 마지막 1개). 원본 지도 시각과
-좌표를 유지하며 미관측 셀은 NaN이다. 새 계획 입력이 없으면 마지막 지도만 유지한다.
+좌표를 유지하며 `elevation`의 미관측 셀은 NaN이다. solve 완료 시 계산 지도
+`h`, `h_s1`, `h_s2`와 원본 마스크 `observed`를 함께 발행한다. 새 입력이 없으면 마지막 지도를 유지한다.
 비평지 sim `--tamols --rviz`의 기본 표시는 `RawElevationMap`이며,
 `CorrectedElevationMap`을 별도로 켜서 실제 SQP 입력과 비교한다.
-`map_datum_reanchor.enabled: false`, `support_patch.enabled: true`로 planner 입력에만
-반폭 0.05m 접촉 패치를 적용한다. CuPy raw 셀은 바꾸지 않는다. CuPy 시작 초기화는
+`map_datum_reanchor.enabled: true`, `support_patch.enabled: true`로 planner 입력에만
+전역 지면 오프셋과 반폭 0.05m 접촉 패치를 적용한다. CuPy raw 셀은 바꾸지 않는다.
+raw 진단에서 datum을 끄더라도 지도는 지면, 발 위치는 중심이라는 기준은 유지한다. CuPy 시작 초기화는
 `use_initializer_at_start: true`로 켜 로봇 아래 미관측 영역만 한 번 채운다. odom 추정기와 CuPy 내부 융합 설정은 바꾸지 않는다.
 sim `--tamols`는 원본·보정 지도와 발 상태·odom 전체 메시지를 deploy의
 `runtime_logs/map_history_*` rosbag으로 기록한다. 원본 지도 보정이나 보행 개선 자체를 뜻하지 않는다.
@@ -25,8 +44,8 @@ sim `--tamols`는 원본·보정 지도와 발 상태·odom 전체 메시지를 
 
 평지 알고리즘 검증은 두 실행기에 모두 `--flat`을 붙인다. 별도 평면 MuJoCo XML과
 기존 LiDAR/CuPy 지도를 사용하고, 입력 GridMap의 구조를 유지한 채 높이·분산·유효성만
-평탄화한다. 평면 높이는 최근 유효 센서 관측을 따라 갱신해 odometry 드리프트를 반영한다.
-초기 발 링크/지면 높이 차이만 고정 오프셋으로 유지한다. TAMOLS와 RViz는 `/terrain_planner/elevation_map_flat`을 받는다.
+평탄화한다. 평면 높이는 확인 지지발의 지면 높이를 변화율 제한으로 추적해 odometry 드리프트를 반영한다.
+초기화와 후속 갱신 모두 확인 지지발 중심에서 `foot_radius`를 뺀 지면 높이를 사용한다. TAMOLS와 RViz는 `/terrain_planner/elevation_map_flat`을 받는다.
 현재 지지발은 추정 위치를 그대로 사용하며 지도와 5mm 이상 높이가 달라도 입력을 거부하지 않는다.
 현재 발·확정 착지점의 지도 조회를 재계획 조건으로 요구하지 않는다. 새 착지점의 지도 조회와
 SQP의 지형 비용·GIAC·마찰·도달 길이 제약은 유지한다.
@@ -60,20 +79,67 @@ map clear 후에는 다시 한 번 초기화하며, 보행·접촉 전환마다 
 `use_initializer_at_start: false`로 끌 수 있다.
 설치 설정 반영 후 맵 노드를 포함해 실행을 재시작한다. 비평지 출발에는 이 가정을 사용하지 않는다.
 
+## TAMOLS 지형 처리와 착지 후보
+
+기본 `terrain.pipeline_enabled: true`는 [TAMOLS 논문](https://arxiv.org/abs/2206.14049)의
+지형 처리(IV), 경계 비용(V-B), 단계 초기화(V-D)를 따른다. 원본 관측 지도는 보존하고,
+연결된 미관측 영역을 경계의 최소 높이로 채운 계산 복사본에 median을 적용해 `h`를 만든다.
+약한 Gaussian의 `h_s1`과 mask dilation·강한 Gaussian의 가상 바닥 `h_s2`를 별도로 둔다.
+5점 중앙차분 기반 경계 비용은 `h`와 `h_s1` 양쪽의 기울기를 사용한다. 이전의
+"필터 주변에 미관측 셀이 하나라도 있으면 경계 비용 0" 처리는 기본 경로에서 사용하지 않는다.
+
+후보 보정에는 원본 미관측 마스크, 양의 곡률, `h_s2`와의 높이 차 비용을 포함한다.
+몸통은 각 hip 투영점에서 가상 바닥과의 상대 높이 비용을 사용한다. 새 착지 슬롯에서
+가상 바닥 최적화→coarse 착지점 주변 0.4m 폭 후보 보정→실제 지형 최적화를 수행한다.
+같은 슬롯 재계획은 이전 해를 재사용한다. 기존 확정 착지점은 그대로 유지한다.
+지도 처리·초기화는 기존 solve 예산에 포함하며 기본 100ms 중 준비 단계에 최대 25%를
+배정한다. 준비 단계 실패·시간 부족 시 직접 초기화로 실제 지형 SQP를 계속한다.
+별도 발행 거부 조건은 추가하지 않는다. 필터 폭과 가중치는 B2 튜닝값이며 논문의
+고정 수치가 아니다. 돌 중앙은 비용이 낮은 후보로 유도하며 강제로 지정하지 않는다.
+
+설정은 `b2_terrain_planner/config/b2_terrain.yaml`의 `planner.common.terrain.*`에 둔다.
+`median_iterations`, `smoothing_sigma`, `virtual_floor_sigma`, `virtual_floor_radius`는
+계산 지도 형상을, `occlusion_weight`, `curvature_weight`, `virtual_height_weight`는
+후보 선호를, `body_alignment_weight`는 몸통 정렬을 조절한다.
+`graduated_initialization`, `graduated_budget_fraction`은 준비 단계를 설정한다.
+독립 CLI는 같은 이름을 `terrain_settings`에 받는다. 비교 진단 시
+`pipeline_enabled: false`로 기존 관측 전용 처리를 선택할 수 있다.
+
+`IsQueryable`은 처리 높이 조회 가능 여부다. 관측 여부는 원본 `valid` 또는
+`Sample.occlusion`으로 확인한다. 보간 셀은 `observed=0`이며 센서 관측으로 취급하지 않는다.
+보정 GridMap의 `h`, `h_s1`, `h_s2`, `observed`와 solve 로그의
+`terrain_processing_seconds`, `terrain_initialization_seconds`, `terrain_initialization_status`로
+계산 입력·비용·준비 시간의 적용을 확인한다. 설치 후 실행기를 재시작해야 한다.
+합성 돌 후보·미관측 마스크·Jacobian·초기화/재사용/예산 fallback은
+`terrain_pipeline_test`로 검증한다. 이 테스트는 실제 parkour 보행 성공 검증을 대체하지 않는다.
+
+검증 결과: CPU 회귀 11개와 ROS flat-map·planner-retry 시험 2개는 통과했다.
+기록된 parkour 지도에서는 문제 착지점의 경계 항이 0에서 양수로 복구되고 후보가
+안쪽으로 약 4.7cm 이동했다. headless parkour 실행(전진 명령 0.25m/s)은 122회 계산 중
+110회 성공·92회 발행, 지형 처리 중앙값 2.6ms·전체 계산 중앙값 10.5ms였다.
+11회는 100ms를 초과했고 최대 110.7ms였다. 돌 구간에서 자세를 잃고 감쇠 모드로
+전환했으므로 통과한 보행 시험이 아니다. 목표/실제 착지 차이와 위치 추정 오차가
+약 7~8cm인 사례도 남아 있다. 평지 통합 시험은 원본 지도 미발행으로 계산 전 중단됐다.
+지형 비용 개선과 지도·추정·실제 착지 정합 및 폐루프 보행 안정성을 분리해 확인해야 한다.
+
+이 반영은 지형·착지 관련 누락을 보완한다. 원문의 모든 비용·모델을 동일하게
+구현했다는 뜻은 아니다. 몸통 추종·평활 비용과 각운동량 모델의 차이, 외력 추정 입력,
+무릎 오프셋 기반 스윙 모델은 별도 범위이며 이번 변경에 포함하지 않는다.
+
 ## 접촉 발의 작은 영역과 높이 기억
 
 `b2_terrain.yaml`의 `planner.wbc`에서 `support_patch.enabled: true`이면,
-`contact_confirmed && contact_estimated`인 발 주변 셀을 발의 Z 높이로 기억한다.
+`contact_confirmed && contact_estimated`인 발 주변 셀을 `발 중심 Z − foot_radius`인 지면 높이로 기억한다.
 기본 `support_patch.half_width: 0.05`는 X/Y 각 방향 5 cm(10×10 cm) 영역이다.
 필터·미분·보간을 위해 영역을 자동으로 넓히지 않는다. 해당 영역 안의 셀 중심만
 갱신하므로 실제 표시 경계는 지도 해상도에 따른다. 겹치면 가장 가까운 접촉 발을 따른다.
 
 기억한 셀은 발을 들어도 유지하며, 새 원본 지도가 도착해도 지우지 않는다.
-같은 셀에 다시 접촉하면 최신 발 높이로 갱신한다. 지도 이동 시 동일 좌표의 셀을 유지하고
+같은 셀에 다시 접촉하면 최신 발 중심에서 반경을 뺀 지면 높이로 갱신한다. 지도 이동 시 동일 좌표의 셀을 유지하고
 로컬 지도 밖의 기억은 버린다. 지도 frame·해상도 변경, ROS 시각 역행, 노드 재시작 시
 기억을 초기화한다. 기억은 현재 로컬 지도 크기로 제한하며 파일에서 복원하지 않는다.
 
-발 링크 높이를 지면으로 취급하는 기존 가정은 유지한다(발 두께 보정 아님).
+발 링크 원점은 구 중심이다. 접촉 기록 때 반경을 한 번 빼고 기억을 재적용할 때는 빼지 않는다.
 보정 셀의 유효성은 1, 분산은 0이다. 원본 관측 지도에는 쓰지 않고, datum 오프셋을 적용한
 계획 입력 복사본 위에 접촉 기억을 덧씌운다. 따라서 발을 뗀 뒤에도 같은 셀이
 TAMOLS와 RViz의 `CorrectedElevationMap`에 남는다. 그 밖의 관측 지형·미관측 영역은 보존한다.
@@ -310,6 +376,20 @@ RViz의 Fixed Frame과 연결되는 TF도 같은 좌표 계약에 맞춰야 한�
   `base_pose.orientation`은 몸통 자세, `base_twist.angular`는 roll/pitch/yaw 변화율이다.
   `b2_deploy` bridge가 각속도로 변환하고 WBC는 전신 CoM Jacobian으로 병진을 직접 추종한다.
   base 원점 궤적을 이 메시지의 병진 필드에 넣지 않는다.
+- nominal kinematics는 논문 식 (33)의 `CoM + R·hip_offset - foot - [0,0,h_des]`
+  제곱 비용을 연속 지지 구간의 중간 시각에서 한 번 평가한다.
+  `nominal_kinematics_weight` 기본값은 7이며 CLI는 `--nominal-kinematics-weight`다.
+  B2 nominal 기준점은 hip 중립 자세에서 URDF의 hip→thigh 옆방향 링크까지 포함한다.
+  첫 hip 관절만 사용하면 기본 발보다 약 12cm 안쪽을 선호하므로 reach용 hip과 분리한다.
+  기준점은 CoM 좌표로 변환하고 `h_des = robot.height + nominal_origin.z`로
+  수평 자세에서의 다리 기준점→발 중심 높이를 사용한다. 발 목표의 사후 보정은 하지 않는다.
+  모델 없는 입력은 기존 hip/height 비용 의미를 유지한다.
+  horizon 경계에서 잘린 지지는 보이는 구간의 중점을 사용한다. 다른 발의 접촉 전환이나
+  spline 분할로 같은 지지 구간을 중복 평가하지 않는다. 완전 지지 대기도 구간당 한 번이다.
+  기존 고정 nominal XY 흡인 및 매 표본의 기준 다리·수직 비용은 제거했다.
+  `leg_vertical_weight`/`--leg-vertical-weight`는 제거한다. 명령속도 기반 nominal은
+  초기값·탐색 범위·후방 비용 기준으로만 남으며 ±0.30m 범위, 후방 비용, 이전 해 비용과
+  committed 착지점은 유지한다. 새 제약·발행 거부 검사는 추가하지 않는다.
 - 스윙 XY는 전체 스윙 시간에 걸친 5차 곡선이며, Z는 시작점→정점→착지점을
   연결하는 두 5차 구간이다. 생성 곡선의 연결점은 위치·속도·가속도가 연속이다.
   부분 재연결은 시작 위치·속도와 함께 가속도를 보존한다. 실행 중인 스윙은 기존처럼
@@ -317,13 +397,16 @@ RViz의 Fixed Frame과 연결되는 TF도 같은 좌표 계약에 맞춰야 한�
   상승·수평 이동·하강에 시간을 따로 배정하지 않는다. 접촉 패치 전 지도에서
   기본 XY 경로가 지나는 셀을 발 크기까지 포함해 조회한다. 기본 발바닥 높이와
   지면의 여유가 `swing_terrain_clearance`(기본 0.03 m)보다 부족할 때만 Z를 보정한다.
-  출발·착지의 요구 여유는 `sin⁴(πs)`로 0까지 줄이고, 최대 부족 높이 H를 구해
-  기본 Z에 `H sin⁴(πs)`를 더한다. s는 스윙 진행률이다. 작은 사인값으로 나눠
-  진폭을 증폭하지 않는다. 따라서 경로 끝부분의 장애물까지 일정 여유를 보장하는
-  충돌 회피가 아닌, 중간 지형에 따른 추가 들기다. 미관측 셀은 건너뛰며 관측이
-  없거나 기본 여유가 충분하면 보정은 0이다. SQP 제약·발행 거부는 추가하지 않는다.
-  `swing_foot_radius=0.0351`, `swing_foot_half_width=0.0275` m는 MuJoCo 발 충돌
-  형상의 반경·반폭이다. 보정은 XY·착지 XYZ·착지 시각을 변경하지 않는다.
+  출발·착지의 요구 여유는 `sin⁴(πs)`로 0까지 줄인다. 진행률 0.15~0.85의
+  부족 구간에 맞춰 smoothstep 상승·최대 부족량 유지·하강 보정을 더한다.
+  지형 기반 XY 후퇴는 사용하지 않으며 기본 XY 위치·속도·가속도를 유지한다.
+  착지 XYZ·착지 시각과 양 끝 p/v/a는 유지한다. 미관측 셀은 건너뛰며
+  관측이 없거나 기본 여유가 충분하면 보정은 0이다. SQP 제약·발행 거부는 추가하지 않는다.
+  `foot_radius=0.032` m는 구형 발 반경이며 착지 후보·비용·재사용, 패치·flat,
+  XY 조회 범위·Z 여유와 datum 보정에 공통 사용한다. planner·WBC URDF와 배포 MuJoCo XML의 구 중심은 foot 링크 원점이다.
+  원통 반폭 설정은 제거했다. 기존 `swing_foot_radius`, `swing_foot_half_width`,
+  `map_datum_reanchor.contact_offset` 사용자 설정은 `foot_radius`로 통합한다.
+  지도는 지면, 착지점·발 궤적은 중심으로 통일하며 아래 높이 기준 계약을 따른다.
   실행기는 20ms 위치 샘플을 선형 보간하므로 생성 곡선의 C2 연속성을 그대로
   보장하지 않는다. 실제 보행 추종은 별도 검증 대상이다. 이륙 전에는 재계획 입력의
   측정 발 위치로 시작점을 갱신한다. 이전 후보와 착지 시각이 같아도 이전 시작점·정점을
@@ -597,3 +680,44 @@ ROS callback의 후보 수신 승인이고 실제 실행 stamp는 `plan_stamp_ns
 착지 인계 ROS 시험을 통과했다. 기록은 workspace의
 `artifacts/handover_20261019/verification.json` 및 `reversal_final/`에 있다.
 검증 범위는 평지 MuJoCo이며 실제 로봇과 비평지 검증은 별도다.
+
+## 지도·발 높이 기준 계약
+
+높이를 수정할 때는 아래 표를 기준으로 입력부터 실행까지 추적한다. 좌표 프레임이
+같다는 것과 물리 기준점이 같다는 것은 별개다. B2의 foot 링크 원점은 반경
+`foot_radius`(기본 0.032m) 구의 중심이며 발바닥 접촉점이 아니다.
+
+| 데이터/경로 | 저장·전달하는 높이 | 변환 책임 |
+| --- | --- | --- |
+| LiDAR 원본·보정·평탄화 GridMap, `HeightMap`, `TerrainModel::Sample` | 지면 Z | 지도에 발 반경을 더하지 않는다 |
+| `LocomotionState.foot_position`, FK/IK, 측정·계획 발 위치 | foot 링크 원점/발 중심 Z | ROS bridge·WBC에서 반경을 다시 적용하지 않는다 |
+| datum 재정착 | 지면 오프셋 | `발 중심 Z − 반경 − 원본 지면 Z` |
+| `SupportPatchMemory`, `ApplySupportPatches` | 입력은 발 중심, 저장은 지면 Z | 관측 기록 시 반경을 한 번 빼고 재적용 시 그대로 복사 |
+| `FlatElevationMap` | 지면 Z | 초기 보정·후속 추적 모두 지지발 중심에서 반경을 뺀다 |
+| `FindFoothold`, 착지 비용, `LandingHeight`, warm start | 발 중심 Z | 지면 조회값에 같은 반경을 한 번 더한다 |
+| 스윙 여유 | 발바닥과 지면 사이 거리 | `발 중심 Z − 반경 − 지면 Z`; 착지 목표에 반경을 다시 더하지 않는다 |
+| `LocomotionPlan.foot_position`, WBC, RViz 발 궤적 | 발 중심 Z | 계획을 그대로 전달·추종한다 |
+| MuJoCo `foot_gt_world_*` / `gt_slip_*_pos_world_*` | 각각 발 중심 / 실제 접촉점 | 두 로그를 같은 점으로 비교하지 않는다 |
+
+반경 설정의 원본은 `b2_terrain_planner/config/b2_terrain.yaml`의
+`planner.common.foot_radius`다. 생성된 `terrain_planner_flat.yaml`은 planner와
+flat 노드 양쪽에 같은 값을 전달하며 배포 실행기도 이 파일을 flat 노드에 넘긴다.
+독립 CLI의 지도 입력은 지면 Z이며 `terrain_settings.foot_radius`로 반경을 지정한다.
+지도가 없는 수학/legacy 입력에서 발 중심 z=0은 기존 로컬 기준면이다. 이를 실제
+지면 z=0으로 해석하거나 측정 발 좌표 전체를 반경만큼 이동하지 않는다.
+`robot.height`와 nominal 다리 높이는 발 중심에 대한 상대 높이다.
+WBC의 `support_foot_center_z_`도 지지발 중심 높이이며 지도 지면이 아니다.
+
+이 계약은 기존 높이맵의 수직 반경 근사다. 경사면 법선상의 정확한 구 접촉점이나
+전신 충돌 모델을 추가한 것이 아니다. GIAC·WBC의 기존 발 기준 동역학 근사도 유지한다.
+
+수정 시에는 `terrain_planner_node.cpp`(datum/설정 전달), `support_patch.cpp`,
+`flat_elevation_map.py`, `terrain.cpp`(후보/비용), `planner.cpp`(재사용),
+`swing_reference.h`, ROS 메시지·bridge, WBC, URDF/MuJoCo 형상을 함께 확인한다.
+설정 OFF로 혼합 기준을 숨기거나, 후처리에서 계획 Z만 옮겨 맞추지 않는다.
+평지에서 지면 0·발 중심 0.032m를 넣었을 때 패치 경계가 평탄하고, 착지 비용이 0이며,
+후보·재사용·실행 목표가 모두 0.032m인지 검증한다. 다른 반경과 odom Z 이동,
+단차·스윙 중 고정 목표도 확인해 반경 누락/중복 적용을 막는다.
+관련 검증은 기존 support-patch·terrain-validity/reuse·flat-map·config·swing 시험에 둔다.
+새 제약·추가 여유·발행 거부 조건은 이 기준 통일에 포함하지 않는다.
+단위 검증 통과와 실제 후진→제자리→전진 보행 안정성 확인은 구분한다.

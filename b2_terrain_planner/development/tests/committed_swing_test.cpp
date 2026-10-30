@@ -1,9 +1,9 @@
 /**
  * @file committed_swing_test.cpp
  * @brief 명령·지도 변경 시 진행 중 착지점의 최적화 고정과 착지 후 해제를 검증한다.
- * @version 0.0.4
- * @update 2026-10-27: 확정 착지점 아래 지도 관측이 사라져도 XYZ 유지와 재계획을 검증함.
- * @update 2026-10-21: 착지 대기 중 몸통 시간 진행과 유한 재계획·보행 재개 연속성을 반영함.
+ * @version 0.0.6
+ * @update 2026-10-30: 보간 높이 조회와 원본 관측 마스크를 구분해 스윙·접촉 계약을 검증함.
+ * @update 2026-10-29: 지면·발 중심 변환과 반경 누락·중복 방지 회귀를 검증함.
  */
 #include "b2_terrain_planner/committed_swing.h"
 #include <cmath>
@@ -32,7 +32,7 @@ int main() {
     initial.command.x() = .1;
     HeightMap map;
     map.origin = Eigen::Vector2d::Constant(-1.975);
-    map.heights = Eigen::MatrixXd::Zero(80, 80);
+    map.heights = Eigen::MatrixXd::Constant(80, 80, -0.032);  // 발 중심 z=0의 지면.
     map.valid = Eigen::ArrayXXi::Ones(80, 80);
     map.variance = Eigen::MatrixXd::Zero(80, 80);
     initial.terrain = map;
@@ -66,7 +66,7 @@ int main() {
     }
     const TerrainModel missing_terrain(missing_map, settings.terrain);
     for (int leg : {1, 2}) {
-      Check(!missing_terrain.IsQueryable(references[leg].target.head<2>()),
+      Check(missing_terrain.Sample(references[leg].target.head<2>()).occlusion > 1 - 1e-10,
             "committed test location is still observed");
     }
     const auto unobserved_result = Solve(robot, missing_committed, settings, &first);

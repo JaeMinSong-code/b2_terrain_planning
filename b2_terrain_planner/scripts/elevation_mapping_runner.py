@@ -18,7 +18,7 @@ from elevation_common import decode_xyz, rotation, flat_ground_height
 
 class StrictElevationMappingNode(ElevationMappingNode):
     def __init__(self):
-        self.pending_clouds = deque(maxlen=5)
+        self.pending_clouds = deque(maxlen=1)
         self.last_accepted = 0.0
         super().__init__()
         self.initializer_pending = self.use_initializer_at_start
@@ -30,6 +30,7 @@ class StrictElevationMappingNode(ElevationMappingNode):
 
     def pointcloud_callback(self, msg, sub_key):
         self.pending_clouds.append((time.monotonic(), msg, sub_key))
+        self.flush_inputs()
 
     def flush_inputs(self):
         if not self.pending_clouds:
@@ -115,6 +116,11 @@ class StrictElevationMappingNode(ElevationMappingNode):
         except ValueError as error:
             self.get_logger().warning(f'Flat plane observation unavailable: {error}',
                                       throttle_duration_sec=2.0)
+
+    def _publish_updated_maps(self):
+        # 첫 융합 결과도 기존 publish_map의 freshness 조건을 만족하게 한다.
+        self.last_accepted = time.monotonic()
+        super()._publish_updated_maps()
 
     def publish_map(self, key):
         if time.monotonic() - self.last_accepted <= 1.0:

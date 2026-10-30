@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.34
- * @update 2026-10-28: CoM 중심에 맞춘 중립 발 XY를 착지점 계획에 반영함.
- * @update 2026-10-27: 지형 여유 기준을 분리하고 XY 시간 압축 없는 Z 보정을 연결함.
+ * @version 0.0.40
+ * @update 2026-10-30: 지형 처리 설정과 단계별 시간 진단 및 실제 h/h_s1/h_s2 지도 출력을 연결함.
+ * @update 2026-10-29: 지도 지면과 발 중심의 높이 계약 및 반경 변환을 통일함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -11,6 +11,7 @@
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
 #include "b2_terrain_planner/support_patch.h"
+#include "b2_terrain_planner/map_datum.h"
 #include "b2_terrain_planner/swing_reference.h"
 #include "b2_terrain_planner/committed_swing.h"
 
@@ -85,16 +86,39 @@ class TerrainPlannerNode : public rclcpp::Node {
     frame_ = declare_parameter<std::string>("frame", "odom");
     plan_rate_hz_ = declare_parameter<double>("plan_rate_hz", 10.0);
     sample_dt_ = declare_parameter<double>("sample_dt", 0.02);
+    // 핸드오버 마감시각·착지 대기 재개 유예. 계획이 상태 스냅샷 후 이 시간 안에
+    // 도착한다고 약속하는 값으로, 실측 전달 시간(~20-75ms)보다 커야 한다.
+    // 0 이하이면 기존 보수 공식(time_limit + 2*sample_dt)을 쓴다.
+    handover_grace_ = declare_parameter<double>("handover_grace", -1.0);
+    if (std::isnan(handover_grace_)) {
+      throw std::invalid_argument("handover_grace must not be NaN");
+    }
     swing_height_ = declare_parameter<double>("swing_height", 0.10);
-    // B2 MuJoCo 발 충돌 cylinder의 반경과 반길이. 발 중심 경로의 지면 여유에 사용한다.
+    // 구형 발 반경은 착지·패치·스윙·datum의 중심-지면 변환에 공통 사용한다.
     swing_terrain_clearance_ = declare_parameter<double>("swing_terrain_clearance", 0.03);
-    swing_foot_radius_ = declare_parameter<double>("swing_foot_radius", 0.0351);
-    swing_foot_half_width_ = declare_parameter<double>("swing_foot_half_width", 0.0275);
+    foot_radius_ = declare_parameter<double>("foot_radius", kDefaultFootRadius);
+    settings_.terrain.foot_radius = foot_radius_;
     require_map_ = declare_parameter<bool>("require_map", true);
     support_patch_enabled_ = declare_parameter<bool>("support_patch.enabled", false);
     support_patch_half_width_ = declare_parameter<double>("support_patch.half_width", 0.05);
     if (!std::isfinite(support_patch_half_width_) || support_patch_half_width_ <= 0) {
       throw std::invalid_argument("support_patch.half_width must be positive and finite");
+    }
+    support_patch_max_age_sec_ =
+        declare_parameter<double>("support_patch.max_age_sec", 2.0);
+    if (std::isnan(support_patch_max_age_sec_) || support_patch_max_age_sec_ <= 0) {
+      throw std::invalid_argument("support_patch.max_age_sec must be positive");
+    }
+    // 지도 z 기준(datum) 재정착: 확인 지지발 기준으로 지도 전체를 수직 이동해 odom z
+    // 드리프트를 상쇄한다. 지형 상대 모양은 보존하고(평탄화 아님) 전역 오프셋만 적용한다.
+    // 오프셋은 지도 갱신 틱에만 변하고 solve 사이에는 상수다(line search 안정).
+    map_datum_reanchor_enabled_ =
+        declare_parameter<bool>("map_datum_reanchor.enabled", false);
+    map_datum_max_rate_ =
+        declare_parameter<double>("map_datum_reanchor.max_rate_mps", 0.01);
+    if (!std::isfinite(map_datum_max_rate_) || map_datum_max_rate_ <= 0 ||
+        !std::isfinite(foot_radius_)) {
+      throw std::invalid_argument("invalid map_datum_reanchor parameters");
     }
     const auto cmd = declare_parameter<std::vector<double>>(
         "command", std::vector<double>{0.1, 0.0, 0.0});
@@ -111,6 +135,18 @@ class TerrainPlannerNode : public rclcpp::Node {
     if (!std::isfinite(command_linear_accel_) || command_linear_accel_ <= 0.0 ||
         !std::isfinite(command_angular_accel_) || command_angular_accel_ <= 0.0) {
       throw std::invalid_argument("command_ramp acceleration must be positive and finite");
+    }
+    // 위치 유지(station keeping): 명령 0 유지 중 측정 CoM의 앵커 이탈을 속도 명령으로
+    // 환원한다. 최적화에 몸통 위치 추종 항이 없어 생기는 제자리 random walk를 막는다.
+    station_keeping_enabled_ = declare_parameter<bool>("station_keeping.enabled", false);
+    station_keeping_gain_ = declare_parameter<double>("station_keeping.gain", 0.5);
+    station_keeping_max_velocity_ =
+        declare_parameter<double>("station_keeping.max_velocity", 0.06);
+    if (!std::isfinite(station_keeping_gain_) || station_keeping_gain_ < 0.0 ||
+        !std::isfinite(station_keeping_max_velocity_) ||
+        station_keeping_max_velocity_ < 0.0) {
+      throw std::invalid_argument(
+          "station_keeping gain/max_velocity must be non-negative and finite");
     }
     effective_command_pub_ = create_publisher<geometry_msgs::msg::TwistStamped>(
         "~/effective_command", rclcpp::QoS(1));
@@ -192,8 +228,9 @@ class TerrainPlannerNode : public rclcpp::Node {
     const double dt = time - *command_ramp_time_;
     if (dt <= 0.0) return;
     command_ramp_time_ = time;
-    // 착지 대기는 PlanningCommand에서만 적용한다. 사용자 램프는 계속 진행한다.
-    const Eigen::Vector3d target = EffectiveCommand();
+    // 착지 미확인의 즉시 0 목표는 유지하고, 실제 보행 정지 중에는 램프도 감속한다.
+    Eigen::Vector3d target = EffectiveCommand();
+    if (state.gait_clock_valid && state.gait_paused) target.setZero();
     const Eigen::Vector2d delta = target.head<2>() - applied_command_.head<2>();
     const double distance = delta.norm();
     const double step = command_linear_accel_ * dt;
@@ -224,6 +261,30 @@ class TerrainPlannerNode : public rclcpp::Node {
   Eigen::Vector3d PlanningCommand() const {
     if (touchdown_stop_) return Eigen::Vector3d::Zero();
     return applied_command_;
+  }
+
+  // 명령 0 유지 중 측정 CoM을 앵커 위치에 붙드는 보정 속도(heading 프레임 XY).
+  // 사용자 XY 명령이 켜지면 앵커를 해제하고, 다시 0이 되면 그 자리에서 재설정한다.
+  // 착지 대기(touchdown_stop)의 즉시 0 목표는 유지하되 앵커는 보존한다.
+  Eigen::Vector2d StationKeepingCorrection() {
+    if (!station_keeping_enabled_ || !state_ ||
+        applied_command_.head<2>().norm() > 1e-3) {
+      hold_anchor_.reset();
+      return Eigen::Vector2d::Zero();
+    }
+    const Eigen::Vector2d com(state_->com_position.x, state_->com_position.y);
+    if (!com.allFinite()) return Eigen::Vector2d::Zero();
+    if (!hold_anchor_) hold_anchor_ = com;
+    if (touchdown_stop_) return Eigen::Vector2d::Zero();
+    Eigen::Vector2d correction = station_keeping_gain_ * (*hold_anchor_ - com);
+    const double norm = correction.norm();
+    if (norm > station_keeping_max_velocity_) {
+      correction *= station_keeping_max_velocity_ / norm;
+    }
+    const Eigen::Quaterniond q(state_->base_orientation.w, state_->base_orientation.x,
+                               state_->base_orientation.y, state_->base_orientation.z);
+    const double yaw = QuatToZyx(q.normalized())[0];
+    return Eigen::Rotation2Dd(-yaw) * correction;
   }
 
   void DiscardRetrySeed() {
@@ -335,6 +396,9 @@ class TerrainPlannerNode : public rclcpp::Node {
         << ",\"solve_end_ns\":" << solve_end_ns_
         << ",\"last_publish_ns\":" << last_publish_ns_
         << ",\"elapsed\":" << number(result.elapsed)
+        << ",\"terrain_processing_seconds\":" << number(result.terrain_processing_seconds)
+        << ",\"terrain_initialization_seconds\":" << number(result.terrain_initialization_seconds)
+        << ",\"terrain_initialization_status\":" << std::quoted(result.terrain_initialization_status)
         << ",\"iterations\":" << result.iterations
         << ",\"violation\":" << number(result.violation)
         << ",\"worst_constraint\":" << std::quoted(worst)
@@ -441,10 +505,26 @@ class TerrainPlannerNode : public rclcpp::Node {
     settings_.orientation_limit =
         declare_parameter<double>("orientation_limit_deg", 60.0) * M_PI / 180.0;
     settings_.pitch_weight = declare_parameter<double>("pitch_weight", 10.0);
-    settings_.leg_vertical_weight = declare_parameter<double>("leg_vertical_weight", 30.0);
+    settings_.nominal_kinematics_weight =
+        declare_parameter<double>("nominal_kinematics_weight", 7.0);
     settings_.foothold_backward_weight =
         declare_parameter<double>("foothold_backward_weight", 1.4);
+    settings_.previous_foothold_weight =
+        declare_parameter<double>("previous_foothold_weight", 0.35);
     settings_.vz_weight = declare_parameter<double>("vz_weight", 0.0);
+    settings_.graduated_initialization = declare_parameter<bool>("terrain.graduated_initialization", true);
+    settings_.graduated_budget_fraction = declare_parameter<double>("terrain.graduated_budget_fraction", 0.25);
+    auto& terrain = settings_.terrain;
+    terrain.pipeline_enabled = declare_parameter<bool>("terrain.pipeline_enabled", true);
+    terrain.median_iterations = declare_parameter<int>("terrain.median_iterations", 1);
+    terrain.smoothing_sigma = declare_parameter<double>("terrain.smoothing_sigma", 0.05);
+    terrain.virtual_floor_sigma = declare_parameter<double>("terrain.virtual_floor_sigma", 0.2);
+    terrain.virtual_floor_radius = declare_parameter<double>("terrain.virtual_floor_radius", 0.15);
+    terrain.occlusion_weight = declare_parameter<double>("terrain.occlusion_weight", 10.0);
+    terrain.curvature_weight = declare_parameter<double>("terrain.curvature_weight", 0.001);
+    terrain.virtual_height_weight = declare_parameter<double>("terrain.virtual_height_weight", 100.0);
+    terrain.body_alignment_weight = declare_parameter<double>("terrain.body_alignment_weight", 100.0);
+
   }
 
   // grid_map_msgs를 직접 디코딩한다(grid_map_core의 전역 Eigen 플러그인 오염 회피).
@@ -452,6 +532,47 @@ class TerrainPlannerNode : public rclcpp::Node {
   static int LayerIndex(const grid_map_msgs::msg::GridMap& m, const std::string& name) {
     for (size_t k = 0; k < m.layers.size(); ++k) if (m.layers[k] == name) return static_cast<int>(k);
     return -1;
+  }
+
+  // xy(odom)에서 관측된 지도 높이를 최근접 셀로 읽는다. 미관측/범위 밖이면 false.
+  // datum 재정착 오프셋 추정 전용(보간은 불필요, 관측 셀 하나면 충분).
+  static bool SampleMapHeight(const HeightMap& hm, const Eigen::Vector2d& xy, double* out) {
+    const Eigen::Vector2d idx = (xy - hm.origin) / hm.resolution;
+    const int col = static_cast<int>(std::lround(idx.x()));
+    const int row = static_cast<int>(std::lround(idx.y()));
+    if (row < 0 || col < 0 || row >= hm.heights.rows() || col >= hm.heights.cols()) return false;
+    if (hm.valid(row, col) == 0 || !std::isfinite(hm.heights(row, col))) return false;
+    *out = hm.heights(row, col);
+    return true;
+  }
+
+  // 확인 지지발(confirmed∧estimated)에서 median(foot_z − 지도높이 − 접촉 오프셋)을
+  // 변화율 제한으로 추적한다. 지도 갱신 틱(OnMap)에만 호출해 solve 사이에는 오프셋이
+  // 상수가 되게 한다. 적용은 solve 입력 복사본에만 하므로 저장 지도는 오염되지 않는다.
+  void UpdateMapDatum() {
+    if (!map_datum_reanchor_enabled_ || !terrain_ || !state_ ||
+        !Fresh(state_->header.stamp, state_max_age_)) {
+      return;
+    }
+    std::vector<double> diffs;
+    for (int leg = 0; leg < 4; ++leg) {
+      if (!(state_->contact_confirmed[leg] && state_->contact_estimated[leg])) continue;
+      const auto& foot = state_->foot_position[leg];
+      double mh;
+      if (SampleMapHeight(*terrain_, Eigen::Vector2d(foot.x, foot.y), &mh)) {
+        diffs.push_back(FootCenterToGroundZ(foot.z, foot_radius_) - mh);
+      }
+    }
+    const std::int64_t stamp_ns = rclcpp::Time(map_stamp_).nanoseconds();
+    double dt = 0.1;
+    if (map_datum_stamp_ns_ != 0 && stamp_ns > map_datum_stamp_ns_) {
+      dt = std::min(0.5, (stamp_ns - map_datum_stamp_ns_) * 1e-9);
+    }
+    map_datum_stamp_ns_ = stamp_ns;
+    UpdateDatumOffset(&map_datum_, diffs, dt, map_datum_max_rate_);
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+                        "Map datum re-anchor: offset %.4f m (planner input only)",
+                        map_datum_.offset);
   }
 
   void RememberSupportContacts() {
@@ -464,7 +585,8 @@ class TerrainPlannerNode : public rclcpp::Node {
       feet[leg] << foot.x, foot.y, foot.z;
       contacts[leg] = state_->contact_confirmed[leg] && state_->contact_estimated[leg];
     }
-    support_patch_memory_.Observe(feet, contacts, support_patch_half_width_);
+    support_patch_memory_.Observe(feet, contacts, support_patch_half_width_,
+                                  rclcpp::Time(state_->header.stamp).seconds(), foot_radius_);
   }
 
   void OnMap(const grid_map_msgs::msg::GridMap& msg) {
@@ -525,12 +647,14 @@ class TerrainPlannerNode : public rclcpp::Node {
       RememberSupportContacts();
     }
     map_stamp_ = msg.header.stamp;
+    UpdateMapDatum();
   }
 
   // 실제 SQP 입력을 표시한다. 원본 시각을 보존하고 미관측 셀은 NaN으로 유지한다.
   // 진단 발행만 최대 10 Hz로 제한하며 계산·계획 발행 조건에는 관여하지 않는다.
   void PublishCorrectedMap(const HeightMap& map,
-                           const builtin_interfaces::msg::Time& stamp) {
+                           const builtin_interfaces::msg::Time& stamp,
+                           const TerrainModel* terrain = nullptr) {
     const auto wall_now = std::chrono::steady_clock::now();
     if (last_corrected_map_publish_ &&
         wall_now - *last_corrected_map_publish_ < std::chrono::milliseconds(100)) return;
@@ -547,8 +671,9 @@ class TerrainPlannerNode : public rclcpp::Node {
     msg.info.pose.position.y = map.origin.y() + (cols - 1) * map.resolution / 2.0;
     msg.info.pose.orientation.w = 1.0;
     msg.layers = {"elevation", "variance"};
+    if (terrain) msg.layers = {"elevation", "variance", "h", "h_s1", "h_s2", "observed"};
     msg.basic_layers = {"elevation"};
-    msg.data.resize(2);
+    msg.data.resize(msg.layers.size());
     for (auto& layer : msg.data) {
       layer.layout.dim.resize(2);
       layer.layout.dim[0].label = "column_index";
@@ -563,10 +688,19 @@ class TerrainPlannerNode : public rclcpp::Node {
       for (int row = 0; row < rows; ++row) {
         const int x = rows - 1 - row;
         const int y = cols - 1 - col;
-        if (!map.valid(y, x)) continue;
         const int index = row + col * rows;
-        msg.data[0].data[index] = map.heights(y, x);
-        msg.data[1].data[index] = map.variance(y, x);
+        if (map.valid(y, x)) {
+          msg.data[0].data[index] = map.heights(y, x);
+          msg.data[1].data[index] = map.variance(y, x);
+        }
+        if (terrain) {
+          msg.data[5].data[index] = map.valid(y, x);
+          if (terrain->processed_map().valid(y, x)) {
+            msg.data[2].data[index] = terrain->processed_map().heights(y, x);
+            msg.data[3].data[index] = terrain->smooth_heights()(y, x);
+            msg.data[4].data[index] = terrain->virtual_map().heights(y, x);
+          }
+        }
       }
     }
     corrected_map_pub_->publish(msg);
@@ -625,7 +759,7 @@ class TerrainPlannerNode : public rclcpp::Node {
         }
         if (swing_terrain) {
           next.ShapeOverTerrain(*swing_terrain, swing_terrain_clearance_,
-                                swing_foot_radius_, swing_foot_half_width_);
+                                foot_radius_);
         }
         swing_references_[leg] = next;
         break;
@@ -684,6 +818,7 @@ class TerrainPlannerNode : public rclcpp::Node {
       published_plans_.clear();
       command_ramp_time_.reset();
       applied_command_.setZero();
+      hold_anchor_.reset();
       touchdown_stop_ = false;
       swing_references_ = {};
     }
@@ -728,6 +863,7 @@ class TerrainPlannerNode : public rclcpp::Node {
       published_plans_.clear();
       command_ramp_time_.reset();
       applied_command_.setZero();
+      hold_anchor_.reset();
       touchdown_stop_ = false;
       epoch_ns_.reset();
       last_planned_ns_ = -1;
@@ -740,7 +876,8 @@ class TerrainPlannerNode : public rclcpp::Node {
       UpdateCommandRamp(*state_);
     }
     // 램프한 사용자 목표를 사용하며 착지 대기는 속도 목표만 즉시 0으로 낮춘다.
-    const Eigen::Vector3d effective_command = PlanningCommand();
+    Eigen::Vector3d effective_command = PlanningCommand();
+    effective_command.head<2>() += StationKeepingCorrection();
     geometry_msgs::msg::TwistStamped command_message;
     command_message.header.stamp = now();
     command_message.header.frame_id = "base_heading";
@@ -819,8 +956,11 @@ class TerrainPlannerNode : public rclcpp::Node {
         PublishPipelineStatus("deferred", "active_plan_not_in_history");
         return;
       }
-      input.reference_prefix = std::make_shared<Result>(active->body);
+      // 몸통 궤적은 측정 상태에서 다시 시작한다(폐루프). 이전 계획에 하드 고정하던
+      // reference_prefix는 추적 오차를 영원히 누적시켜 제거했다. prefix_duration은
+      // 이제 핸드오버 마감시각과 착지 대기 재개 유예로만 쓰인다.
       input.prefix_duration = settings_.time_limit + 2 * sample_dt_;
+      if (handover_grace_ > 0) input.prefix_duration = handover_grace_;
       // legacy는 정지한 기준점에 연결한다. 별도 몸통 시각은 계산 중에도 진행한다.
       if (state.gait_paused && !state.body_clock_valid) input.prefix_duration = 0;
       if (state.body_clock_valid && state.gait_paused &&
@@ -837,11 +977,7 @@ class TerrainPlannerNode : public rclcpp::Node {
               BodyTime(context) + context.gait_hold_duration - BodyTime(input));
         }
       }
-      const double old_end = BodyTime(active->body.seed_context) + robot_.period;
-      if (BodyTime(input) + input.prefix_duration > old_end) {
-        PublishPipelineStatus("deferred", "active_body_horizon_too_short");
-        return;
-      }
+      // prefix 고정이 없으므로 이전 계획 horizon이 짧아도 재계획을 막지 않는다.
     }
     input.contact_estimated = state.contact_estimated;
     input.position << state.com_position.x, state.com_position.y, state.com_position.z,
@@ -864,9 +1000,16 @@ class TerrainPlannerNode : public rclcpp::Node {
       const auto& foot = state.foot_position[leg];
       input.feet.row(leg) << foot.x, foot.y, foot.z;
     }
+    // 지도 틱에서 추적한 datum 오프셋을 solve 입력 복사본에만 적용한다(지형 모양 보존).
+    if (map_datum_reanchor_enabled_ && input.terrain) {
+      ApplyDatumOffset(&*input.terrain, map_datum_.offset);
+    }
     const auto swing_terrain = input.terrain;
     if (support_patch_enabled_ && input.terrain) {
-      const int count = support_patch_memory_.ApplyTo(&*input.terrain);
+      // 수명 초과 패치는 옛 KF datum의 화석이라 적용하지 않는다(가짜 둔덕 방지).
+      const int count = support_patch_memory_.ApplyTo(
+          &*input.terrain, rclcpp::Time(state.header.stamp).seconds(),
+          support_patch_max_age_sec_);
       RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
                           "Support contact memory: %d cells, half-width %.3f m (planner input only)",
                           count, support_patch_half_width_);
@@ -903,9 +1046,6 @@ class TerrainPlannerNode : public rclcpp::Node {
           }
           return std::make_pair(std::move(result), clock->now().nanoseconds());
         });
-    if (pending_solve_->input.terrain) {
-      PublishCorrectedMap(*pending_solve_->input.terrain, pending_solve_->map_stamp);
-    }
   }
 
   void CompleteSolve() {
@@ -920,6 +1060,9 @@ class TerrainPlannerNode : public rclcpp::Node {
     pending_solve_.reset();
     const auto& state = pending.state;
     const auto& input = pending.input;
+    if (input.terrain && pending.generation == generation_) {
+      PublishCorrectedMap(*input.terrain, pending.map_stamp, result.terrain_snapshot.get());
+    }
     bool publishable = result.success;
     const char* reason = "solve_failed";
     if (publishable) {
@@ -1046,10 +1189,13 @@ class TerrainPlannerNode : public rclcpp::Node {
     b2_terrain_planner::msg::LocomotionPlan msg;
     msg.header.stamp = stamp;
     msg.header.frame_id = active_frame_;
+    // WBC가 활성 계획을 들고 있으면 거기에 체이닝한다. prefix 고정과는 무관하다.
+    const bool has_parent = state.gait_clock_valid &&
+        state.active_plan_stamp_ns >= state.gait_epoch_ns && state.active_plan_stamp_ns > 0;
     msg.parent_plan_stamp_ns = 0;
-    if (input.reference_prefix) msg.parent_plan_stamp_ns = state.active_plan_stamp_ns;
+    if (has_parent) msg.parent_plan_stamp_ns = state.active_plan_stamp_ns;
     msg.handover_gait_time = input.gait_time;
-    if (input.reference_prefix && !state.body_clock_valid) {
+    if (has_parent && !state.body_clock_valid) {
       msg.handover_gait_time += input.prefix_duration;
     }
     msg.body_clock_valid = state.body_clock_valid;
@@ -1189,6 +1335,10 @@ class TerrainPlannerNode : public rclcpp::Node {
   std::optional<double> command_ramp_time_;
   double command_linear_accel_ = 0.5;
   double command_angular_accel_ = 1.0;
+  bool station_keeping_enabled_ = false;
+  double station_keeping_gain_ = 0.5;
+  double station_keeping_max_velocity_ = 0.06;
+  std::optional<Eigen::Vector2d> hold_anchor_;
   std::deque<PublishedPlan> published_plans_;
   std::string command_topic_;
   double command_timeout_ = 0.25;
@@ -1216,12 +1366,18 @@ class TerrainPlannerNode : public rclcpp::Node {
   std::string state_topic_, state_frame_, map_topic_, elevation_layer_, plan_topic_, frame_;
   std::string active_frame_ = "odom";
   double swing_terrain_clearance_ = 0.03;
-  double swing_foot_radius_ = 0.0351, swing_foot_half_width_ = 0.0275;
+  double foot_radius_ = kDefaultFootRadius;
   double plan_rate_hz_ = 10.0, sample_dt_ = 0.02, swing_height_ = 0.10;
+  double handover_grace_ = -1.0;
   bool require_map_ = true;
   bool support_patch_enabled_ = false;
   double support_patch_half_width_ = 0.05;
+  double support_patch_max_age_sec_ = 2.0;
   SupportPatchMemory support_patch_memory_;
+  bool map_datum_reanchor_enabled_ = false;
+  double map_datum_max_rate_ = 0.01;
+  DatumOffsetState map_datum_;
+  std::int64_t map_datum_stamp_ns_ = 0;
   double state_max_age_ = 0.25, map_max_age_ = 1.0;
 
   rclcpp::Subscription<b2_terrain_planner::msg::LocomotionState>::SharedPtr state_sub_;

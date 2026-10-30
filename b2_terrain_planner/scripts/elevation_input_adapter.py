@@ -10,7 +10,7 @@ import rclpy
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.executors import ExternalShutdownException
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from rclpy.time import Time
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
@@ -68,12 +68,12 @@ class ElevationInputAdapter(Node):
             if not np.isfinite(self.cfg[key]) or self.cfg[key] <= 0:
                 raise ValueError(key + ' must be finite and positive')
         self.poses = deque(maxlen=2000)
-        self.clouds = deque(maxlen=8)
+        self.clouds = deque(maxlen=1)
         self.tf_buffer = Buffer(cache_time=Duration(seconds=10.0))
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.tf_pub = self.create_publisher(TFMessage, '/elevation/tf', 50)
-        self.points_pub = self.create_publisher(PointCloud2, '/elevation/points',
-                                                qos_profile_sensor_data)
+        cloud_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+        self.points_pub = self.create_publisher(PointCloud2, '/elevation/points', cloud_qos)
         self.status_pub = self.create_publisher(String, '/elevation/input_status', 10)
         self.clear_client = self.create_client(Trigger, '/elevation_mapping_node/clear_map')
         self.reset_pending = True
@@ -86,8 +86,7 @@ class ElevationInputAdapter(Node):
                                  qos_profile_sensor_data)
         self.create_subscription(LocomotionState, self.cfg['state_topic'], self.on_state,
                                  qos_profile_sensor_data)
-        self.create_subscription(PointCloud2, self.cfg['cloud_topic'], self.on_cloud,
-                                 qos_profile_sensor_data)
+        self.create_subscription(PointCloud2, self.cfg['cloud_topic'], self.on_cloud, cloud_qos)
         self.create_timer(0.02, self.process)
         self.create_timer(1.0, lambda: self.status_pub.publish(String(data=self.last_status)))
         self.status('waiting: pointcloud, odometry and sensor extrinsic TF')
@@ -120,6 +119,8 @@ class ElevationInputAdapter(Node):
                         > self.cfg['reset_distance'] or angle > self.cfg['reset_angle']):
                     self.reset('odometry discontinuity/frame change')
             self.poses.append(pose)
+            if self.clouds:
+                self.process()
         except ValueError as exc:
             self.status('invalid odometry: ' + str(exc))
 
@@ -154,6 +155,7 @@ class ElevationInputAdapter(Node):
             return
         self.last_cloud_stamp = stamp
         self.clouds.append((time.monotonic(), msg))
+        self.process()
 
     def lookup(self, parent, child, stamp, sensor=False):
         if parent == child:

@@ -1,9 +1,9 @@
 /**
  * @file planner_retry_test.cpp
  * @brief 지연·실패를 주입해 비동기 재계획과 성공해 보존 및 발행 차단을 검증한다.
- * @version 0.0.16
+ * @version 0.0.17
  * @update 2026-10-28: development 폴더 이동에 맞춰 플래너 노드 소스 포함 경로를 조정함.
- * @update 2026-10-25: 반복 착지 대기에도 사용자 목표에 도달하고 해제 시 유지된 램프를 쓰는지 검증함.
+ * @update 2026-10-28: 지지 확인 후에도 보행 정지 중이면 감속하고 재개 시 연속 가속하는지 검증함.
  */
 #define B2_TERRAIN_PLANNER_NO_MAIN
 #include "../../src/terrain_planner_node.cpp"
@@ -173,6 +173,25 @@ struct TerrainPlannerRetryTest {
     }
     Check(node.PlanningCommand().isApprox(node.command_),
           "repeated touchdown waits prevented full command speed");
+    // 접촉이 모두 확인돼도 몸통 계획 인계로 보행이 멈춰 있으면 감속한다.
+    state.gait_paused = true;
+    state.contact_confirmed.fill(true);
+    node.UpdateTouchdownStop(state);
+    state.body_time += .1;
+    node.UpdateCommandRamp(state);
+    Check(node.PlanningCommand().isApprox(Eigen::Vector3d(.45, 0, .4), 1e-10),
+          "paused gait did not ramp linear and yaw commands toward zero");
+    node.UpdateCommandRamp(state);
+    Check(node.PlanningCommand().isApprox(Eigen::Vector3d(.45, 0, .4), 1e-10),
+          "same-state retry advanced paused ramp");
+    state.body_time += 1.0;
+    node.UpdateCommandRamp(state);
+    Check(node.PlanningCommand().isZero(1e-10), "paused ramp overshot zero");
+    state.gait_paused = false;
+    state.body_time += .1;
+    node.UpdateCommandRamp(state);
+    Check(node.PlanningCommand().isApprox(Eigen::Vector3d(.05, 0, .1), 1e-10),
+          "gait resume jumped to the original command");
   }
 
   static void CheckTouchdownStop(TerrainPlannerNode& node) {

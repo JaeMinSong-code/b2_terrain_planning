@@ -1,9 +1,9 @@
 /**
  * @file support_combination_test.cpp
  * @brief 세 지지의 실제 발 조합·미분·몸통 계획과 trot 재개를 검증한다.
- * @version 0.0.2
- * @update 2026-10-25: 사후 IK 검사를 제거한 세 지지 계획과 기존 지지 안정성 제약을 검증함.
- * @update 2026-10-23: 세 지지 네 조합과 비지지발 독립성 및 연속 재계획을 검증함.
+ * @version 0.0.4
+ * @update 2026-10-29: nominal 전용 중립 다리 기준점과 높이로 B2 옆방향 링크를 반영함.
+ * @update 2026-10-29: midstance 식 (33)의 미분·좌표 불변성과 지지 중점 샘플링을 검증함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -25,8 +25,8 @@ void Check(bool value, const std::string& reason) {
 }
 
 struct Sample {
-  Eigen::VectorXd residual = Eigen::VectorXd::Zero(24);
-  Eigen::MatrixXd residual_jacobian = Eigen::MatrixXd::Zero(24, 31);
+  Eigen::VectorXd residual = Eigen::VectorXd::Zero(12);
+  Eigen::MatrixXd residual_jacobian = Eigen::MatrixXd::Zero(12, 31);
   Eigen::VectorXd constraint = Eigen::VectorXd::Zero(22);
   Eigen::MatrixXd constraint_jacobian = Eigen::MatrixXd::Zero(22, 31);
   Eigen::VectorXd lower = Eigen::VectorXd::Zero(22);
@@ -96,8 +96,7 @@ void CheckKernels() {
       shifted = z;
       shifted[18 + 3 * leg] += .04;
       const auto moved = EvaluateKernel(full[missing], shifted, parameters);
-      Check((baseline.residual - moved.residual).norm() > 1e-4 &&
-            (baseline.constraint - moved.constraint).norm() > 1e-4,
+      Check((baseline.constraint - moved.constraint).norm() > 1e-4,
             "actual supporting foot was ignored");
     }
     for (int axis = 0; axis < 31; ++axis) {
@@ -116,6 +115,63 @@ void CheckKernels() {
   }
 }
 
+// nominal의 수직 목표는 몸통과 함께 기울이지 않는다. 월드 평행이동에는 불변이다.
+void CheckNominalKinematics() {
+  Eigen::Matrix<double, 9, 1> state;
+  state << .1, -.2, .55, .15, -.06, .08, .4, .1, .02;
+  Eigen::Vector4d parameters(.3, .2, -.03, .52);
+  Eigen::Vector3d residual;
+  Eigen::Matrix<double, 3, 9> jacobian;
+  auto evaluate = [&](const Eigen::Matrix<double, 9, 1>& input) {
+    Eigen::Vector3d value;
+    const double* arguments[] = {input.data(), parameters.data()};
+    double* outputs[] = {value.data(), nullptr};
+    Check(tamols_nominal_kinematics(arguments, outputs, nullptr, nullptr, 0) == 0,
+          "nominal kernel failed");
+    return value;
+  };
+  const double* arguments[] = {state.data(), parameters.data()};
+  double* outputs[] = {residual.data(), jacobian.data()};
+  tamols_nominal_kinematics(arguments, outputs, nullptr, nullptr, 0);
+  for (int axis = 0; axis < 9; ++axis) {
+    auto plus = state;
+    auto minus = state;
+    plus[axis] += 1e-6;
+    minus[axis] -= 1e-6;
+    Check(((evaluate(plus) - evaluate(minus)) / 2e-6 - jacobian.col(axis)).norm() < 1e-7,
+          "nominal Jacobian disagrees with finite differences");
+  }
+  auto shifted = state;
+  shifted.head<3>() += Eigen::Vector3d(.7, -.4, .2);
+  shifted.tail<3>() += Eigen::Vector3d(.7, -.4, .2);
+  Check(evaluate(shifted).isApprox(residual, 1e-12), "nominal uses an absolute position anchor");
+  // hip offset이 0이면 몸통을 기울여도 l_des=[0,0,h]는 월드 수직으로 남는다.
+  parameters.head<3>().setZero();
+  state.tail<3>() = state.head<3>() - Eigen::Vector3d(0, 0, parameters[3]);
+  Check(evaluate(state).norm() < 1e-12, "nominal rotated the desired vertical leg vector");
+
+  const auto phases = MakeHorizon(0, .8, .6);
+  const auto fl = StanceMidpoints(phases, 0);
+  const auto fr = StanceMidpoints(phases, 1);
+  Check(fl.size() == 1 && std::abs(fl[0] - .24) < 1e-10,
+        "FL nominal must be sampled once at full midstance");
+  Check(fr.size() == 2 && std::abs(fr[0] - .04) < 1e-10 &&
+        std::abs(fr[1] - .6) < 1e-10, "clipped stance midpoints are incorrect");
+  auto split = phases;
+  auto tail = split.front();
+  tail.start += .03;
+  tail.duration -= .03;
+  split.front().duration = .03;
+  split.insert(split.begin() + 1, tail);
+  Check(StanceMidpoints(split, 0) == fl, "spline split duplicated nominal cost");
+  const std::array<bool, 4> contacts{false, true, true, true};
+  const auto hold = MakeHorizon(.4, .8, .6, .8, contacts);
+  Check(StanceMidpoints(hold, 0).empty(), "non-supporting leg received nominal cost");
+  const auto held = StanceMidpoints(hold, 1);
+  Check(held.size() == 1 && std::abs(held[0] - .4) < 1e-10,
+        "hold must receive one nominal sample per supporting leg");
+}
+
 void CheckPlanner() {
   auto model = std::make_shared<RobotModel>(B2_BUILD_MODEL_PATH);
   ModelState state;
@@ -127,6 +183,33 @@ void CheckPlanner() {
   Robot robot;
   Input nominal;
   model->PopulatePlanner(state, &robot, &nominal);
+  Check(robot.nominal_hips.has_value(), "B2 nominal leg origins missing");
+  for (int leg = 0; leg < 4; ++leg) {
+    const Eigen::Vector3d origin = robot.nominal_hips->row(leg).transpose();
+    const Eigen::Vector3d foot = nominal.feet.row(leg).transpose();
+    const Eigen::Vector3d target = nominal.position.head<3>() + origin -
+        Eigen::Vector3d(0, 0, robot.height + origin.z());
+    // The distal URDF links include lateral offsets below 0.1 mm.
+    Check(std::abs(target.y() - foot.y()) < 1e-4,
+          "nominal target pulls neutral B2 feet inward");
+    Check(std::abs(target.z() - foot.z()) < 1e-8,
+          "nominal leg height differs from neutral foot height");
+    Check(std::abs(std::abs(origin.y() - robot.hips(leg, 1)) - .11973) < 1e-8,
+          "nominal lateral offset missing or reach hip changed");
+    Eigen::Matrix<double, 9, 1> kernel_state;
+    kernel_state.head<6>() = nominal.position;
+    kernel_state.tail<3>() = target;
+    Eigen::Vector4d parameters;
+    parameters << origin, robot.height + origin.z();
+    Eigen::Vector3d residual;
+    const double* arguments[] = {kernel_state.data(), parameters.data()};
+    double* outputs[] = {residual.data(), nullptr};
+    tamols_nominal_kinematics(arguments, outputs, nullptr, nullptr, 0);
+    Check(residual.norm() < 1e-10, "neutral leg target has nominal residual");
+    kernel_state[7] = nominal.position[1] + robot.hips(leg, 1);
+    tamols_nominal_kinematics(arguments, outputs, nullptr, nullptr, 0);
+    Check(residual.norm() > .11, "inward foot target is not penalized");
+  }
   nominal.gait_time = .4;
   nominal.body_time = .8;
   nominal.gait_hold_duration = robot.period;
@@ -186,6 +269,7 @@ void CheckPlanner() {
 int main() {
   try {
     CheckKernels();
+    CheckNominalKinematics();
     CheckPlanner();
     std::cout << "PASS four tripod combinations, support sensitivity, Jacobians, B2 planning, trot order\n";
     return 0;

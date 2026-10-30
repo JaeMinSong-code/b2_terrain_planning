@@ -1,9 +1,9 @@
 /**
  * @file planner.h
  * @brief 평지·지형 trot의 SQP 입력·출력 및 시간 구간 계획 계약.
- * @version 0.0.29
- * @update 2026-10-25: 착지 대기 정지 제약 입력을 제거하고 기존 속도 목표 계약을 사용함.
- * @update 2026-10-25: 착지 대기의 정지 시한과 지지 다리 도달 여유 계약을 추가함.
+ * @version 0.0.32
+ * @update 2026-10-30: 공유 지형 처리와 제한된 단계별 초기화의 설정·진단을 추가함.
+ * @update 2026-10-29: nominal 전용 중립 다리 기준점과 높이로 B2 옆방향 링크를 반영함.
  */
 #ifndef B2_TERRAIN_PLANNER_PLANNER_H_
 #define B2_TERRAIN_PLANNER_PLANNER_H_
@@ -26,6 +26,8 @@ struct Robot {
   double mass = 74.0;
   Eigen::Matrix3d inertia = Eigen::Vector3d(1.5, 4.0, 4.0).asDiagonal();
   Feet hips;
+  // Reach uses hips; nominal uses a neutral leg origin including lateral links.
+  std::optional<Feet> nominal_hips;
   Feet nominal_offsets;
   Feet reference_legs = Feet::Zero();
   Eigen::Vector4d reach_min = Eigen::Vector4d::Zero();
@@ -98,9 +100,12 @@ struct Settings {
   int realtime_iterations = 0;  // 0: 기존 수렴. 양수: feasible 개선 후 다음 호출에서 계속.
   double orientation_limit = 0.35;  // pitch/roll 절댓값 상한 [rad], 0 < limit < pi/2.
   double pitch_weight = 30.0;  // 수평 pitch 선호 비용. 각도 제한과 별개다.
-  double leg_vertical_weight = 100.0;  // 기준 다리 벡터의 월드 Z 오차 추가 비용.
+  double nominal_kinematics_weight = 7.0;  // 지지 중간 시각의 식 (33) 비용.
   double vz_weight = 0.0;  // 월드 수직속도 제곱 비용(0=비활성). 지형-인지 기준 도입 전까지 꺼 둔다.
   double foothold_backward_weight = 1.4;  // nominal 뒤쪽 거리 제곱의 추가 비용, 0이면 비활성.
+  // 직전 해의 같은 착지 슬롯 foothold와의 거리 제곱 비용(TAMOLS 논문 V-B.6).
+  // 인접 solve 간 발 목표 점프를 눌러 commit 결정이 여러 solve의 합의가 되게 한다.
+  double previous_foothold_weight = 0.0;  // 0이면 비활성(기존 동작).
   double qp_regularization = 0.01;
   double qp_eps_abs = 1e-9;
   double qp_eps_rel = 1e-9;
@@ -108,6 +113,8 @@ struct Settings {
   int sample_intervals = 12;
   double feasibility_tolerance = 1e-5;
   double step_tolerance = 1e-5;
+  bool graduated_initialization = true;
+  double graduated_budget_fraction = 0.25;  // 준비 단계 상한; 나머지는 실제 지형 SQP에 남긴다.
   TerrainSettings terrain;
   double time_limit = 20.0;  // Offline baseline; not a real-time guarantee.
 };
@@ -244,6 +251,10 @@ struct Result {
   SeedContext seed_context;
   WarmStartDiagnostic warm_start;
   std::vector<TerrainAttempt> terrain_attempts;
+  std::shared_ptr<const TerrainModel> terrain_snapshot;  // 진단용 입력 처리 지도. 제어 채택 조건 아님.
+  double terrain_processing_seconds = 0.0;
+  double terrain_initialization_seconds = 0.0;
+  std::string terrain_initialization_status = "not_needed";
   bool success = false;
   int variable_count = 0;
   int margin_variable_count = 0;
@@ -274,6 +285,8 @@ struct Result {
 std::vector<Phase> MakeHorizon(double time, double period, double duty,
     double hold_duration = 0.0,
     const std::optional<std::array<bool, 4>>& hold_contacts = std::nullopt);
+// 예측 구간에 포함된 연속 지지 구간마다 중점을 하나 반환한다.
+std::vector<double> StanceMidpoints(const std::vector<Phase>& phases, int leg);
 Result Solve(const Robot& robot, const Input& input, const Settings& settings = {},
              const Result* previous = nullptr);
 // 이전 계획과 현재 입력의 모델·지형 스냅샷 호환성을 확인하는 식별값.

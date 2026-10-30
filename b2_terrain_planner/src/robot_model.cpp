@@ -1,9 +1,9 @@
 /**
  * @file robot_model.cpp
  * @brief RBDL의 이름 기반 관절 매핑·합성 관성·FK·제한 IK를 계산한다.
- * @version 0.0.4
+ * @version 0.0.5
+ * @update 2026-10-29: nominal 전용 중립 다리 기준점과 높이로 B2 옆방향 링크를 반영함.
  * @update 2026-10-21: 측정 관절값의 제한 경계 오버슈트는 허용하고 큰 이상값은 거부함.
- * @update 2026-10-14: URDF 무릎 제한으로 다리별 최소·최대 고관절 거리를 계산함.
  */
 #include "b2_terrain_planner/robot_model.h"
 
@@ -322,10 +322,16 @@ void RobotModel::PopulatePlanner(const ModelState& state, Robot* robot, Input* i
   robot->leg_min = impl_->reach_min.minCoeff();
   robot->leg_max = impl_->reach_max.maxCoeff();
   robot->height = snapshot.com.z() - snapshot.feet.col(2).mean();
+  robot->nominal_hips = Feet::Zero();
   for (int leg = 0; leg < 4; ++leg) {
     robot->hips.row(leg) = (rotation.transpose() * (snapshot.hips.row(leg).transpose() - snapshot.com)).transpose();
     robot->nominal_offsets.row(leg) = (rotation.transpose() * (snapshot.feet.row(leg).transpose() - snapshot.com)).transpose();
     robot->reference_legs.row(leg) = robot->hips.row(leg) - robot->nominal_offsets.row(leg);
+    // The neutral hip joint leaves the URDF lateral hip-to-thigh link unrotated.
+    // Keep the actual hip origin above for reach constraints.
+    const Eigen::Vector3d neutral_leg_origin =
+        (impl_->chains[leg].origins[0] * impl_->chains[leg].origins[1]).translation();
+    robot->nominal_hips->row(leg) = (neutral_leg_origin - snapshot.com_body).transpose();
   }
   robot->use_reference_legs = true;
   input->position.head<3>() = snapshot.com;

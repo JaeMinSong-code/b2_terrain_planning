@@ -1,9 +1,9 @@
 /**
  * @file solve_main.cpp
  * @brief ROS 없이 단일 설정의 예제 또는 개별 평지·지형 입력을 읽고 몸통 계획을 YAML로 출력한다.
- * @version 0.0.26
- * @update 2026-10-28: 통합 설정의 example 필드와 기존 개별 입력 YAML을 함께 지원함.
- * @update 2026-10-27: 셀 분산 상한 설정의 YAML 입력을 제거함.
+ * @version 0.0.29
+ * @update 2026-10-30: TAMOLS 지형 처리·초기화 설정과 단계별 계산 시간을 CLI에 연결함.
+ * @update 2026-10-29: 지도 지면과 발 중심의 높이 계약 및 반경 변환을 통일함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -135,15 +135,26 @@ void ReadInput(const std::string& path, b2_terrain_planner::Robot* robot,
   }
   if (node["terrain_settings"]) {
     const auto config = node["terrain_settings"];
-    for (const char* removed : {"foot_radius", "surface_tolerance",
+    for (const char* removed : {"surface_tolerance",
                                 "max_contact_slope", "min_foot_distance"}) {
       if (config[removed]) {
         throw std::invalid_argument(std::string("removed terrain setting; delete key: ") + removed);
       }
     }
+    if (config["pipeline_enabled"]) settings->terrain.pipeline_enabled = config["pipeline_enabled"].as<bool>();
+    if (config["median_iterations"]) settings->terrain.median_iterations = config["median_iterations"].as<int>();
+    if (config["graduated_initialization"]) settings->graduated_initialization = config["graduated_initialization"].as<bool>();
+    if (config["graduated_budget_fraction"]) settings->graduated_budget_fraction = config["graduated_budget_fraction"].as<double>();
     auto& t = settings->terrain;
     for (auto item : {
-             std::make_pair("smoothing_sigma", &t.smoothing_sigma),
+             std::make_pair("foot_radius", &t.foot_radius),
+             {"smoothing_sigma", &t.smoothing_sigma},
+             {"virtual_floor_sigma", &t.virtual_floor_sigma},
+             {"virtual_floor_radius", &t.virtual_floor_radius},
+             {"occlusion_weight", &t.occlusion_weight},
+             {"curvature_weight", &t.curvature_weight},
+             {"virtual_height_weight", &t.virtual_height_weight},
+             {"body_alignment_weight", &t.body_alignment_weight},
              {"contact_tolerance", &t.contact_tolerance},
              {"ground_weight", &t.ground_weight}, {"edge_weight", &t.edge_weight},
              {"collision_weight", &t.collision_weight},
@@ -252,6 +263,9 @@ void Print(const b2_terrain_planner::Result& result, bool show_profile,
          << YAML::Key << "status" << YAML::Value << result.status
          << YAML::Key << "iterations" << YAML::Value << result.iterations
          << YAML::Key << "elapsed" << YAML::Value << result.elapsed
+         << YAML::Key << "terrain_processing_seconds" << YAML::Value << result.terrain_processing_seconds
+         << YAML::Key << "terrain_initialization_seconds" << YAML::Value << result.terrain_initialization_seconds
+         << YAML::Key << "terrain_initialization_status" << YAML::Value << result.terrain_initialization_status
          << YAML::Key << "cost" << YAML::Value << result.cost
          << YAML::Key << "violation" << YAML::Value << result.violation;
   const auto& seed = result.seed_context;
@@ -341,7 +355,7 @@ void Print(const b2_terrain_planner::Result& result, bool show_profile,
            << YAML::Key << "orientation_limit_radians" << YAML::Value << settings.orientation_limit
            << YAML::Key << "pitch_weight" << YAML::Value << settings.pitch_weight
            << YAML::Key << "foothold_backward_weight" << YAML::Value << settings.foothold_backward_weight
-           << YAML::Key << "leg_vertical_weight" << YAML::Value << settings.leg_vertical_weight;
+           << YAML::Key << "nominal_kinematics_weight" << YAML::Value << settings.nominal_kinematics_weight;
     for (const auto& item : {
              std::make_pair("full_evaluation_seconds", p.full_evaluation_seconds),
              {"values_evaluation_seconds", p.values_evaluation_seconds},
@@ -485,7 +499,7 @@ int main(int argc, char** argv) {
                      "[--time-limit S] [--iterations N] [--fixed-feet] "
                      "[--profile] [--full-evaluation] "
                      "[--warm-start PLAN.yaml] "
-                     "[--orientation-limit-deg VALUE] [--pitch-weight VALUE] [--foothold-backward-weight VALUE] [--leg-vertical-weight VALUE] [--vz-weight VALUE] [--fast-replanning] [--qp-reuse cold|reuse|warm] [--qp-regularization VALUE] [--svd jacobi|lapack] [--qp-working-set] [--structured-equalities] [--block-assembly] [--polynomial-tail|--hermite-tail] [--projection-l2] [--chord-projection] [--realtime-iterations N] [--sample-intervals N] [--equality-rank-tolerance TOL] [--projection-rank-tolerance TOL] [--projection-residual-tolerance TOL] "
+                     "[--orientation-limit-deg VALUE] [--pitch-weight VALUE] [--foothold-backward-weight VALUE] [--nominal-kinematics-weight VALUE] [--vz-weight VALUE] [--fast-replanning] [--qp-reuse cold|reuse|warm] [--qp-regularization VALUE] [--svd jacobi|lapack] [--qp-working-set] [--structured-equalities] [--block-assembly] [--polynomial-tail|--hermite-tail] [--projection-l2] [--chord-projection] [--realtime-iterations N] [--sample-intervals N] [--equality-rank-tolerance TOL] [--projection-rank-tolerance TOL] [--projection-residual-tolerance TOL] "
                      "[--qp-eps-abs VALUE] [--qp-eps-rel VALUE] [--qp-max-iterations N]\n"
                      "B2 평지·지형 스냅샷의 독립 계획 계산. ROS 명령이나 모터 출력을 발행하지 않습니다.\n";
         return 0;
@@ -568,7 +582,7 @@ int main(int argc, char** argv) {
       }
       else if (option == "--pitch-weight") settings.pitch_weight = ReadDoubleOption(value);
       else if (option == "--foothold-backward-weight") settings.foothold_backward_weight = ReadDoubleOption(value);
-      else if (option == "--leg-vertical-weight") settings.leg_vertical_weight = ReadDoubleOption(value);
+      else if (option == "--nominal-kinematics-weight") settings.nominal_kinematics_weight = ReadDoubleOption(value);
       else if (option == "--vz-weight") settings.vz_weight = ReadDoubleOption(value);
       else if (option == "--qp-regularization") settings.qp_regularization = ReadDoubleOption(value);
       else if (option == "--qp-eps-abs") settings.qp_eps_abs = ReadDoubleOption(value);

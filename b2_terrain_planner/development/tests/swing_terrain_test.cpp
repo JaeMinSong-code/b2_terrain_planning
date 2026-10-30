@@ -1,9 +1,9 @@
 /**
  * @file swing_terrain_test.cpp
  * @brief 스윙·지지발의 높이 불일치 허용과 다음 착지점의 지형 검사를 검증한다.
- * @version 0.0.5
- * @update 2026-10-27: 현재 지지·스윙 발 아래 미관측 셀이 있어도 SQP 진입을 검증함.
- * @update 2026-10-25: 사후 지도 검사 없이 기존 지형 비용과 착지점 계산이 유지되는지 검증함.
+ * @version 0.0.7
+ * @update 2026-10-30: 보간 높이 조회와 원본 관측 마스크를 구분해 스윙·접촉 계약을 검증함.
+ * @update 2026-10-29: 지면·발 중심 변환과 반경 누락·중복 방지 회귀를 검증함.
  */
 #include "b2_terrain_planner/planner.h"
 
@@ -27,7 +27,7 @@ Input FlatInput(const Robot& robot, double gait_time) {
   input.gait_time = gait_time;
   HeightMap map;
   map.origin = Eigen::Vector2d::Constant(-1.975);
-  map.heights = Eigen::MatrixXd::Zero(80, 80);
+  map.heights = Eigen::MatrixXd::Constant(80, 80, -0.032);  // 발 중심 z=0의 지면.
   map.valid = Eigen::ArrayXXi::Ones(80, 80);
   map.variance = Eigen::MatrixXd::Zero(80, 80);
   input.terrain = map;
@@ -68,7 +68,7 @@ void Run(double gait_time) {
   }
   const TerrainModel terrain(map, settings.terrain);
   for (int leg = 0; leg < 4; ++leg) {
-    Check(!terrain.IsQueryable(input.feet.row(leg).head<2>().transpose()),
+    Check(terrain.Sample(input.feet.row(leg).head<2>().transpose()).occlusion > 1 - 1e-10,
           "current foot test location is still observed");
   }
   const auto replanned = Solve(robot, unobserved, settings);

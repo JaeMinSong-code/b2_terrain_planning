@@ -69,6 +69,11 @@ def load_configs(path):
         outputs[f'terrain_planner_{mode}.yaml'] = {
             'terrain_planner_node': {
                 'ros__parameters': merge_parameters(common, overrides)}}
+    # 같은 YAML을 두 노드에 전달해 반경 설정의 소유권을 planner.common에 둔다.
+    flat_parameters = outputs['terrain_planner_flat.yaml'][
+        'terrain_planner_node']['ros__parameters']
+    outputs['terrain_planner_flat.yaml']['flat_elevation_map'] = {
+        'ros__parameters': {'foot_radius': flat_parameters['foot_radius']}}
     outputs['planner_b2_example.yaml'] = _mapping(
         document['example'], 'example')
     return outputs

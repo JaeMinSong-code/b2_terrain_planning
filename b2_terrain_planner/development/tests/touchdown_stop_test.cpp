@@ -1,9 +1,9 @@
 /**
  * @file touchdown_stop_test.cpp
  * @brief B2 모델의 착지 대기 목표 속도 감속과 기존 궤적 재사용·연결을 검증한다.
- * @version 0.0.2
+ * @version 0.0.3
+ * @update 2026-10-29: midstance nominal 비용 설정으로 착지 대기 감속 회귀를 실행함.
  * @update 2026-10-25: 추가 정지 제약 없이 목표 속도 0으로 감속하는 기존 SQP 경로를 검증함.
- * @update 2026-10-25: 이동 상태의 정지·도달 여유·고정 앞부분 인계 회귀를 추가함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -56,7 +56,7 @@ void Run() {
   settings.qp_max_iterations = 4000;
   settings.orientation_limit = pi / 3;
   settings.pitch_weight = 10;
-  settings.leg_vertical_weight = 30;
+  settings.nominal_kinematics_weight = 7;
   settings.vz_weight = 10;
   const auto moving = Solve(robot, input, settings);
   Check(moving.success, "moving reference failed: " + moving.status);

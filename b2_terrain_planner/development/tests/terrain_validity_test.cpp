@@ -1,10 +1,9 @@
 /**
  * @file terrain_validity_test.cpp
  * @brief 착지 높이 조회 유효성과 경계 비용 유효성의 분리를 검증한다.
- * @version 0.0.2
- * @update 2026-10-27: 분산값이 높이 조회·경계 비용·착지 후보를 차단하지 않음을 검증함.
- * @update 2026-10-26: 관측 착지 셀이 주변 미관측에도 조회 가능하고, 경계 비용은
- *                     필터 지원 영역이 known일 때만 적용됨을 검증함.
+ * @version 0.0.4
+ * @update 2026-10-30: 미관측 주변의 경계 비용 유지와 원본 마스크 보존을 검증함.
+ * @update 2026-10-29: 지면·발 중심 변환과 반경 누락·중복 방지 회귀를 검증함.
  */
 #include "b2_terrain_planner/terrain.h"
 
@@ -40,7 +39,7 @@ Eigen::Vector2d CellCenter(const HeightMap& map, int row, int col) {
 }
 
 void Run() {
-  TerrainSettings settings;  // 기본값: smoothing_sigma 0.05, resolution 0.05 → halo 4.
+  TerrainSettings settings;
 
   const TerrainModel full(StepMap(), settings);
   const Eigen::Vector2d probe = CellCenter(StepMap(), 10, 11);
@@ -65,7 +64,7 @@ void Run() {
     const Eigen::Vector2d nominal = CellCenter(uncertain, 10, 16);
     const auto found = terrain.FindFoothold(
         nominal, nominal.array() - 0.10, nominal.array() + 0.10);
-    Check(std::abs(found.z() - 0.1) < 1e-6,
+    Check(std::abs(found.z() - 0.132) < 1e-6,
           "variance blocked an observed foothold candidate");
   }
 
@@ -79,26 +78,24 @@ void Run() {
   const auto partial_sample = partial.Sample(probe);
   Check(std::abs(partial_sample.height - full_sample.height) < 1e-12,
         "landing height changed when a neighbor went unobserved");
-  Check(partial_sample.edge.squaredNorm() < 1e-12,
-        "boundary cost not dropped where the filter support is unobserved");
+  Check(partial_sample.edge.squaredNorm() > 1e-6,
+        "observed boundary cost disappeared beside an occlusion");
 
-  // 착지 2x2 블록이 미관측 셀을 포함하면 높이 조회는 여전히 거부한다.
+  // 처리 높이를 조회해도 원본 미관측 마스크와 후보 벌점은 남는다.
   const Eigen::Vector2d on_hole = CellCenter(holed, 14, 7);
-  Check(!partial.IsQueryable(on_hole),
-        "unobserved landing block must stay unqueryable");
-  bool threw = false;
-  try {
-    partial.Sample(on_hole);
-  } catch (const TerrainDomainError&) {
-    threw = true;
-  }
-  Check(threw, "sampling an unobserved landing block did not throw");
+  Check(partial.IsQueryable(on_hole), "inpainted height unavailable");
+  Check(partial.map().valid(14, 7) == 0 && partial.Sample(on_hole).occlusion > 0,
+        "inpainted cells were relabeled as observed");
+  TerrainSettings legacy = settings;
+  legacy.pipeline_enabled = false;
+  const TerrainModel original(holed, legacy);
+  Check(!original.IsQueryable(on_hole), "legacy unknown-height behavior changed");
 
-  // 관측 지형 높이(단차)는 보존된다: 후보 검색이 우반부 단에서 0.1을 되돌린다.
+  // 지면 단차 0.1m는 보존되고 발 중심 후보는 반경을 더한 0.132m다.
   const Eigen::Vector2d nominal = CellCenter(holed, 10, 16);
   const Eigen::Vector3d found = partial.FindFoothold(
       nominal, nominal.array() - 0.10, nominal.array() + 0.10);
-  Check(std::abs(found.z() - 0.1) < 1e-6, "observed step height was erased");
+  Check(std::abs(found.z() - 0.132) < 1e-6, "observed step height was erased");
 }
 }  // namespace
 

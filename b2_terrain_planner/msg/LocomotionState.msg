@@ -12,6 +12,7 @@ geometry_msgs/Point com_position
 geometry_msgs/Vector3 com_velocity
 geometry_msgs/Quaternion base_orientation
 geometry_msgs/Vector3 base_angular_velocity
+# foot 링크 원점 = 구형 발 중심. 지면/접촉점이 아니며 반경을 빼지 않는다.
 geometry_msgs/Point[4] foot_position
 geometry_msgs/Vector3[4] foot_velocity
 bool[4] contact_estimated

@@ -1,9 +1,9 @@
 /**
  * @file support_patch.cpp
  * @brief 좁은 접촉 영역의 높이를 로컬 지도에 기억하고 입력 복사본에 적용한다.
- * @version 0.0.2
+ * @version 0.0.3
+ * @update 2026-10-29: 지도 지면과 발 중심의 높이 계약 및 반경 변환을 통일함.
  * @update 2026-10-27: 패치 폭을 그대로 사용하고 접촉 셀 기억·이동·재착지를 반영함.
- * @update 2026-10-17: 겹친 영역은 가장 가까운 접촉 발을 사용하고 외부 셀은 유지함.
  */
 #include "b2_terrain_planner/support_patch.h"
 
@@ -24,7 +24,8 @@ double SupportPatchHalfWidth(double requested, double resolution, double sigma) 
 
 int ApplySupportPatches(HeightMap* map,
                         const std::array<Eigen::Vector3d, 4>& feet,
-                        const std::array<bool, 4>& contacts, double half_width) {
+                        const std::array<bool, 4>& contacts, double half_width,
+                        Eigen::MatrixXd* stamps, double stamp_sec, double foot_radius) {
   if (map == nullptr || !std::isfinite(half_width) || half_width <= 0 ||
       !std::isfinite(map->resolution) || map->resolution <= 0 ||
       !map->origin.allFinite() || map->heights.rows() != map->valid.rows() ||
@@ -69,9 +70,10 @@ int ApplySupportPatches(HeightMap* map,
           }
         }
         if (nearest != leg) continue;
-        map->heights(row, col) = feet[leg].z();
+        map->heights(row, col) = FootCenterToGroundZ(feet[leg].z(), foot_radius);
         map->valid(row, col) = 1;
         map->variance(row, col) = 0.0;
+        if (stamps != nullptr) (*stamps)(row, col) = stamp_sec;
         ++patched;
       }
     }
@@ -94,6 +96,8 @@ void SupportPatchMemory::SyncLayout(const HeightMap& layout) {
   next.heights = Eigen::MatrixXd::Zero(layout.heights.rows(), layout.heights.cols());
   next.variance = next.heights;
   next.valid = Eigen::ArrayXXi::Zero(layout.heights.rows(), layout.heights.cols());
+  Eigen::MatrixXd next_stamps =
+      Eigen::MatrixXd::Zero(layout.heights.rows(), layout.heights.cols());
   if (memory_ && memory_->frame == layout.frame && memory_->resolution == layout.resolution) {
     for (int row = 0; row < memory_->heights.rows(); ++row) {
       for (int col = 0; col < memory_->heights.cols(); ++col) {
@@ -107,23 +111,31 @@ void SupportPatchMemory::SyncLayout(const HeightMap& layout) {
         const int next_row = static_cast<int>(std::lround(index.y()));
         next.heights(next_row, next_col) = memory_->heights(row, col);
         next.valid(next_row, next_col) = 1;
+        next_stamps(next_row, next_col) = stamps_(row, col);
       }
     }
   }
   memory_ = std::move(next);
+  stamps_ = std::move(next_stamps);
 }
 
 void SupportPatchMemory::Observe(const std::array<Eigen::Vector3d, 4>& feet,
-                                 const std::array<bool, 4>& contacts, double half_width) {
-  if (memory_) ApplySupportPatches(&*memory_, feet, contacts, half_width);
+                                 const std::array<bool, 4>& contacts, double half_width,
+                                 double stamp_sec, double foot_radius) {
+  if (memory_) {
+    ApplySupportPatches(&*memory_, feet, contacts, half_width, &stamps_, stamp_sec,
+                        foot_radius);
+  }
 }
 
-int SupportPatchMemory::ApplyTo(HeightMap* map) const {
+int SupportPatchMemory::ApplyTo(HeightMap* map, double now_sec, double max_age_sec) const {
   if (!memory_) return 0;
   int count = 0;
   for (int row = 0; row < map->heights.rows(); ++row) {
     for (int col = 0; col < map->heights.cols(); ++col) {
       if (!memory_->valid(row, col)) continue;
+      // 옛 datum으로 기록된 화석 패치는 적용하지 않는다(수명 초과).
+      if (now_sec - stamps_(row, col) > max_age_sec) continue;
       map->heights(row, col) = memory_->heights(row, col);
       map->variance(row, col) = 0.0;
       map->valid(row, col) = 1;

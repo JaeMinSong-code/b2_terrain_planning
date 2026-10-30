@@ -1,9 +1,9 @@
 /**
  * @file terrain.h
  * @brief 정적 높이맵의 보간·유효성·착지 비용과 후보 검색 계약.
- * @version 0.0.8
- * @update 2026-10-27: 분산 상한 설정을 제거하고 분산을 지도 메타데이터로 유지함.
- * @update 2026-10-26: 착지 높이 조회 유효성과 평활·경계 비용 유효성을 분리함.
+ * @version 0.0.10
+ * @update 2026-10-30: 원본 관측 마스크와 TAMOLS 처리·평활·가상 바닥 및 후보 비용 계약을 추가함.
+ * @update 2026-10-29: 지도 지면과 발 중심의 높이 계약 및 반경 변환을 통일함.
  */
 #ifndef B2_TERRAIN_PLANNER_TERRAIN_H_
 #define B2_TERRAIN_PLANNER_TERRAIN_H_
@@ -15,7 +15,20 @@
 
 namespace b2_terrain_planner {
 
-// 행은 +Y, 열은 +X. origin은 (0, 0) 셀 중심이며 높이는 frame 기준 절대 Z다.
+// 발 상태·계획은 foot 링크 원점(구 중심), 지도는 실제 지면의 절대 Z를 사용한다.
+inline constexpr double kDefaultFootRadius = 0.032;
+
+// 높이맵의 수직 반경 근사다. 경사면 법선 방향의 정확한 구 접촉점은 아니다.
+inline double GroundToFootCenterZ(double ground_z, double foot_radius) {
+  return ground_z + foot_radius;
+}
+
+inline double FootCenterToGroundZ(double foot_center_z, double foot_radius) {
+  return foot_center_z - foot_radius;
+}
+
+// 행은 +Y, 열은 +X. origin은 (0, 0) 셀 중심이며 높이는 frame 기준 지면 Z다.
+// 발 반경을 더한 지도나 foot 링크 높이를 이 자료형에 넣지 않는다.
 struct HeightMap {
   Eigen::MatrixXd heights;
   Eigen::ArrayXXi valid;
@@ -25,7 +38,18 @@ struct HeightMap {
   std::string frame = "odom";
 };
 
+enum class TerrainLayer { kGround, kVirtualFloor };
+
 struct TerrainSettings {
+  bool pipeline_enabled = true;
+  int median_iterations = 1;
+  double virtual_floor_sigma = 0.20;
+  double virtual_floor_radius = 0.15;
+  double occlusion_weight = 10.0;
+  double curvature_weight = 0.001;
+  double virtual_height_weight = 100.0;
+  double body_alignment_weight = 100.0;
+  double foot_radius = kDefaultFootRadius;  // 지면↔발 중심의 수직 오프셋, m.
   double smoothing_sigma = 0.05;  // m, Gaussian 표준편차.
   double contact_tolerance = 0.005;  // m.
   double ground_weight = 1e4;
@@ -42,6 +66,9 @@ class TerrainDomainError : public std::runtime_error {
 struct TerrainSample {
   double height = 0.0;
   Eigen::Vector2d gradient = Eigen::Vector2d::Zero();
+  double occlusion = 0.0;
+  double curvature_cost = 0.0;
+  double virtual_height = 0.0;
   Eigen::Vector4d edge = Eigen::Vector4d::Zero();
   Eigen::Matrix<double, 4, 2> edge_jacobian =
       Eigen::Matrix<double, 4, 2>::Zero();
@@ -60,28 +87,44 @@ struct CollisionResidual {
 class TerrainModel {
  public:
   TerrainModel(const HeightMap& map, const TerrainSettings& settings);
-  TerrainSample Sample(const Eigen::Vector2d& xy) const;
-  TerrainResidual Residual(const Eigen::Vector3d& foot) const;
+  TerrainSample Sample(const Eigen::Vector2d& xy,
+                       TerrainLayer layer = TerrainLayer::kGround) const;
+  // Sample은 지면, LandingHeight와 FindFoothold는 발 중심을 반환한다.
+  double LandingHeight(const Eigen::Vector2d& xy,
+                       TerrainLayer layer = TerrainLayer::kGround) const;
+  TerrainResidual Residual(const Eigen::Vector3d& foot,
+                           TerrainLayer layer = TerrainLayer::kGround) const;
   CollisionResidual Separation(const Eigen::Vector2d& delta) const;
   bool IsQueryable(const Eigen::Vector2d& xy) const;
   // direction은 월드 XY 단위 진행 방향, 정지 시 Zero이다.
   double FootholdCost(const Eigen::Vector2d& xy, const Eigen::Vector2d& nominal,
-                      const Eigen::Vector2d& direction, double backward_weight) const;
+                      const Eigen::Vector2d& direction, double backward_weight,
+                      TerrainLayer layer = TerrainLayer::kGround) const;
   Eigen::Vector3d FindFoothold(const Eigen::Vector2d& nominal,
                              const Eigen::Vector2d& lower,
                              const Eigen::Vector2d& upper,
                              const Eigen::Vector2d& direction = Eigen::Vector2d::Zero(),
                              double backward_weight = 0.0,
-                             const std::function<bool(const Eigen::Vector3d&)>& admissible = {}) const;
+                             const std::function<bool(const Eigen::Vector3d&)>& admissible = {},
+                             TerrainLayer layer = TerrainLayer::kGround) const;
   const HeightMap& map() const { return map_; }
+  const HeightMap& processed_map() const { return processed_; }
+  const Eigen::MatrixXd& smooth_heights() const { return smooth_; }
+  const HeightMap& virtual_map() const { return virtual_; }
   const TerrainSettings& settings() const { return settings_; }
 
  private:
   HeightMap map_;
   TerrainSettings settings_;
+  HeightMap processed_;
+  HeightMap virtual_;
+  Eigen::MatrixXd smooth_;
+  Eigen::MatrixXd occlusion_;
+  Eigen::MatrixXd curvature_cost_;
+  Eigen::MatrixXd virtual_gradients_[2];
   Eigen::MatrixXd gradients_[4];  // 원본·평활 높이의 X/Y 기울기.
-  // 착지 높이 조회 유효성(관측 높이 셀)과 평활·경계 비용 유효성(필터 지원 영역)을
-  // 분리한다. 주변 일부가 미관측이어도 관측된 착지 셀의 높이는 조회할 수 있다.
+  // 원본 관측 마스크는 map_에 보존한다. 처리 지도 높이와 비용의 계산 가능 영역.
+  // pipeline OFF는 기존 관측 전용 조회 계약을 유지한다.
   Eigen::ArrayXXi height_known_;
   Eigen::ArrayXXi usable_;
 };

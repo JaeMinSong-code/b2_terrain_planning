@@ -59,6 +59,12 @@ mapping:
   # 모서리 보존용 max fusion은 현재 끈다.
   enable_max_fusion: false
   max_fusion_edge_thresh: 0.03
+  # KF odom z drift(접촉발 재앵커 누적, 제자리걸음 ~3mm/s)로 갱신 시점이 다른
+  # 셀들이 높이 패치워크(실측 ~3cm)가 되지 않게, 스캔-지도 자기 정합(drift
+  # compensation)을 빠르고(alpha 0.1→0.5) 자주(움직임 게이트 1cm→5mm) 돌린다.
+  # 안전장치 유지: max_drift 0.1 초과 보정 차단, 저분산·traversable 셀만 비교.
+  drift_compensation_alpha: 0.5
+  position_noise_thresh: 0.005
   # 정책 입력 크롭(H_filled/M)을 50 Hz로 발행한다. inpaint/smooth 플러그인은
   # 아래 publisher에서 요청하지 않으므로 계산·발행하지 않는다.
   enable_policy_crop: true
@@ -73,12 +79,14 @@ mapping:
       topic_name: '/lidar/points'
       data_type: pointcloud
 
-  # 출력: RViz(grid_map) 확인용 raw 맵에 높이·유효성·분산을 포함한다.
+  # 출력: planner 입력 겸 RViz 확인용 raw 맵(높이·유효성·분산).
+  # 새 점군을 융합한 직후 발행한다. 처리 가능한 입력 속도를 따르고
+  # 별도 고정 발행 주기나 동일 지도의 반복 직렬화로 대기하지 않는다.
   publishers:
     elevation_map_raw:
       layers: ['elevation', 'is_valid', 'variance']
       basic_layers: ['elevation']
-      fps: 5.0
+      publish_on_update: true
 
 # 공통값에 각 모드의 차이만 덧씌운다. 평지 설정에 WBC 전용값을 섞지 않는다.
 planner:
@@ -93,21 +101,58 @@ planner:
     command_timeout: 0.25
     plan_rate_hz: 10.0
     time_limit: 0.1
+    # 핸드오버 마감·착지 대기 재개 유예. 실측 계획 전달 시간(p99 ~55ms, 최대 ~75ms,
+    # 2026-10-28 23:39 로그)보다 크게. 기존 공식(time_limit+2·sample_dt=0.14)은 과잉으로
+    # 착지마다 ~120ms 불필요 대기(gait_paused 27%)를 만들었다. 0 이하 = 기존 공식.
+    handover_grace: 0.08
+    # TAMOLS IV/V: 처리 지도와 후보 보정. 원본 지도·관측 마스크는 보존한다.
+    terrain.pipeline_enabled: true
+    terrain.median_iterations: 1
+    terrain.smoothing_sigma: 0.05
+    terrain.virtual_floor_sigma: 0.20
+    terrain.virtual_floor_radius: 0.15
+    # 논문에 수치가 없는 후보 보정 가중치는 B2의 시작 튜닝값이다.
+    terrain.occlusion_weight: 10.0
+    terrain.curvature_weight: 0.001
+    terrain.virtual_height_weight: 100.0
+    terrain.body_alignment_weight: 100.0
+    terrain.graduated_initialization: true
+    # 새 착지 슬롯의 준비 단계는 전체 예산의 25% 이내. 실패하면 직접 초기화한다.
+    terrain.graduated_budget_fraction: 0.25
+    # 직전 해의 같은 착지 슬롯 foothold에 대한 거리 제곱 비용(논문 V-B.6).
+    # 이전 해의 같은 착지 슬롯에만 적용하며 midstance nominal 비용과 별도다.
+    previous_foothold_weight: 0.35
+    # 논문 식 (33): 지지 중간 시각의 월드 엉덩이–발 벡터 비용.
+    nominal_kinematics_weight: 7.0
+    # 명령 0 유지 중 CoM 앵커 위치 유지: 이탈 × gain을 ±max_velocity로 잘라
+    # 속도 명령에 더한다. 최적화에 위치 추종 항이 없어 생기는 random walk 억제.
+    station_keeping.enabled: false
+    station_keeping.gain: 0.5
+    station_keeping.max_velocity: 0.06
     sample_dt: 0.02
     swing_height: 0.1
+    # MuJoCo와 두 URDF의 foot 링크 원점 중심 구형 충돌체와 같은 반경.
+    # 모든 지도는 지면 Z, 발 상태·착지·스윙은 중심 Z. 패치/flat은 반경을 빼고
+    # 착지 후보·비용·재사용은 반경을 더한다. flat 노드에도 이 값을 생성해 전달한다.
+    foot_radius: 0.032
     state_max_age: 0.25
     map_max_age: 1.0
     require_map: true
     publish_markers: true
   # 원본 지도 입력에 10×10 cm 접촉 기억 패치를 적용한다.
-  # 전역 z 재정착은 끈다. CuPy 시작 초기화는 mapping에서 별도로 설정한다.
+  # 전역 z 재정착: 확인 지지발 FK 높이와 지도 높이의 median 차를 변화율 제한으로
+  # 추적해 solve 입력 지도 전체를 이동한다. mapping drift compensation이 셀 간
+  # 일관성을 지키고, 여기 남는 지도↔발 공통 오프셋을 발 실측으로 제거한다.
   wbc:
     map_topic: /elevation_mapping_node/elevation_map_raw
     support_patch.enabled: true
     support_patch.half_width: 0.05
-    map_datum_reanchor.enabled: false
+    # 패치 수명. KF odom z drift(~3mm/s) 때문에 오래된 패치는 옛 datum 화석이
+    # 되어 가짜 둔덕(실측 4cm 섬 → 이상 착지 씨앗)을 만든다. 2초면 drift 영향
+    # ≤6mm이고 제자리 트롯은 ~1.1초마다 같은 자리를 재관측해 패치가 갱신된다.
+    support_patch.max_age_sec: 2.0
+    map_datum_reanchor.enabled: true
     map_datum_reanchor.max_rate_mps: 0.01
-    map_datum_reanchor.contact_offset: 0.032
   # 평지 입력: 접촉 기억 패치를 끄고 수직속도 비용으로 z 진동을 감쇠한다.
   # 경사 지형에 사용하기 전 vz_weight를 재검토한다.
   flat:

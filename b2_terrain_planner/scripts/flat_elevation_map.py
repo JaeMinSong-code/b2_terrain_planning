@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """입력 GridMap의 구조를 보존하고 높이·분산·유효성만 평탄화한다.
 
-최근 센서 관측의 평면 높이를 따라 odometry 드리프트를 반영한다.
-발 링크 원점과 센서 지면의 고정 오프셋만 최초 안정 접촉으로 맞춘다.
+평면 높이는 확인 지지발 중심 z에서 구 반경을 뺀 지면 높이를 추적한다.
+지지발은 유효 관측 나이가 0인 유일한 지면 측정이므로, odometry z 드리프트가
+지도 융합 지연으로 남기는 지도-발 괴리를 매 주기 재정착으로 제거한다.
+확인 지지발이 2개 미만인 구간은 직전 높이를 유지한다.
 """
 import math
 import copy
@@ -15,22 +17,51 @@ from rclpy.qos import qos_profile_sensor_data
 from b2_terrain_planner.msg import LocomotionState
 from rclpy.executors import ExternalShutdownException
 from grid_map_msgs.msg import GridMap
-from geometry_msgs.msg import PointStamped
 
 
-class PlaneHeightTracker:
-    """초기 링크 높이 보정은 유지하고 매 지도에서 관측 높이 변화만 반영한다."""
-    def __init__(self):
-        self.offset = None
+class SupportPlaneTracker:
+    """확인 지지발에서 변환한 지면 높이 중앙값으로 평면을 추적한다.
 
-    def update(self, observed_height, initial_support_height):
-        if not math.isfinite(observed_height):
-            raise ValueError('non-finite observed plane height')
-        if self.offset is None:
-            if initial_support_height is None or not math.isfinite(initial_support_height):
-                raise ValueError('waiting for stable initial support height')
-            self.offset = initial_support_height - observed_height
-        return observed_height + self.offset
+    초기 높이는 안정 기립 보정이 설정하고, 이후에는 변화율 제한으로만 이동해
+    접촉 추정 오염 한 번에 지도가 점프하지 않게 한다. odometry z 드리프트
+    (관측상 ~1.4mm/s)는 제한 안에서 그대로 따라간다.
+    """
+
+    def __init__(self, max_rate_mps=0.01, max_step_sec=0.1):
+        self.height = None
+        self.last_stamp_ns = None
+        self.max_rate = max_rate_mps
+        self.max_step_sec = max_step_sec
+
+    def initialize(self, stamp_ns, height):
+        if not math.isfinite(height):
+            raise ValueError('non-finite initial support height')
+        self.height = height
+        self.last_stamp_ns = stamp_ns
+
+    def update(self, stamp_ns, support_heights):
+        """발 반경을 이미 뺀 지면 z 목록으로 높이를 갱신한다. 초기화 전이나 빈 목록은 유지."""
+        if self.height is None:
+            return None
+        if self.last_stamp_ns is not None and stamp_ns <= self.last_stamp_ns:
+            return self.height
+        heights = sorted(z for z in support_heights if math.isfinite(z))
+        if len(heights) < 2:
+            # 지지 2개 미만(스윙 전환·접촉 깜빡임)은 직전 평면을 유지한다.
+            self.last_stamp_ns = stamp_ns
+            return self.height
+        middle = len(heights) // 2
+        if len(heights) % 2:
+            median = heights[middle]
+        else:
+            median = 0.5 * (heights[middle - 1] + heights[middle])
+        dt = self.max_step_sec
+        if self.last_stamp_ns is not None:
+            dt = min(dt, (stamp_ns - self.last_stamp_ns) * 1e-9)
+        limit = self.max_rate * max(0.0, dt)
+        self.height += min(limit, max(-limit, median - self.height))
+        self.last_stamp_ns = stamp_ns
+        return self.height
 
 
 def flatten_map(message, height):
@@ -56,45 +87,33 @@ def flatten_map(message, height):
 class FlatElevationMap(Node):
     def __init__(self):
         super().__init__('flat_elevation_map')
-        self.support_height = None
-        self.plane = PlaneHeightTracker()
         self.state = None
         self.last_stamp = None
         self.last_map_stamp = None
         self.epoch = None
-        self.observations = {}
-        self.pending_map = None
         self.calibration = deque()
         input_topic = self.declare_parameter(
             'input_topic', '/elevation_mapping_node/elevation_map_raw').value
         output_topic = self.declare_parameter(
             'output_topic', '/terrain_planner/elevation_map_flat').value
+        self.foot_radius = self.declare_parameter('foot_radius', 0.032).value
+        rate_limit = self.declare_parameter('plane_rate_limit_mps', 0.01).value
         if input_topic == output_topic:
             raise ValueError('input and output topics must differ')
+        if not math.isfinite(rate_limit) or rate_limit <= 0:
+            raise ValueError('plane_rate_limit_mps must be positive and finite')
+        self.plane = SupportPlaneTracker(rate_limit)
         self.publisher = self.create_publisher(
             GridMap, output_topic, 1)
         self.create_subscription(LocomotionState, '/robot/locomotion_state',
                                  self.on_state, qos_profile_sensor_data)
         self.create_subscription(GridMap, input_topic, self.on_map, qos_profile_sensor_data)
-        self.create_subscription(PointStamped, '/elevation/observed_plane', self.on_plane, 10)
         self.get_logger().info('Flat map: waiting for four estimated support contacts')
 
     def reset_plane(self):
-        self.support_height = None
-        self.plane = PlaneHeightTracker()
+        self.plane = SupportPlaneTracker(self.plane.max_rate, self.plane.max_step_sec)
         self.calibration.clear()
         self.last_map_stamp = None
-        self.observations.clear()
-        self.pending_map = None
-
-    def on_plane(self, message):
-        if not self.fresh(message.header, 'elevation_odom') or not math.isfinite(message.point.z):
-            return
-        stamp = rclpy.time.Time.from_msg(message.header.stamp).nanoseconds
-        self.observations[stamp] = message.point.z
-        self.observations = dict(sorted(self.observations.items())[-20:])
-        if self.pending_map is not None:
-            self.on_map(self.pending_map)
 
     def fresh(self, header, frame='odom', max_age=0.25):
         stamp = rclpy.time.Time.from_msg(header.stamp)
@@ -116,27 +135,38 @@ class FlatElevationMap(Node):
             self.epoch = state.gait_epoch_ns
         self.last_stamp = stamp
         self.state = state
-        if self.plane.offset is None:
-            self.support_height = None
-            if not all(state.contact_estimated):
-                self.calibration.clear()
-                return
-            heights = [foot.z for foot in state.foot_position]
-            if not all(math.isfinite(value) for value in heights):
-                return
-            if max(heights) - min(heights) > 0.01:
-                self.calibration.clear()
-                return
-            mean = sum(heights) / 4
-            self.calibration.append((stamp, mean))
-            while self.calibration and stamp - self.calibration[0][0] > 700_000_000:
-                self.calibration.popleft()
-            if stamp - self.calibration[0][0] < 500_000_000:
-                return
-            levels = [entry[1] for entry in self.calibration]
-            if max(levels) - min(levels) > 0.002:
-                return
-            self.support_height = mean
+        if self.plane.height is None:
+            self.calibrate(state, stamp)
+            return
+        supports = [foot.z - self.foot_radius for foot, confirmed, estimated
+                    in zip(state.foot_position, state.contact_confirmed,
+                           state.contact_estimated)
+                    if confirmed and estimated]
+        self.plane.update(stamp, supports)
+
+    def calibrate(self, state, stamp):
+        """기립 중 네 발이 같은 높이로 안정될 때 초기 평면을 설정한다."""
+        if not all(state.contact_estimated):
+            self.calibration.clear()
+            return
+        heights = [foot.z - self.foot_radius for foot in state.foot_position]
+        if not all(math.isfinite(value) for value in heights):
+            return
+        if max(heights) - min(heights) > 0.01:
+            self.calibration.clear()
+            return
+        mean = sum(heights) / 4
+        self.calibration.append((stamp, mean))
+        while self.calibration and stamp - self.calibration[0][0] > 700_000_000:
+            self.calibration.popleft()
+        if stamp - self.calibration[0][0] < 500_000_000:
+            return
+        levels = [entry[1] for entry in self.calibration]
+        if max(levels) - min(levels) > 0.002:
+            return
+        self.plane.initialize(stamp, mean)
+        self.get_logger().info(
+            f'Flat ground plane anchored below foot centers: height={mean:.6f} m')
 
     def on_map(self, message):
         if self.state is None or not self.fresh(self.state.header):
@@ -146,23 +176,14 @@ class FlatElevationMap(Node):
         stamp = rclpy.time.Time.from_msg(message.header.stamp).nanoseconds
         if self.last_map_stamp is not None and stamp <= self.last_map_stamp:
             return
-        self.pending_map = message
-        # DDS 채널 도착 순서와 무관하게 동일 source stamp끼리만 결합한다.
-        if stamp not in self.observations:
+        if self.plane.height is None:
             return
         try:
-            observed = self.observations[stamp]
-            first = self.plane.offset is None
-            height = self.plane.update(observed, self.support_height)
-            result = flatten_map(message, height)
+            result = flatten_map(message, self.plane.height)
             self.publisher.publish(result)
             self.last_map_stamp = stamp
-            self.pending_map = None
-            if first:
-                self.get_logger().info(
-                    f'Flat map tracking observations: offset={self.plane.offset:.6f} m')
             self.get_logger().info(
-                f'Flat plane height={height:.6f} m, observed={observed:.6f} m',
+                f'Flat plane height={self.plane.height:.6f} m (ground datum, foot radius removed)',
                 throttle_duration_sec=2.0)
         except ValueError as error:
             self.get_logger().warning(str(error), throttle_duration_sec=2.0)

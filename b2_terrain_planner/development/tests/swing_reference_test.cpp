@@ -1,9 +1,9 @@
 /**
  * @file swing_reference_test.cpp
  * @brief 전체 시간 XY 5차 연결과 지형 여유 기반 Z 보정의 경계·속도 검증.
- * @version 0.0.4
- * @update 2026-10-27: 부분 스윙의 가속도 보존과 정점 초과 방지를 검증함.
- * @update 2026-10-27: 지면 여유 조건·Z 전용 보정·급회전 사례의 XY 속도를 검증함.
+ * @version 0.0.7
+ * @update 2026-10-29: 이륙 장애물에서도 XY p/v/a가 바뀌지 않는 지형 보정을 검증함.
+ * @update 2026-10-28: 32mm 구형 발의 조회 범위와 기존 스윙 경계를 검증함.
  */
 #include "b2_terrain_planner/swing_reference.h"
 #undef NDEBUG
@@ -14,8 +14,7 @@
 namespace {
 using b2_terrain_planner::HeightMap;
 using b2_terrain_planner::SwingReference;
-constexpr double kRadius = 0.0351;
-constexpr double kHalfWidth = 0.0275;
+constexpr double kRadius = 0.032;
 constexpr double kMargin = 0.03;
 
 HeightMap MakeMap() {
@@ -39,7 +38,7 @@ SwingReference MakeCurve() {
 }
 
 void Shape(SwingReference* curve, const HeightMap& map) {
-  curve->ShapeOverTerrain(map, kMargin, kRadius, kHalfWidth);
+  curve->ShapeOverTerrain(map, kMargin, kRadius);
 }
 
 void CheckConnections(const SwingReference& curve) {
@@ -134,6 +133,72 @@ void CheckTerrain() {
   assert((curve.Sample(curve.start).second - curve.velocity).norm() < 1e-12);
 }
 
+// 착지 전(진행률 ~0.6-0.7)에 낮은 블록이 있으면 보정이 그 위치의 여유를 실제로
+// 채워야 한다. 중앙 고정 봉우리에서는 후반 보정이 소멸해 발바닥이 지면 아래로 갔다.
+void CheckLateObstacle() {
+  auto map = MakeMap();
+  const auto original = MakeCurve();
+  auto curve = original;
+  for (int col = 0; col < map.heights.cols(); ++col) {
+    const double x = map.origin.x() + col * map.resolution;
+    if (x >= 0.46 && x <= 0.50) map.heights.col(col).setConstant(0.12);
+  }
+  Shape(&curve, map);
+  assert(curve.terrain_lift > 0.05 && curve.terrain_lift < 0.12);
+  assert(curve.lift_fall_start > 0.65);
+  CheckConnections(curve);
+  for (double time = curve.start; time <= curve.end; time += 0.0005) {
+    const auto shaped = curve.Sample(time).first;
+    assert((shaped.head<2>() -
+            original.Sample(time).first.head<2>()).norm() < 1e-12);
+    if (shaped.x() < 0.46 || shaped.x() > 0.50) continue;
+    assert(shaped.z() - kRadius >= 0.12 - 1e-3);  // 블록 위에서 발바닥이 지면 위.
+  }
+  assert(curve.Sample(curve.end).first.isApprox(curve.target, 1e-10));
+}
+
+// 이륙 인접 단차에서도 지도 보정은 기본 XY의 위치·속도·가속도를 바꾸지 않는다.
+void CheckTakeoffRiser() {
+  auto map = MakeMap();
+  auto curve = MakeCurve();
+  for (int col = 0; col < map.heights.cols(); ++col) {
+    const double x = map.origin.x() + col * map.resolution;
+    if (x >= 0.03) map.heights.col(col).setConstant(0.15);
+  }
+  curve.target.z() = 0.15 + kRadius;
+  curve.apex_z = curve.target.z() + 0.1;
+  Shape(&curve, map);
+  assert(curve.terrain_lift > 0.0);
+  CheckConnections(curve);
+  for (double t = curve.start; t < curve.end; t += 0.0005) {
+    const auto base = curve.SampleBaseKinematics(t);
+    const auto shaped = curve.SampleKinematics(t);
+    assert(shaped.position.head<2>().isApprox(base.position.head<2>(), 1e-12));
+    assert(shaped.velocity.head<2>().isApprox(base.velocity.head<2>(), 1e-12));
+    assert(shaped.acceleration.head<2>().isApprox(base.acceleration.head<2>(), 1e-12));
+  }
+}
+
+// 착지점 바로 앞 회랑 안에 다음 단차가 있는 경우. 착지 경계 구간의 부족은
+// 보정을 만들지 않으므로 착지 직전 Z 목표가 폭주하지 않고 착지를 유지한다.
+void CheckLandingRiser() {
+  auto map = MakeMap();
+  auto curve = MakeCurve();
+  for (int col = 0; col < map.heights.cols(); ++col) {
+    const double x = map.origin.x() + col * map.resolution;
+    if (x >= 0.64) map.heights.col(col).setConstant(0.12);
+  }
+  Shape(&curve, map);
+  assert(curve.terrain_lift < 0.02);
+  CheckConnections(curve);
+  double peak = 0.0;
+  for (double time = curve.start; time <= curve.end; time += 0.0005) {
+    peak = std::max(peak, std::abs(curve.Sample(time).second.z()));
+  }
+  assert(peak < 3.0);  // 하강 구간이 스캔 한 칸으로 붕괴하면 10 m/s를 넘는다.
+  assert(curve.Sample(curve.end).first.isApprox(curve.target, 1e-10));
+}
+
 void CheckFailureDistance() {
   // 18:20 런의 FR 이동거리/시간. 지형 보정을 켜도 XY 이동 시간이 줄지 않는다.
   auto curve = MakeCurve();
@@ -166,6 +231,9 @@ void CheckFailureDistance() {
 
 int main() {
   CheckTerrain();
+  CheckLateObstacle();
+  CheckTakeoffRiser();
+  CheckLandingRiser();
   CheckFailureDistance();
   b2_terrain_planner::SwingReference curve;
   curve.start = .08; curve.end = .4; curve.apex_time = .24; curve.apex_z = .1;

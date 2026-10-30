@@ -1,9 +1,9 @@
 /**
  * @file swing_reference.h
- * @brief 절대 스윙 시각을 보존하는 5차 발 궤적과 지형 여유 기반 Z 보정.
- * @version 0.0.5
- * @update 2026-10-27: 부분 재연결의 시작 가속도와 해석적 가속도 샘플을 보존함.
- * @update 2026-10-27: 전체 시간의 XY 5차 곡선과 부족 여유의 sin⁴ Z 보정으로 변경함.
+ * @brief 절대 스윙 시각을 보존하는 5차 발 궤적과 지형 부족 구간에 맞춘 Z 보정.
+ * @version 0.0.8
+ * @update 2026-10-29: 지형 기반 XY 후퇴와 전용 재조회를 제거하고 기본 XY·Z 보정을 유지함.
+ * @update 2026-10-28: 발 크기 조회를 구형 발 반경 하나로 통일함.
  */
 #pragma once
 
@@ -30,7 +30,10 @@ struct SwingReference {
   Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
   Eigen::Vector3d acceleration = Eigen::Vector3d::Zero();
   Eigen::Vector3d target = Eigen::Vector3d::Zero();
+  // Z 보정: 부족 최대값과 부족이 나타난 진행률 구간(유지 구간 양 끝).
   double terrain_lift = 0.0;
+  double lift_rise_end = 0.5;
+  double lift_fall_start = 0.5;
 
   bool ActiveAt(double time) const {
     return end > start && time >= start - 1e-9 && time < end - 1e-9;
@@ -57,7 +60,8 @@ struct SwingReference {
                 (duration * duration)};
   }
 
-  // sin⁴ 봉우리와 진행률에 대한 1·2차 미분. 양 끝의 세 값은 0이다.
+  // sin⁴ 봉우리와 진행률에 대한 1·2차 미분. 양 끝의 세 값은 0이다. 요구 여유를
+  // 출발·착지에서 0으로 줄이는 가중치로만 사용한다.
   static Eigen::Vector3d Bump(double phase) {
     const double u = std::clamp(phase, 0.0, 1.0);
     constexpr double kPi = 3.14159265358979323846;
@@ -66,6 +70,30 @@ struct SwingReference {
     const double square = sine * sine;
     return {square * square, 4.0 * kPi * square * sine * cosine,
             4.0 * kPi * kPi * (3.0 * square * cosine * cosine - square * square)};
+  }
+
+  // 5차 smoothstep과 입력에 대한 1·2차 미분. 양 끝에서 (0,0,0)과 (1,0,0)이다.
+  static Eigen::Vector3d SmoothStep(double u) {
+    const double c = std::clamp(u, 0.0, 1.0);
+    const double c2 = c * c;
+    return {c2 * c * (10.0 - 15.0 * c + 6.0 * c2),
+            30.0 * c2 * (c - 1.0) * (c - 1.0),
+            60.0 * c * (2.0 * c - 1.0) * (c - 1.0)};
+  }
+
+  // 상승[0,rise]→유지[rise,hold]→하강[hold,clear] 모양과 진행률 1·2차 미분.
+  // 시작·clear 밖의 세 값은 0이고 구간 경계는 C2로 연결된다.
+  static Eigen::Vector3d HoldBump(double phase, double rise, double hold,
+                                  double clear) {
+    if (phase <= 0.0 || phase >= clear) return Eigen::Vector3d::Zero();
+    if (phase < rise) {
+      const auto value = SmoothStep(phase / rise);
+      return {value[0], value[1] / rise, value[2] / (rise * rise)};
+    }
+    if (phase <= hold) return {1.0, 0.0, 0.0};
+    const double width = clear - hold;
+    const auto value = SmoothStep((clear - phase) / width);
+    return {value[0], -value[1] / width, value[2] / (width * width)};
   }
 
   // XY는 스윙 전체 시간을 사용한다. Z만 정점을 경유하는 두 5차 구간이다.
@@ -92,12 +120,14 @@ struct SwingReference {
 
   Kinematics SampleKinematics(double time) const {
     auto sample = SampleBaseKinematics(time);
-    if (end > start) {
-      const double duration = end - start;
-      const auto bump = Bump((time - start) / duration);
-      sample.position.z() += terrain_lift * bump[0];
-      sample.velocity.z() += terrain_lift * bump[1] / duration;
-      sample.acceleration.z() += terrain_lift * bump[2] / (duration * duration);
+    if (end <= start) return sample;
+    const double duration = end - start;
+    const double phase = (time - start) / duration;
+    if (terrain_lift > 0.0) {
+      const auto lift = HoldBump(phase, lift_rise_end, lift_fall_start, 1.0);
+      sample.position.z() += terrain_lift * lift[0];
+      sample.velocity.z() += terrain_lift * lift[1] / duration;
+      sample.acceleration.z() += terrain_lift * lift[2] / (duration * duration);
     }
     return sample;
   }
@@ -107,21 +137,20 @@ struct SwingReference {
     return {sample.position, sample.velocity};
   }
 
-  // 생성된 XY 경로의 셀에서 기본 발바닥 궤적의 부족 여유만 읽는다.
-  // 부족량의 최대값을 단일 봉우리 진폭으로 사용한다. 충돌 보장/발행 거부 검사가 아니다.
-  void ShapeOverTerrain(const HeightMap& map, double clearance,
-                        double foot_radius, double foot_half_width) {
+  // 경계 부족을 그대로 반영하면 Z 상승·하강 구간이 지나치게 짧아진다.
+  // 기존 경계 제외를 유지하며 지형에 따른 XY 우회는 수행하지 않는다.
+  static constexpr double kLiftEdgePhase = 0.15;
+
+  // 기본 XY 경로에서 Z 부족 최대값과 유지 구간을 구한다.
+  void ScanDeficits(const HeightMap& map, double clearance, double foot_radius,
+                    int intervals, double corridor) {
     terrain_lift = 0.0;
-    if (end <= start) return;
-    const double travel = (target.head<2>() - position.head<2>()).norm() +
-                          (end - start) * velocity.head<2>().norm();
-    const int intervals = std::max(16, static_cast<int>(
-        std::ceil(2.0 * travel / map.resolution)));
-    const double footprint = std::hypot(foot_radius, foot_half_width);
-    const double corridor = footprint + map.resolution / std::sqrt(2.0);
+    double first_deficit = 1.0;
+    double last_deficit = 0.0;
     for (int i = 1; i < intervals; ++i) {
       const double phase = static_cast<double>(i) / intervals;
-      const auto base = SampleBaseKinematics(start + phase * (end - start)).position;
+      Eigen::Vector3d base =
+          SampleBaseKinematics(start + phase * (end - start)).position;
       const double margin = clearance * Bump(phase)[0];
       const int x0 = std::max(0, static_cast<int>(std::floor(
           (base.x() - corridor - map.origin.x()) / map.resolution)));
@@ -143,10 +172,38 @@ struct SwingReference {
           if ((xy - base.head<2>()).norm() > corridor) continue;
           const double deficit =
               map.heights(row, col) + foot_radius + margin - base.z();
+          if (deficit <= 0.0) continue;
+          if (phase < kLiftEdgePhase || phase > 1.0 - kLiftEdgePhase) continue;
           terrain_lift = std::max(terrain_lift, deficit);
+          first_deficit = std::min(first_deficit, phase);
+          last_deficit = std::max(last_deficit, phase);
         }
       }
     }
+    if (terrain_lift > 0.0) {
+      lift_rise_end = first_deficit;
+      lift_fall_start = last_deficit;
+    } else {
+      lift_rise_end = 0.5;
+      lift_fall_start = 0.5;
+    }
+  }
+
+  // 기본 XY 경로를 유지하고 부족 구간에 상승→유지→하강 Z 보정만 더한다.
+  // 착지점·착지 시각·양 끝 p/v/a를 유지하며 발행 거부 조건을 추가하지 않는다.
+  void ShapeOverTerrain(const HeightMap& map, double clearance,
+                        double foot_radius) {
+    terrain_lift = 0.0;
+    lift_rise_end = 0.5;
+    lift_fall_start = 0.5;
+    if (end <= start) return;
+    const double travel = (target.head<2>() - position.head<2>()).norm() +
+                          (end - start) * velocity.head<2>().norm();
+    const int intervals = std::max(16, static_cast<int>(
+        std::ceil(2.0 * travel / map.resolution)));
+    const double footprint = foot_radius;
+    const double corridor = footprint + map.resolution / std::sqrt(2.0);
+    ScanDeficits(map, clearance, foot_radius, intervals, corridor);
   }
 };
 }  // namespace b2_terrain_planner

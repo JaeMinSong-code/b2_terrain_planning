@@ -9,32 +9,42 @@
   ],
   "kernels": {
     "tamols_diagonal_a": {
-      "residuals": 20,
+      "residuals": 12,
       "constraints": 17
     },
     "tamols_diagonal_b": {
-      "residuals": 20,
+      "residuals": 12,
       "constraints": 17
     },
     "tamols_full_support": {
-      "residuals": 28,
+      "residuals": 12,
       "constraints": 26
     },
     "tamols_without_fl": {
-      "residuals": 24,
+      "residuals": 12,
       "constraints": 22
     },
     "tamols_without_fr": {
-      "residuals": 24,
+      "residuals": 12,
       "constraints": 22
     },
     "tamols_without_rl": {
-      "residuals": 24,
+      "residuals": 12,
       "constraints": 22
     },
     "tamols_without_rr": {
-      "residuals": 24,
+      "residuals": 12,
       "constraints": 22
     }
+  },
+  "nominal_kinematics": {
+    "state_size": 9,
+    "parameter_size": 4,
+    "residuals": 3
+  },
+  "terrain_alignment": {
+    "state_size": 6,
+    "parameter_size": 3,
+    "outputs": 3
   }
 }

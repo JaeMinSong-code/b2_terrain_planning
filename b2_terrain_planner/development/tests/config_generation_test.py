@@ -2,6 +2,7 @@
 """단일 설정의 모드 분리, 중복 키 거부와 ROS 호환 출력을 검증한다."""
 
 import copy
+import xml.etree.ElementTree as ET
 from pathlib import Path
 import sys
 import tempfile
@@ -34,12 +35,47 @@ class ConfigGenerationTest(unittest.TestCase):
         flat = configs['terrain_planner_flat.yaml'][
             'terrain_planner_node']['ros__parameters']
         self.assertTrue(wbc['support_patch.enabled'])
+        self.assertTrue(wbc['terrain.pipeline_enabled'])
+        self.assertTrue(wbc['terrain.graduated_initialization'])
+        self.assertEqual(wbc['terrain.graduated_budget_fraction'], 0.25)
+        self.assertGreater(wbc['terrain.virtual_floor_sigma'], wbc['terrain.smoothing_sigma'])
+
         self.assertFalse(flat['support_patch.enabled'])
         self.assertNotIn('vz_weight', wbc)
         self.assertNotIn('map_datum_reanchor.enabled', flat)
         self.assertEqual(
             flat['map_topic'], '/terrain_planner/elevation_map_flat')
         self.assertEqual(wbc['command_topic'], flat['command_topic'])
+        self.assertEqual(wbc['foot_radius'], 0.032)
+        self.assertEqual(flat['foot_radius'], wbc['foot_radius'])
+        self.assertEqual(configs['terrain_planner_flat.yaml'][
+            'flat_elevation_map']['ros__parameters']['foot_radius'], flat['foot_radius'])
+        self.assertNotIn('map_datum_reanchor.contact_offset', wbc)
+        self.assertNotIn('swing_foot_half_width', wbc)
+
+    def test_flat_node_uses_the_configured_radius(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'radius.yaml'
+            document = yaml.safe_load(self.source.read_text())
+            document['planner']['common']['foot_radius'] = 0.05
+            source.write_text(yaml.safe_dump(document))
+            config = load_configs(source)['terrain_planner_flat.yaml']
+            self.assertEqual(config['terrain_planner_node']['ros__parameters'][
+                'foot_radius'], 0.05)
+            self.assertEqual(config['flat_elevation_map']['ros__parameters'][
+                'foot_radius'], 0.05)
+
+    def test_foot_collision_matches_planner_radius(self):
+        config = load_configs(self.source)['terrain_planner_wbc.yaml']
+        radius = config['terrain_planner_node']['ros__parameters']['foot_radius']
+        robot = ET.parse(PACKAGE / 'model/unitree_b2/b2.urdf').getroot()
+        for leg in ['FL', 'FR', 'RL', 'RR']:
+            collision = robot.find(f"link[@name='{leg}_foot']/collision")
+            geometry = list(collision.find('geometry'))
+            self.assertEqual(len(geometry), 1)
+            self.assertEqual(geometry[0].tag, 'sphere')
+            self.assertEqual(float(geometry[0].get('radius')), radius)
+            self.assertEqual(collision.find('origin').get('xyz'), '0 0 0')
 
     def test_nested_override_replaces_arrays_and_preserves_common(self):
         common = {'ramp': {'linear': 0.5, 'angular': 1.0}, 'command': [0, 0, 0]}
