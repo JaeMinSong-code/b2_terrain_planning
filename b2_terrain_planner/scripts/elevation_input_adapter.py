@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""B2/시뮬 점군과 odometry를 격리된 elevation 좌표계로 연결한다."""
+"""원본 시각으로 점군·odom을 정렬하고 격리된 지도 좌표·시각으로 전달한다."""
 
 from collections import deque
 import time
@@ -10,7 +10,7 @@ import rclpy
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.executors import ExternalShutdownException
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import QoSProfile, qos_profile_sensor_data
 from rclpy.time import Time
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
@@ -54,7 +54,8 @@ class ElevationInputAdapter(Node):
         super().__init__('elevation_input_adapter')
         defaults = {
             'cloud_topic': '/rslidar_points', 'odom_topic': '/dog_odom',
-            'body_frame': '', 'max_odom_gap': 0.3, 'max_age': 1.0,
+            'body_frame': '', 'body_frame_alias': '', 'use_receive_time': False,
+            'max_odom_gap': 0.3, 'max_age': 1.0,
             'queue_wait': 0.35, 'reset_distance': 1.0, 'reset_angle': 1.2,
             'extrinsic_parent': '', 'extrinsic_child': '',
             'extrinsic_child_from_cloud': False,
@@ -66,7 +67,12 @@ class ElevationInputAdapter(Node):
             if not np.isfinite(self.cfg[key]) or self.cfg[key] <= 0:
                 raise ValueError(key + ' must be finite and positive')
         self.poses = deque(maxlen=2000)
-        self.clouds = deque(maxlen=8)
+        cloud_queue_size = 8
+        cloud_qos = qos_profile_sensor_data
+        if self.cfg['use_receive_time']:
+            cloud_queue_size = 1
+            cloud_qos = QoSProfile(depth=1, reliability=qos_profile_sensor_data.reliability)
+        self.clouds = deque(maxlen=cloud_queue_size)
         self.tf_buffer = Buffer(cache_time=Duration(seconds=10.0))
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.tf_pub = self.create_publisher(TFMessage, '/elevation/tf', 50)
@@ -83,7 +89,7 @@ class ElevationInputAdapter(Node):
         self.create_subscription(Odometry, self.cfg['odom_topic'], self.on_odom,
                                  qos_profile_sensor_data)
         self.create_subscription(PointCloud2, self.cfg['cloud_topic'], self.on_cloud,
-                                 qos_profile_sensor_data)
+                                 cloud_qos)
         self.create_timer(0.02, self.process)
         self.create_timer(1.0, lambda: self.status_pub.publish(String(data=self.last_status)))
         self.status('waiting: pointcloud, odometry and sensor extrinsic TF')
@@ -132,7 +138,8 @@ class ElevationInputAdapter(Node):
         if stamp == self.last_cloud_stamp:
             return
         self.last_cloud_stamp = stamp
-        self.clouds.append((time.monotonic(), msg))
+        # 원본 메시지 시각은 odom 보간·외부 TF 조회에 그대로 사용한다.
+        self.clouds.append((time.monotonic(), self.get_clock().now().to_msg(), msg))
 
     def lookup(self, parent, child, stamp, sensor=False):
         if parent == child:
@@ -142,6 +149,11 @@ class ElevationInputAdapter(Node):
             position = vector(result.transform.translation)
             attitude = unit_quaternion(quaternion(result.transform.rotation))
         except TransformException:
+            # 설정에서 동일 몸통으로 지정한 프레임에만 identity fallback을 적용한다.
+            if (not sensor and self.cfg['body_frame_alias']
+                    and parent == self.cfg['body_frame_alias']
+                    and child == self.cfg['body_frame']):
+                return np.zeros(3), np.array([0., 0., 0., 1.])
             child_matches = child == self.cfg['extrinsic_child']
             if sensor and self.cfg['extrinsic_child_from_cloud']:
                 child_matches = True
@@ -172,13 +184,21 @@ class ElevationInputAdapter(Node):
             if time.monotonic() - self.last_good > self.cfg['max_age']:
                 self.status('stale: no usable cloud/odometry')
             return
-        received, msg = self.clouds[0]
+        received, received_stamp, msg = self.clouds[0]
         stamp = seconds(msg.header.stamp)
-        now = self.get_clock().now().nanoseconds * 1e-9
-        if now - stamp > self.cfg['max_age'] or stamp - now > 0.1:
-            self.clouds.popleft()
-            self.status('dropped: stale/future sensor stamp; check clock synchronization')
-            return
+        output_stamp = msg.header.stamp
+        if self.cfg['use_receive_time']:
+            if time.monotonic() - received > self.cfg['max_age']:
+                self.clouds.popleft()
+                self.status('dropped: cloud expired since reception')
+                return
+            output_stamp = received_stamp
+        else:
+            now = self.get_clock().now().nanoseconds * 1e-9
+            if now - stamp > self.cfg['max_age'] or stamp - now > 0.1:
+                self.clouds.popleft()
+                self.status('dropped: stale/future sensor stamp; check clock synchronization')
+                return
         try:
             pose = interpolate(self.poses, stamp, self.cfg['max_odom_gap'])
             body = self.cfg['body_frame'] or pose.child
@@ -191,13 +211,14 @@ class ElevationInputAdapter(Node):
             if not len(xyz):
                 raise ValueError('empty finite pointcloud')
             self.tf_pub.publish(TFMessage(transforms=[
-                transform(msg.header.stamp, 'elevation_odom', 'elevation_base',
+                transform(output_stamp, 'elevation_odom', 'elevation_base',
                           map_body_p, map_body_q),
-                transform(msg.header.stamp, 'elevation_base', 'elevation_lidar',
+                transform(output_stamp, 'elevation_base', 'elevation_lidar',
                           sensor_p, sensor_q),
             ]))
             output = PointCloud2()
-            output.header.stamp = msg.header.stamp
+            # 보간된 같은 자세와 점군을 동일 시각으로 전달한다.
+            output.header.stamp = output_stamp
             # 센서 좌표를 유지하고 동등한 변환을 전용 TF에 발행한다.
             output.header.frame_id = 'elevation_lidar'
             output.height, output.width = 1, len(xyz)

@@ -97,12 +97,13 @@ IP 충돌이 없는 노트북 주소를 해당 유선 연결에 설정하고, DD
 성공을 의미하지 않는다. 온보드 센서 프로세스의 실제 `ROS_DOMAIN_ID`와 네트워크 설정을
 확인한다. WBC 실행 셸의 설정만 확인해서 센서 프로세스도 같다고 가정하지 않는다.
 
-두 호스트가 같은 시간 기준을 사용해야 한다. 각각 `timedatectl status`를 확인하고,
-chrony 사용 환경이면 `chronyc tracking`, `chronyc sources -v`로 동기화 원천·오차를
-확인한다. LAN 직결만으로 시계가 동기화되지는 않는다. 기존 NTP/chrony 구성으로
-공통 시간 원천에 동기화한 뒤 메시지 stamp와 수신 시각을 비교한다. 시계 오차와
-전송 지연은 `max_age=1.0 s`보다 충분히 작아야 한다. 이 문제를 입력 재타임스탬프나
-허용 나이 완화로 우회하지 않는다. 실행 스크립트는 IP·방화벽·시간 설정을 변경하지 않는다.
+실기 기본 `use_receive_time: true`는 노트북과 센서의 절대 시계 동기화를 요구하지 않는다.
+LiDAR와 `/dog_odom`은 서로 같은 센서 시간 기준이어야 하며, 원본 LiDAR timestamp로
+odom을 보간한다. 입력 원본은 수정하지 않고, 정렬된 점군과 전용 TF에 동일한 로컬
+LiDAR 수신 시각을 붙여 지도에 전달한다. 최신 대기 점군 한 장만 유지하고 `max_age`는
+수신 후 단조 시계 경과 시간에 적용한다. 수신 이전의 전송 지연을 측정하는 방식은 아니다.
+`use_receive_time: false`인 시뮬/원본 시각 모드에서는 기존 호스트 간 시계 기준과
+입력 timestamp 만료 판정을 유지한다. 실행 스크립트는 시스템 시계를 변경하지 않는다.
 
 ### 3. 진단 터미널에서 원본 토픽 확인
 
@@ -193,9 +194,11 @@ ros2 topic hz /elevation_mapping_node/elevation_map_raw
 |---|---|
 | `cloud_topic` | 기본 `/rslidar_points` (`PointCloud2`) |
 | `odom_topic` | 기본 `/dog_odom` (`Odometry`) |
-| `body_frame` | 실기 기본 `base_link`; odometry child가 다르면 몸통까지 TF 필요 |
+| `body_frame` | 실기 기본 `base_link`; odometry child에서 몸통까지 변환 |
+| `body_frame_alias` | 실기 `robot_center`: TF가 없으면 `base_link`와 동일한 몸통으로 취급하는 사용자 승인 시험 가정 |
+| `use_receive_time` | 실기 true: 원본 시각으로 odom 정렬 후 점군·TF에 동일 로컬 수신 시각 사용; 미지정 시 false |
 | `max_odom_gap` | 보간할 odometry 두 표본 사이 최대 간격, 기본 0.3 s |
-| `max_age` | 입력 timestamp 최대 나이, 기본 1.0 s; 호스트 간 시간 동기화 필요 |
+| `max_age` | 기본 1.0 s; 수신 시각 모드는 수신 후 경과 시간, 원본 시각 모드는 입력 timestamp 나이 |
 | `queue_wait` | odometry/TF 도착 대기, 기본 0.35 s |
 | `extrinsic_parent/child` | TF가 없을 때 사용할 확인된 고정 변환의 프레임 이름 |
 | `extrinsic_child_from_cloud` | 실기 기본 true: 센서 변환의 child를 점군 frame_id에서 읽음 |
@@ -203,10 +206,15 @@ ros2 topic hz /elevation_mapping_node/elevation_map_raw
 
 기존 TF가 있으면 우선 사용하며, 없을 때만 사용자 확인을 받은 URDF 장착값을 사용한다.
 `extrinsic_child_from_cloud`는 몸통→점군 변환에만 적용한다. odometry child가 `base_link`와
-다를 때 필요한 몸통 변환을 대신하지 않는다. 점군 frame이 몸통과 같으면 추가 장착 변환을
-적용하지 않는다. 고정 장착값 사용을 끄려면 `extrinsic_parent: ''`로 설정한다.
+다를 때 필요한 몸통 변환을 대신하지 않는다. 실기 시험의 `body_frame_alias`만
+`robot_center → base_link`에 이동·회전 없는 fallback을 허용한다. 실제 TF가 있으면
+이를 우선 사용하며, alias를 비우면 이 가정을 해제한다. 점군 frame이 몸통과 같으면
+추가 장착 변환을 적용하지 않는다. 고정 장착값 사용을 끄려면 `extrinsic_parent: ''`로 설정한다.
 
-- 점군 시각으로 odometry를 보간하며 외삽하거나 현재 시각으로 재표기하지 않는다.
+- 원본 점군 시각으로 odometry를 보간하며 외삽하지 않는다. 두 입력을 각각 수신 시각으로
+  바꿔 맞추지 않는다. 수신 시각 모드에서만 정렬 완료 후 출력 점군·TF 시각을 함께 변환한다.
+- 센서가 노트북보다 약 131초 앞선 실기 입력은 기존 미래 timestamp 판정으로 제외됐다.
+  수신 시각 모드는 이 호스트 시계 차이를 지도 입력 거부 사유로 사용하지 않는다.
 - XYZ FLOAT32/FLOAT64, endian, organized row padding을 해석한다. 추가 필드는 허용하고
   맵 입력은 유한 XYZ FLOAT32만 전달한다.
 - odometry 부모 프레임부터 몸통 pose를 합성하고 몸통↔센서 변환을 확인한다.

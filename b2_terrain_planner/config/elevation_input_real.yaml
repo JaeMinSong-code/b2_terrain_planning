@@ -2,8 +2,13 @@ elevation_input_adapter:
   ros__parameters:
     cloud_topic: /rslidar_points
     odom_topic: /dog_odom
-    # URDF 몸통 기준. Odometry.child_frame_id가 다르면 해당 프레임↔base_link TF 필요.
+    # LiDAR와 /dog_odom은 원본 시각으로 정렬하고, 지도 점군·TF는 같은 수신 시각 사용.
+    # 노트북과 센서의 절대 시계 차이로 입력을 버리지 않고 최신 대기 점군만 유지한다.
+    use_receive_time: true
     body_frame: base_link
+    # 사용자 승인(2026-10-30): 이번 실기 지도 시험에서 두 몸통 프레임을 동일하게 가정.
+    # 실제 TF가 있으면 우선 사용하고, 없을 때만 이동·회전 없는 변환을 적용한다.
+    body_frame_alias: robot_center
     max_odom_gap: 0.3
     max_age: 1.0
     queue_wait: 0.35

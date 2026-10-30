@@ -181,8 +181,12 @@ ROS 노드의 QP 정규화·반복 수·허용 오차와는 값이 다르다.
 ./b2_terrain_planner/scripts/run_elevation_real.sh --interface enp3s0 --rviz
 ```
 
-시각 동기화·DDS·장착 TF·입력 만료 처리는
-[맵 운영 절차](docs/elevation_map_runtime.md)를 따른다.
+실기 지도는 최신 LiDAR와 `/dog_odom`을 원본 timestamp로 정렬한 뒤, 점군과 전용 TF를
+같은 로컬 수신 시각으로 전달한다(`use_receive_time: true`). 노트북과 센서의 절대 시계
+동기화는 필요 없으며 두 센서 입력 사이의 시간 정합은 유지해야 한다.
+실기 시험에서는 사용자 승인으로 `robot_center`를 `base_link`와 같은 몸통으로 가정하고,
+실제 TF가 있으면 이를 우선 사용한다. 최신 대기 점군 한 장만 유지한다.
+DDS·장착 TF·입력 만료 처리는 [맵 운영 절차](docs/elevation_map_runtime.md)를 따른다.
 
 계획 노드는 별도 터미널에서 실행한다. 시뮬레이션과 실기 모두 WBC 실행 노드의
 `/robot/locomotion_state`를 구독한다. WBC task를 실행해 추정 상태가 유효해져야 계획을 시작한다.
