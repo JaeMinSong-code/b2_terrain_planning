@@ -1,9 +1,9 @@
 /**
  * @file planner.cpp
  * @brief 접촉 조합별 생성 Jacobian과 지형 비용의 Gauss–Newton QP로 trot을 최적화한다.
- * @version 0.0.43
+ * @version 0.0.44
+ * @update 2026-10-30: 지지발 3×3 셀 제외를 초기 후보·재사용에 연결하고 후보 소진 시 현재 발로 초기화함.
  * @update 2026-10-30: 처리 지도를 공유하고 가상 바닥 정렬·후보 보정·시간 제한 초기화를 연결함.
- * @update 2026-10-29: 지도 지면과 발 중심의 높이 계약 및 반경 변환을 통일함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -229,6 +229,20 @@ class StructureCache {
   Matrix inverse_, nullspace_;
 };
 
+SupportPositions OccupiedSupports(
+    const Input& input, const std::vector<Phase>& phases, int leg) {
+  SupportPositions occupied;
+  if (input.fixed[leg] || input.committed_footholds[leg]) return occupied;
+  auto contacts = phases.front().contacts;
+  if (input.contact_estimated) contacts = *input.contact_estimated;
+  for (int other = 0; other < 4; ++other) {
+    if (other != leg && contacts[other]) {
+      occupied.push_back(input.feet.row(other).head<2>().transpose());
+    }
+  }
+  return occupied;
+}
+
 Eigen::Matrix<double, 4, 2, Eigen::RowMajor> NominalFootholds(
     const Robot& robot, const Input& input, const std::vector<Phase>& phases) {
   if (input.has_nominal) return input.nominal;
@@ -378,9 +392,15 @@ class Problem {
         double limit = 0.30;
         if (FootFixed(leg)) limit = 0.0;
         const Eigen::Vector2d nominal = nominal_.row(leg).transpose();
-        terrain_initial_.row(leg) = terrain_->FindFoothold(
-            nominal, nominal.array() - limit, nominal.array() + limit,
-            direction_, backward_weight_, {}, terrain_layer_).transpose();
+        occupied_supports_[leg] = OccupiedSupports(input_, phases_, leg);
+        try {
+          terrain_initial_.row(leg) = terrain_->FindFoothold(
+              nominal, nominal.array() - limit, nominal.array() + limit,
+              direction_, backward_weight_, {}, terrain_layer_, occupied_supports_[leg]).transpose();
+        } catch (const OccupiedFootholdError&) {
+          // 후보 제외만으로 계산을 중단하지 않는다. 자기 발의 현재 XYZ에서 SQP를 계속한다.
+          terrain_initial_.row(leg) = input_.feet.row(leg);
+        }
       }
     }
   }
@@ -571,7 +591,8 @@ class Problem {
         try {
           selected_terrain.row(leg) = terrain_->FindFoothold(
               nominal, nominal.array() - .30, nominal.array() + .30,
-              direction_, backward_weight_, reach_accept[leg], terrain_layer_).transpose();
+              direction_, backward_weight_, reach_accept[leg], terrain_layer_,
+              occupied_supports_[leg]).transpose();
           if ((selected_terrain.row(leg) - terrain_initial_.row(leg)).norm() > 1e-10) {
             ++diagnostic->reach_reselected_footholds;
           }
@@ -596,6 +617,7 @@ class Problem {
       if (touchdown <= shift + 1e-10 || FootFixed(leg)) continue;
       if (terrain_ != nullptr) {
         const Eigen::Vector3d foot = old.footholds.row(leg).transpose();
+        if (terrain_->IsOccupiedCell(foot.head<2>(), occupied_supports_[leg])) continue;
         // XY를 잘라 다른 단으로 옮기면 Z가 맞지 않는다. 기존 목표 전체가
         // 현재 범위·관측 지형 높이에 유효할 때만 복사하고 아니면 새 후보를 유지한다.
         if ((foot.head<2>() - nominal_.row(leg).transpose()).cwiseAbs().maxCoeff() > .30 ||
@@ -1306,6 +1328,7 @@ class Problem {
   double nominal_kinematics_weight_ = 7.0;
   Vector parameters_;
   Eigen::Matrix<double, 4, 2, Eigen::RowMajor> nominal_;
+  std::array<SupportPositions, 4> occupied_supports_;
   std::array<std::optional<Eigen::Vector2d>, 4> previous_footholds_{};
   double previous_foothold_weight_ = 0.0;
 };
@@ -2472,7 +2495,9 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
         const Eigen::Vector2d upper = (center.array() + .20).matrix().cwiseMin((n.array() + .30).matrix());
         try {
           refined[leg] = prepared->FindFoothold(center, lower, upper, direction,
-                                              settings.foothold_backward_weight);
+                                              settings.foothold_backward_weight, {},
+                                              TerrainLayer::kGround,
+                                              OccupiedSupports(input, phases, leg));
         } catch (const TerrainDomainError&) { complete = false; break; }
       }
       if (complete) {
@@ -2510,9 +2535,9 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
   if (!result.success && retryable && elapsed() < settings.time_limit) {
     // 같은 nominal과 목적함수를 유지하고, 각 다리의 다른 높이 지지면에서 시작한다.
     // 후보별로 남은 시간 안에서 몸통 SQP를 다시 수행한다.
-    const auto nominal = NominalFootholds(robot, input,
-        MakeHorizon(input.gait_time, robot.period, robot.duty,
-            input.gait_hold_duration, input.hold_contacts));
+    const auto phases = MakeHorizon(input.gait_time, robot.period, robot.duty,
+                                   input.gait_hold_duration, input.hold_contacts);
+    const auto nominal = NominalFootholds(robot, input, phases);
     Eigen::Vector3d command(input.command.x(), input.command.y(), 0);
     command = Eigen::AngleAxisd(input.position[3], Eigen::Vector3d::UnitZ()) * command;
     Eigen::Vector2d direction = Eigen::Vector2d::Zero();
@@ -2531,7 +2556,8 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
         TerrainAttempt candidate;
         candidate.leg = leg;
         candidate.seed = prepared->FindFoothold(center, center.array() - .30,
-            center.array() + .30, direction, settings.foothold_backward_weight, other_platform);
+            center.array() + .30, direction, settings.foothold_backward_weight, other_platform,
+            TerrainLayer::kGround, OccupiedSupports(input, phases, leg));
         const Eigen::Vector3d hip = input.position.head<3>() +
             Rotation(input.position) * robot.hips.row(leg).transpose();
         double priority = (hip - initial.row(leg).transpose()).norm() / robot.reach_max[leg];

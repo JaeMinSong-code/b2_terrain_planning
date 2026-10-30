@@ -1,9 +1,9 @@
 /**
  * @file terrain_reuse_test.cpp
  * @brief 지도 영역 이동 시 이전 궤적 재사용과 변경 지형의 착지점 재검사를 검증한다.
- * @version 0.0.3
+ * @version 0.0.4
+ * @update 2026-10-30: 점유 제외로 후보가 소진돼도 현재 발 초기값으로 SQP에 진입하는지 검증함.
  * @update 2026-10-29: 지면·발 중심 변환과 반경 누락·중복 방지 회귀를 검증함.
- * @update 2026-10-25: 사후 지도 검사 없이 기존 지형 비용과 착지점 계산이 유지되는지 검증함.
  */
 #include "b2_terrain_planner/planner.h"
 
@@ -65,6 +65,17 @@ int main() {
       Check(std::abs(raised.footholds(leg, 2) - 0.02) < settings.terrain.contact_tolerance,
             "landing height was not updated");
     }
+    // 큰 셀 하나가 모든 초기 검색 범위를 덮어도, 점유 제외는 발행 거부가 아니다.
+    Input occupied = input;
+    occupied.terrain->resolution = 1.0;
+    occupied.terrain->origin = Eigen::Vector2d::Constant(-2.0);
+    occupied.contact_estimated = std::array<bool, 4>{true, true, true, true};
+    Settings seed_settings = settings;
+    seed_settings.graduated_initialization = false;
+    seed_settings.max_iterations = 1;
+    const auto exhausted = Solve(robot, occupied, seed_settings);
+    Check(exhausted.optimization_started,
+          "occupied candidate exhaustion stopped before SQP: " + exhausted.status);
     Input unknown = input;
     unknown.terrain->valid.setZero();
     Check(!Solve(robot, unknown, settings, &initial).success,

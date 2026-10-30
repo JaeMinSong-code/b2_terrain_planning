@@ -1,9 +1,9 @@
 /**
  * @file terrain.h
  * @brief 정적 높이맵의 보간·유효성·착지 비용과 후보 검색 계약.
- * @version 0.0.11
+ * @version 0.0.12
+ * @update 2026-10-30: 초기 후보의 점유 셀·주변 1칸 제외와 후보 소진 계약을 추가함.
  * @update 2026-10-30: 발 충돌 회피 기본 가중치를 TAMOLS 논문 Table I의 0.001로 통일함.
- * @update 2026-10-30: 원본 관측 마스크와 TAMOLS 처리·평활·가상 바닥 및 후보 비용 계약을 추가함.
  */
 #ifndef B2_TERRAIN_PLANNER_TERRAIN_H_
 #define B2_TERRAIN_PLANNER_TERRAIN_H_
@@ -11,12 +11,16 @@
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 #include <Eigen/Core>
 
 namespace b2_terrain_planner {
 
 // 발 상태·계획은 foot 링크 원점(구 중심), 지도는 실제 지면의 절대 Z를 사용한다.
 inline constexpr double kDefaultFootRadius = 0.032;
+
+using SupportPositions =
+    std::vector<Eigen::Vector2d, Eigen::aligned_allocator<Eigen::Vector2d>>;
 
 // 높이맵의 수직 반경 근사다. 경사면 법선 방향의 정확한 구 접촉점은 아니다.
 inline double GroundToFootCenterZ(double ground_z, double foot_radius) {
@@ -63,6 +67,12 @@ class TerrainDomainError : public std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
+// 지도 자체는 조회 가능하지만 점유 영역 제외로 초기 후보가 소진된 경우다.
+class OccupiedFootholdError : public TerrainDomainError {
+ public:
+  using TerrainDomainError::TerrainDomainError;
+};
+
 struct TerrainSample {
   double height = 0.0;
   Eigen::Vector2d gradient = Eigen::Vector2d::Zero();
@@ -96,6 +106,9 @@ class TerrainModel {
                            TerrainLayer layer = TerrainLayer::kGround) const;
   CollisionResidual Separation(const Eigen::Vector2d& delta) const;
   bool IsQueryable(const Eigen::Vector2d& xy) const;
+  // origin은 셀 중심이다. 점유 셀과 대각선을 포함한 주변 1칸을 제외한다.
+  bool IsOccupiedCell(const Eigen::Vector2d& xy,
+                      const SupportPositions& occupied) const;
   // direction은 월드 XY 단위 진행 방향, 정지 시 Zero이다.
   double FootholdCost(const Eigen::Vector2d& xy, const Eigen::Vector2d& nominal,
                       const Eigen::Vector2d& direction, double backward_weight,
@@ -106,7 +119,8 @@ class TerrainModel {
                              const Eigen::Vector2d& direction = Eigen::Vector2d::Zero(),
                              double backward_weight = 0.0,
                              const std::function<bool(const Eigen::Vector3d&)>& admissible = {},
-                             TerrainLayer layer = TerrainLayer::kGround) const;
+                             TerrainLayer layer = TerrainLayer::kGround,
+                             const SupportPositions& occupied = {}) const;
   const HeightMap& map() const { return map_; }
   const HeightMap& processed_map() const { return processed_; }
   const Eigen::MatrixXd& smooth_heights() const { return smooth_; }

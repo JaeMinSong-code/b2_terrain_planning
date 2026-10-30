@@ -1,9 +1,9 @@
 /**
  * @file terrain.cpp
  * @brief 유효성 보존 높이맵 필터와 일관된 보간 미분·착지 후보 검색.
- * @version 0.0.11
+ * @version 0.0.12
+ * @update 2026-10-30: 후보 점수 계산 전에 지지발 점유 셀과 주변 1칸을 제외함.
  * @update 2026-10-30: 관측 마스크를 보존한 보간·필터·가상 바닥과 미관측·곡률·높이 후보 비용을 구현함.
- * @update 2026-10-29: 지도 지면과 발 중심의 높이 계약 및 반경 변환을 통일함.
  */
 #include "b2_terrain_planner/terrain.h"
 
@@ -367,15 +367,28 @@ double TerrainModel::FootholdCost(const Eigen::Vector2d& xy,
   return cost;
 }
 
+bool TerrainModel::IsOccupiedCell(
+    const Eigen::Vector2d& xy, const SupportPositions& occupied) const {
+  const Eigen::Array2d cell = ((xy - map_.origin) / map_.resolution).array() + 0.5;
+  for (const auto& support : occupied) {
+    const Eigen::Array2d support_cell =
+        ((support - map_.origin) / map_.resolution).array() + 0.5;
+    if ((cell.floor() - support_cell.floor()).abs().maxCoeff() <= 1.0) return true;
+  }
+  return false;
+}
+
 Eigen::Vector3d TerrainModel::FindFoothold(const Eigen::Vector2d& nominal,
                                          const Eigen::Vector2d& lower,
                                          const Eigen::Vector2d& upper,
                                          const Eigen::Vector2d& direction,
                                          double backward_weight,
                                          const std::function<bool(const Eigen::Vector3d&)>& admissible,
-                                         TerrainLayer layer) const {
+                                         TerrainLayer layer,
+                                         const SupportPositions& occupied) const {
   double best = std::numeric_limits<double>::infinity();
   Eigen::Vector3d result = Eigen::Vector3d::Zero();
+  bool occupied_candidate = false;
   auto consider = [&](const Eigen::Vector2d& xy) {
     if ((xy.array() < lower.array()).any() || (xy.array() > upper.array()).any() ||
         !IsQueryable(xy)) return;
@@ -383,6 +396,10 @@ Eigen::Vector3d TerrainModel::FindFoothold(const Eigen::Vector2d& nominal,
     const Eigen::Vector3d foot(
         xy.x(), xy.y(), GroundToFootCenterZ(sample.height, settings_.foot_radius));
     if (admissible && !admissible(foot)) return;
+    if (IsOccupiedCell(xy, occupied)) {
+      occupied_candidate = true;
+      return;
+    }
     const double cost = FootholdCost(xy, nominal, direction, backward_weight, layer);
     if (cost < best) {
       best = cost;
@@ -397,7 +414,10 @@ Eigen::Vector3d TerrainModel::FindFoothold(const Eigen::Vector2d& nominal,
       consider(map_.origin + map_.resolution * Eigen::Vector2d(col, row));
     }
   }
-  if (!std::isfinite(best)) throw TerrainDomainError("no valid terrain foothold candidate");
+  if (!std::isfinite(best)) {
+    if (occupied_candidate) throw OccupiedFootholdError("all terrain foothold candidates occupied");
+    throw TerrainDomainError("no valid terrain foothold candidate");
+  }
   return result;
 }
 }  // namespace b2_terrain_planner

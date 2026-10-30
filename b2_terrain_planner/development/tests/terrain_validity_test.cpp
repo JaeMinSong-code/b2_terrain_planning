@@ -1,9 +1,9 @@
 /**
  * @file terrain_validity_test.cpp
  * @brief 착지 높이 조회 유효성과 경계 비용 유효성의 분리를 검증한다.
- * @version 0.0.4
+ * @version 0.0.5
+ * @update 2026-10-30: 점유 3×3 셀·비격자 후보 제외와 바깥 셀 보존을 검증함.
  * @update 2026-10-30: 미관측 주변의 경계 비용 유지와 원본 마스크 보존을 검증함.
- * @update 2026-10-29: 지면·발 중심 변환과 반경 누락·중복 방지 회귀를 검증함.
  */
 #include "b2_terrain_planner/terrain.h"
 
@@ -38,7 +38,42 @@ Eigen::Vector2d CellCenter(const HeightMap& map, int row, int col) {
   return map.origin + map.resolution * Eigen::Vector2d(col + 0.5, row + 0.5);
 }
 
+void CheckOccupiedCandidates() {
+  HeightMap map = StepMap();
+  map.heights.setZero();
+  const TerrainModel terrain(map, TerrainSettings());
+  const Eigen::Vector2d support = map.origin + map.resolution * Eigen::Vector2d(12, 12);
+  const SupportPositions occupied{support};
+  for (int y = -2; y <= 2; ++y) {
+    for (int x = -2; x <= 2; ++x) {
+      const Eigen::Vector2d point = support + map.resolution * Eigen::Vector2d(x, y);
+      bool excluded = false;
+      try {
+        terrain.FindFoothold(point, point, point, Eigen::Vector2d::Zero(), 0.0, {},
+                             TerrainLayer::kGround, occupied);
+      } catch (const OccupiedFootholdError&) {
+        excluded = true;
+      }
+      Check(excluded == (std::abs(x) <= 1 && std::abs(y) <= 1),
+            "occupied mask must exclude exactly the 3x3 cell neighborhood");
+    }
+  }
+  // 셀 중심이 아닌 nominal도 점유 셀 안이면 후보로 들어가면 안 된다.
+  const Eigen::Vector2d nominal = support + Eigen::Vector2d(0.019, -0.018);
+  const auto found = terrain.FindFoothold(
+      nominal, support.array() - 0.2, support.array() + 0.2,
+      Eigen::Vector2d::Zero(), 0.0, {}, TerrainLayer::kGround, occupied);
+  Check((found.head<2>() - support).cwiseAbs().maxCoeff() >= 0.099,
+        "non-grid nominal bypassed the occupied-cell exclusion");
+  const auto unoccupied = terrain.FindFoothold(nominal, nominal, nominal);
+  Check((unoccupied.head<2>() - nominal).norm() < 1e-12,
+        "empty occupied list changed candidate selection");
+  Check(terrain.map().valid.isOnes() && terrain.map().heights.isZero(),
+        "candidate occupancy modified terrain data");
+}
+
 void Run() {
+  CheckOccupiedCandidates();
   TerrainSettings settings;
 
   const TerrainModel full(StepMap(), settings);

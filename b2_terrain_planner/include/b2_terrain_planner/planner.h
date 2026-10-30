@@ -1,9 +1,9 @@
 /**
  * @file planner.h
  * @brief 평지·지형 trot의 SQP 입력·출력 및 시간 구간 계획 계약.
- * @version 0.0.33
+ * @version 0.0.34
+ * @update 2026-10-30: 접촉 추정 입력의 초기 후보 점유 제외 용도를 명시함.
  * @update 2026-10-30: 이전 착지점 유지 기본 가중치를 TAMOLS 논문 Table I의 0.01로 통일함.
- * @update 2026-10-30: 공유 지형 처리와 제한된 단계별 초기화의 설정·진단을 추가함.
  */
 #ifndef B2_TERRAIN_PLANNER_PLANNER_H_
 #define B2_TERRAIN_PLANNER_PLANNER_H_
@@ -66,7 +66,8 @@ struct Input {
   std::array<bool, 4> fixed{false, false, false, false};
   // 이미 이륙한 발의 확정 착지점. 현재 실측 feet와 분리하여 XYZ를 하드 제약으로 유지한다.
   std::array<std::optional<Eigen::Vector3d>, 4> committed_footholds;
-  // 초기 지면 검사 전용. 없으면 gait 접촉을 사용하며 미래 접촉 스케줄은 바꾸지 않는다.
+  // 초기 지면 검사와 후보 점유 제외에 사용한다. 없으면 현재 gait 접촉을 사용한다.
+  // 미래 접촉 스케줄은 바꾸지 않는다.
   std::optional<std::array<bool, 4>> contact_estimated;
   std::string frame = "odom";
   std::optional<HeightMap> terrain;  // 없으면 기존 평지 계산 경로를 사용한다.
