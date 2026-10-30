@@ -35,7 +35,7 @@ GUI·RViz·지도·TAMOLS·시각화 TF를 함께 실행하고, 지도 입력은
 비평지 sim `--tamols --rviz`의 기본 표시는 `RawElevationMap`이며,
 `CorrectedElevationMap`을 별도로 켜서 실제 SQP 입력과 비교한다.
 `map_datum_reanchor.enabled: true`, `support_patch.enabled: true`로 planner 입력에만
-전역 지면 오프셋과 반폭 0.05m 접촉 패치를 적용한다. CuPy raw 셀은 바꾸지 않는다.
+전역 지면 오프셋과 반폭 0.025m 접촉 패치를 적용한다. CuPy raw 셀은 바꾸지 않는다.
 raw 진단에서 datum을 끄더라도 지도는 지면, 발 위치는 중심이라는 기준은 유지한다. CuPy 시작 초기화는
 `use_initializer_at_start: true`로 켜 로봇 아래 미관측 영역만 한 번 채운다. odom 추정기와 CuPy 내부 융합 설정은 바꾸지 않는다.
 sim `--tamols`는 원본·보정 지도와 발 상태·odom 전체 메시지를 deploy의
@@ -147,13 +147,13 @@ B2 튜닝값은 유지한다. 수평 pitch/roll 선호는 지형 정렬 활성 �
 
 `b2_terrain.yaml`의 `planner.wbc`에서 `support_patch.enabled: true`이면,
 `contact_confirmed && contact_estimated`인 발 주변 셀을 `발 중심 Z − foot_radius`인 지면 높이로 기억한다.
-기본 `support_patch.half_width: 0.05`는 X/Y 각 방향 5 cm(10×10 cm) 영역이다.
+기본 `support_patch.half_width: 0.025`는 X/Y 각 방향 2.5 cm(전체 5×5 cm) 영역이다.
 필터·미분·보간을 위해 영역을 자동으로 넓히지 않는다. 해당 영역 안의 셀 중심만
 갱신하므로 실제 표시 경계는 지도 해상도에 따른다. 겹치면 가장 가까운 접촉 발을 따른다.
 
 기억한 셀은 발을 들어도 유지하며, 새 원본 지도가 도착해도 지우지 않는다.
-같은 셀에 다시 접촉하면 최신 발 중심에서 반경을 뺀 지면 높이로 갱신한다. 지도 이동 시 동일 좌표의 셀을 유지하고
-로컬 지도 밖의 기억은 버린다. 지도 frame·해상도 변경, ROS 시각 역행, 노드 재시작 시
+같은 셀에 다시 접촉하면 최신 발 중심에서 반경을 뺀 지면 높이로 갱신한다. 지도 이동 시 최근접 셀로
+옮기며 로컬 지도 밖의 기억은 버린다. 이번 폭 축소는 반복 반올림에 따른 위치 오차를 수정하지 않는다. 지도 frame·해상도 변경, ROS 시각 역행, 노드 재시작 시
 기억을 초기화한다. 기억은 현재 로컬 지도 크기로 제한하며 파일에서 복원하지 않는다.
 
 발 링크 원점은 구 중심이다. 접촉 기록 때 반경을 한 번 빼고 기억을 재적용할 때는 빼지 않는다.

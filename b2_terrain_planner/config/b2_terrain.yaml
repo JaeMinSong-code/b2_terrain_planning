@@ -139,14 +139,14 @@ planner:
     map_max_age: 1.0
     require_map: true
     publish_markers: true
-  # 원본 지도 입력에 10×10 cm 접촉 기억 패치를 적용한다.
+  # 원본 지도 입력에 5×5 cm 접촉 기억 패치를 적용한다.
   # 전역 z 재정착: 확인 지지발 FK 높이와 지도 높이의 median 차를 변화율 제한으로
   # 추적해 solve 입력 지도 전체를 이동한다. mapping drift compensation이 셀 간
   # 일관성을 지키고, 여기 남는 지도↔발 공통 오프셋을 발 실측으로 제거한다.
   wbc:
     map_topic: /elevation_mapping_node/elevation_map_raw
     support_patch.enabled: true
-    support_patch.half_width: 0.05
+    support_patch.half_width: 0.025
     # 패치 수명. KF odom z drift(~3mm/s) 때문에 오래된 패치는 옛 datum 화석이
     # 되어 가짜 둔덕(실측 4cm 섬 → 이상 착지 씨앗)을 만든다. 2초면 drift 영향
     # ≤6mm이고 제자리 트롯은 ~1.1초마다 같은 자리를 재관측해 패치가 갱신된다.

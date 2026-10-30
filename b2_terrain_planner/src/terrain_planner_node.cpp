@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.41
+ * @version 0.0.42
+ * @update 2026-10-30: 접촉 기억 패치 기본 반폭을 0.025m로 줄여 5×5cm 영역에 기록함.
  * @update 2026-10-30: 이전 착지점 유지 ROS 기본 가중치를 논문 기준 0.01로 통일함.
- * @update 2026-10-30: 지형 처리 설정과 단계별 시간 진단 및 실제 h/h_s1/h_s2 지도 출력을 연결함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -100,7 +100,7 @@ class TerrainPlannerNode : public rclcpp::Node {
     settings_.terrain.foot_radius = foot_radius_;
     require_map_ = declare_parameter<bool>("require_map", true);
     support_patch_enabled_ = declare_parameter<bool>("support_patch.enabled", false);
-    support_patch_half_width_ = declare_parameter<double>("support_patch.half_width", 0.05);
+    support_patch_half_width_ = declare_parameter<double>("support_patch.half_width", 0.025);
     if (!std::isfinite(support_patch_half_width_) || support_patch_half_width_ <= 0) {
       throw std::invalid_argument("support_patch.half_width must be positive and finite");
     }
@@ -1371,7 +1371,7 @@ class TerrainPlannerNode : public rclcpp::Node {
   double handover_grace_ = -1.0;
   bool require_map_ = true;
   bool support_patch_enabled_ = false;
-  double support_patch_half_width_ = 0.05;
+  double support_patch_half_width_ = 0.025;
   double support_patch_max_age_sec_ = 2.0;
   SupportPatchMemory support_patch_memory_;
   bool map_datum_reanchor_enabled_ = false;
