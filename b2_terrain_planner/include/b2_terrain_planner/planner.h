@@ -1,9 +1,9 @@
 /**
  * @file planner.h
  * @brief 평지·지형 trot의 SQP 입력·출력 및 시간 구간 계획 계약.
- * @version 0.0.34
+ * @version 0.0.35
+ * @update 2026-11-03: 은퇴한 IK·지형 검증 결과 필드와 TerrainValidation 구조체를 제거함.
  * @update 2026-10-30: 접촉 추정 입력의 초기 후보 점유 제외 용도를 명시함.
- * @update 2026-10-30: 이전 착지점 유지 기본 가중치를 TAMOLS 논문 Table I의 0.01로 통일함.
  */
 #ifndef B2_TERRAIN_PLANNER_PLANNER_H_
 #define B2_TERRAIN_PLANNER_PLANNER_H_
@@ -198,13 +198,6 @@ struct Profile {
   std::vector<QpDiagnostic> qp_diagnostics;
 };
 
-struct TerrainValidation {
-  bool passed = false;
-  double max_contact_error = 0.0;
-  double min_foot_distance = 0.0;  // 측정값이며 성공 판정에 사용하지 않는다.
-  std::string reason;
-};
-
 // 동일한 모델·좌표계의 재계획 초기 추정값. 갱신 지형에서 다시 검증하며 실패한 계획은 재사용하지 않는다.
 struct SeedContext {
   double gait_time = 0.0;
@@ -270,13 +263,6 @@ struct Result {
   double cost = 0.0;
   double violation = 0.0;
   Profile profile;
-  // 이전 출력 소비자 호환용. 사후 검사 제거로 미측정(null/0)을 반환한다.
-  std::optional<TerrainValidation> terrain_validation;
-  std::optional<bool> kinematics_valid;
-  int ik_checks = 0;
-  double max_ik_error = 0;
-  std::optional<int> ik_failed_leg;
-  std::optional<double> ik_failed_time;
   Feet footholds = Feet::Zero();
   std::vector<Phase> phases;
   std::vector<Eigen::Matrix<double, 6, 5>> coefficients;  // Physical seconds.

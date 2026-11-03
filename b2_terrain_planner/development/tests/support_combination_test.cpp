@@ -1,9 +1,9 @@
 /**
  * @file support_combination_test.cpp
  * @brief 세 지지의 실제 발 조합·미분·몸통 계획과 trot 재개를 검증한다.
- * @version 0.0.4
+ * @version 0.0.5
+ * @update 2026-11-03: 제거한 IK 검증 결과 필드 검사를 정리함.
  * @update 2026-10-29: nominal 전용 중립 다리 기준점과 높이로 B2 옆방향 링크를 반영함.
- * @update 2026-10-29: midstance 식 (33)의 미분·좌표 불변성과 지지 중점 샘플링을 검증함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -229,8 +229,7 @@ void CheckPlanner() {
     const auto result = Solve(robot, input, settings);
     Check(result.success, "B2 three-support solve: " + result.status);
     Check(result.phases.size() == 1 && result.phases.front().contacts == contacts &&
-          result.margin_variable_count == 1 && result.ik_checks == 0 &&
-          !result.kinematics_valid, "wrong three-support plan or removed IK checker ran");
+          result.margin_variable_count == 1, "wrong three-support plan");
     const auto equality = std::find_if(result.constraint_groups.begin(), result.constraint_groups.end(),
         [](const auto& group) { return group.name == "giac-equality"; });
     Check(equality != result.constraint_groups.end() && equality->rows == 0,

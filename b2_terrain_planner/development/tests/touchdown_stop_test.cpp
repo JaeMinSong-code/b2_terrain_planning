@@ -1,9 +1,9 @@
 /**
  * @file touchdown_stop_test.cpp
  * @brief B2 모델의 착지 대기 목표 속도 감속과 기존 궤적 재사용·연결을 검증한다.
- * @version 0.0.3
+ * @version 0.0.4
+ * @update 2026-11-03: 제거한 IK·지형 검증 결과 필드 검사를 정리함.
  * @update 2026-10-29: midstance nominal 비용 설정으로 착지 대기 감속 회귀를 실행함.
- * @update 2026-10-25: 추가 정지 제약 없이 목표 속도 0으로 감속하는 기존 SQP 경로를 검증함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -71,8 +71,6 @@ void Run() {
   const auto slowed = Solve(robot, waiting, settings, &moving);
   Check(slowed.success, "zero-command hold failed: " + slowed.status);
   Check(slowed.warm_start.used, "landing wait discarded the previous plan seed");
-  Check(!slowed.terrain_validation && !slowed.kinematics_valid && slowed.ik_checks == 0,
-        "removed final checkers still ran");
   Check(slowed.profile.final_validation_seconds == 0 && slowed.profile.ik_seconds == 0,
         "removed post-processing still ran");
   for (double time : {0.0, .07, .14}) {

@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.42
+ * @version 0.0.43
+ * @update 2026-11-03: 은퇴한 IK 진단 필드 제거·공용 DefaultModelPath 적용·TAMOLS 진단 로그를 DEBUG로 낮춤.
  * @update 2026-10-30: 접촉 기억 패치 기본 반폭을 0.025m로 줄여 5×5cm 영역에 기록함.
- * @update 2026-10-30: 이전 착지점 유지 ROS 기본 가중치를 논문 기준 0.01로 통일함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -42,14 +42,6 @@
 
 namespace {
 using namespace b2_terrain_planner;
-
-std::string DefaultModelPath() {
-  const auto exe = std::filesystem::canonical("/proc/self/exe");
-  const auto installed = exe.parent_path().parent_path().parent_path() /
-      "share/b2_terrain_planner/model/unitree_b2/b2.urdf";
-  if (std::filesystem::exists(installed)) return installed.string();
-  return B2_BUILD_MODEL_PATH;
-}
 
 // ZYX(yaw,pitch,roll) 쿼터니언 변환.
 Eigen::Vector3d QuatToZyx(const Eigen::Quaterniond& q) {
@@ -351,7 +343,7 @@ class TerrainPlannerNode : public rclcpp::Node {
     const bool waiting = std::string(event) == "deferred" || std::string(event) == "state_rejected";
     if (!waiting || key != last_pipeline_log_key_ ||
         log_time - last_pipeline_log_time_ >= std::chrono::seconds(1)) {
-      RCLCPP_INFO(get_logger(), "TAMOLS_PIPELINE %s", message.data.c_str());
+      RCLCPP_DEBUG(get_logger(), "TAMOLS_PIPELINE %s", message.data.c_str());
       last_pipeline_log_key_ = key;
       last_pipeline_log_time_ = log_time;
     }
@@ -405,10 +397,6 @@ class TerrainPlannerNode : public rclcpp::Node {
         << ",\"worst_violation\":" << number(worst_violation)
         << ",\"warm_start\":" << std::quoted(result.warm_start.reason)
         << ",\"state_age\":" << number((now() - rclcpp::Time(stamp)).seconds())
-        << ",\"ik_checks\":" << result.ik_checks
-        << ",\"max_ik_error\":" << number(result.max_ik_error)
-        << ",\"ik_failed_leg\":" << result.ik_failed_leg.value_or(-1)
-        << ",\"ik_failed_time\":" << number(result.ik_failed_time.value_or(-1))
         << ",\"gait_time\":" << number(input.gait_time)
         << ",\"body_time\":" << number(BodyTime(input))
         << ",\"gait_hold_duration\":" << number(input.gait_hold_duration)
@@ -440,7 +428,7 @@ class TerrainPlannerNode : public rclcpp::Node {
     std_msgs::msg::String message;
     message.data = out.str();
     solve_status_pub_->publish(message);
-    RCLCPP_INFO(get_logger(), "TAMOLS_SOLVE %s", message.data.c_str());
+    RCLCPP_DEBUG(get_logger(), "TAMOLS_SOLVE %s", message.data.c_str());
   }
 
   void OnCommand(const geometry_msgs::msg::TwistStamped& message) {
@@ -470,7 +458,7 @@ class TerrainPlannerNode : public rclcpp::Node {
   }
 
   void InitRobot() {
-    auto model = std::make_shared<RobotModel>(DefaultModelPath());
+    auto model = std::make_shared<RobotModel>(DefaultModelPath(B2_BUILD_MODEL_PATH));
     ModelState state;
     for (int leg = 0; leg < 4; ++leg) {
       state.joints.segment<3>(3 * leg) << 0, 44.30 * M_PI / 180, -85.94 * M_PI / 180;
@@ -570,7 +558,7 @@ class TerrainPlannerNode : public rclcpp::Node {
     }
     map_datum_stamp_ns_ = stamp_ns;
     UpdateDatumOffset(&map_datum_, diffs, dt, map_datum_max_rate_);
-    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+    RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 5000,
                         "Map datum re-anchor: offset %.4f m (planner input only)",
                         map_datum_.offset);
   }
@@ -1010,7 +998,7 @@ class TerrainPlannerNode : public rclcpp::Node {
       const int count = support_patch_memory_.ApplyTo(
           &*input.terrain, rclcpp::Time(state.header.stamp).seconds(),
           support_patch_max_age_sec_);
-      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+      RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 5000,
                           "Support contact memory: %d cells, half-width %.3f m (planner input only)",
                           count, support_patch_half_width_);
     }

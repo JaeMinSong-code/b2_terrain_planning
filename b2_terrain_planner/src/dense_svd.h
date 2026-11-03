@@ -1,9 +1,9 @@
 /**
  * @file dense_svd.h
  * @brief SQP의 최소 노름 보정과 영공간을 동일한 절단 기준으로 계산한다.
- * @version 0.0.2
+ * @version 0.0.3
+ * @update 2026-11-03: 호출자 없는 singular_values() 접근자를 제거함.
  * @update 2026-10-14: 고정 Jacobian 보정에서 재사용할 의사 역행렬을 제공함.
- * @update 2026-10-14: Jacobi와 LAPACK SVD의 비교 가능한 공통 인터페이스를 추가함.
  */
 #ifndef B2_TERRAIN_PLANNER_SRC_DENSE_SVD_H_
 #define B2_TERRAIN_PLANNER_SRC_DENSE_SVD_H_
@@ -20,7 +20,6 @@ class DenseSvd {
   Eigen::VectorXd Solve(const Eigen::VectorXd& rhs) const;
   Eigen::MatrixXd PseudoInverse() const;
   int rank() const { return rank_; }
-  const Eigen::VectorXd& singular_values() const { return singular_values_; }
   const Eigen::MatrixXd& v() const { return v_; }
 
  private:

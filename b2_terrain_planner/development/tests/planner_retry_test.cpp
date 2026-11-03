@@ -1,9 +1,9 @@
 /**
  * @file planner_retry_test.cpp
  * @brief 지연·실패를 주입해 비동기 재계획과 성공해 보존 및 발행 차단을 검증한다.
- * @version 0.0.17
+ * @version 0.0.18
+ * @update 2026-11-03: 제거한 IK 검증 결과 필드 검사를 정리함.
  * @update 2026-10-28: development 폴더 이동에 맞춰 플래너 노드 소스 포함 경로를 조정함.
- * @update 2026-10-28: 지지 확인 후에도 보행 정지 중이면 감속하고 재개 시 연속 가속하는지 검증함.
  */
 #define B2_TERRAIN_PLANNER_NO_MAIN
 #include "../../src/terrain_planner_node.cpp"
@@ -616,8 +616,6 @@ struct TerrainPlannerRetryTest {
     model_settings.time_limit = 3;
     const auto held_result = Solve(node.robot_, held_model, model_settings);
     Check(held_result.success, "real-model two-support hold solve failed");
-    Check(!held_result.kinematics_valid && held_result.ik_checks == 0,
-          "hold still ran the removed final IK checker");
     std::cout << "PASS seed preservation, nonblocking state, immediate/bounded retries, "
                  "epoch/pause/command/clock publication guards, latched stance support, "
                  "command ramp, touchdown stop, retry-seed discard, "

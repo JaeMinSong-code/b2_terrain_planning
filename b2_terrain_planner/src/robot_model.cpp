@@ -1,9 +1,9 @@
 /**
  * @file robot_model.cpp
- * @brief RBDL의 이름 기반 관절 매핑·합성 관성·FK·제한 IK를 계산한다.
- * @version 0.0.5
+ * @brief RBDL의 이름 기반 관절 매핑·합성 관성·FK와 계획 모델 변환을 계산한다.
+ * @version 0.0.6
+ * @update 2026-11-03: 미사용 IK/Jacobian·질량행렬/바이어스를 제거하고 공용 DefaultModelPath를 구현함.
  * @update 2026-10-29: nominal 전용 중립 다리 기준점과 높이로 B2 옆방향 링크를 반영함.
- * @update 2026-10-21: 측정 관절값의 제한 경계 오버슈트는 허용하고 큰 이상값은 거부함.
  */
 #include "b2_terrain_planner/robot_model.h"
 
@@ -11,10 +11,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
-#include <Eigen/Cholesky>
 #include <Eigen/Eigenvalues>
 #include <rbdl/rbdl.h>
 #include <rbdl/rbdl_utils.h>
@@ -45,26 +45,6 @@ struct RobotModel::Impl {
     std::array<Eigen::Isometry3d, 4> origins;
     std::array<Eigen::Vector3d, 3> axes;
 
-    Eigen::Vector3d Point(const Eigen::Vector3d& joints,
-                          Eigen::Matrix3d* jacobian = nullptr) const {
-      Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
-      std::array<Eigen::Vector3d, 3> centers, directions;
-      for (int i = 0; i < 3; ++i) {
-        pose = pose * origins[i];
-        if (jacobian != nullptr) {
-          centers[i] = pose.translation();
-          directions[i] = pose.linear() * axes[i];
-        }
-        pose.rotate(Eigen::AngleAxisd(joints[i], axes[i]));
-      }
-      const Eigen::Vector3d point = pose * origins[3].translation();
-      if (jacobian != nullptr) {
-        for (int i = 0; i < 3; ++i) {
-          jacobian->col(i) = directions[i].cross(point - centers[i]);
-        }
-      }
-      return point;
-    }
   };
   std::array<LegChain, 4> chains;
   rb::Model model;
@@ -248,63 +228,11 @@ ModelSnapshot RobotModel::Evaluate(const ModelState& state) const {
     out.feet.row(leg) = rb::CalcBodyToBaseCoordinates(model, q, p.feet[leg], Eigen::Vector3d::Zero(), false).transpose();
     out.hips.row(leg) = rb::CalcBodyToBaseCoordinates(model, q, p.hips[leg], Eigen::Vector3d::Zero(), false).transpose();
   }
-  out.mass_matrix = Eigen::MatrixXd::Zero(model.qdot_size, model.qdot_size);
-  rb::CompositeRigidBodyAlgorithm(model, q, out.mass_matrix, false);
-  out.bias = Eigen::VectorXd::Zero(model.qdot_size);
-  rb::NonlinearEffects(model, q, dq, out.bias);
   if (!std::isfinite(out.mass) || out.mass <= 0 || !out.inertia_body.allFinite() ||
       Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(out.inertia_body).eigenvalues().minCoeff() <= 0) {
     throw std::runtime_error("invalid B2 mass/inertia");
   }
   return out;
-}
-
-Eigen::Matrix3d RobotModel::LegJacobian(const ModelState& state, int leg) const {
-  if (leg < 0 || leg >= 4) throw std::invalid_argument("invalid leg");
-  auto model = impl_->model;
-  const auto q = impl_->Positions(state);
-  Eigen::MatrixXd full = Eigen::MatrixXd::Zero(3, model.qdot_size);
-  rb::CalcPointJacobian(model, q, impl_->feet[leg], Eigen::Vector3d::Zero(), full, true);
-  Eigen::Matrix3d result;
-  for (int i = 0; i < 3; ++i) result.col(i) = full.col(impl_->indices[3 * leg + i]);
-  return result;
-}
-
-LegIkResult RobotModel::LegIk(int leg, const Eigen::Vector3d& target_body,
-                             const Eigen::Vector3d& seed) const {
-  if (leg < 0 || leg >= 4 || !target_body.allFinite() || !seed.allFinite()) {
-    throw std::invalid_argument("invalid IK query");
-  }
-  const auto& chain = impl_->chains[leg];
-  const Eigen::Vector3d lower = impl_->lower.segment<3>(3 * leg);
-  const Eigen::Vector3d upper = impl_->upper.segment<3>(3 * leg);
-  LegIkResult result;
-  result.joints = seed.cwiseMax(lower).cwiseMin(upper);
-  for (int iteration = 0; iteration < 80; ++iteration) {
-    Eigen::Matrix3d jacobian;
-    const Eigen::Vector3d point = chain.Point(result.joints, &jacobian);
-    const Eigen::Vector3d error = target_body - point;
-    result.error = error.norm();
-    if (result.error < 1e-6) { result.success = true; break; }
-    Eigen::Vector3d step = jacobian.transpose() *
-        (jacobian * jacobian.transpose() + 1e-8 * Eigen::Matrix3d::Identity()).ldlt().solve(error);
-    double scale = std::min(1.0, .2 / std::max(1e-12, step.norm()));
-    bool accepted = false;
-    for (int search = 0; search < 12; ++search) {
-      const Eigen::Vector3d trial = (result.joints + scale * step).cwiseMax(lower).cwiseMin(upper);
-      const Eigen::Vector3d point_trial = chain.Point(trial);
-      if ((target_body - point_trial).norm() < result.error) {
-        result.joints = trial;
-        accepted = true;
-        break;
-      }
-      scale *= .5;
-    }
-    if (!accepted) break;
-  }
-  result.error = (target_body - chain.Point(result.joints)).norm();
-  result.success = result.error < 1e-6;
-  return result;
 }
 
 void RobotModel::PopulatePlanner(const ModelState& state, Robot* robot, Input* input) const {
@@ -341,5 +269,13 @@ void RobotModel::PopulatePlanner(const ModelState& state, Robot* robot, Input* i
   input->velocity.head<3>() = snapshot.com_velocity;
   input->velocity.tail<3>() = EulerRates(input->position.tail<3>(), state.base_angular_velocity);
   input->feet = snapshot.feet;
+}
+
+std::string DefaultModelPath(const std::string& build_fallback) {
+  const auto executable = std::filesystem::canonical("/proc/self/exe");
+  const auto installed = executable.parent_path().parent_path().parent_path() /
+      "share/b2_terrain_planner/model/unitree_b2/b2.urdf";
+  if (std::filesystem::exists(installed)) return installed.string();
+  return build_fallback;
 }
 }  // namespace b2_terrain_planner

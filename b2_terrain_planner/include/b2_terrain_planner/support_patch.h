@@ -1,9 +1,9 @@
 /**
  * @file support_patch.h
  * @brief 작은 접촉 발 영역을 로컬 지도 안에 기억하고 계획 입력에 반영한다.
- * @version 0.0.3
+ * @version 0.0.4
+ * @update 2026-11-03: 호출자 없는 SupportPatchHalfWidth shim을 제거함.
  * @update 2026-10-29: 지도 지면과 발 중심의 높이 계약 및 반경 변환을 통일함.
- * @update 2026-10-27: 패치 자동 확장을 제거하고 이륙 후에도 접촉 셀을 보존함.
  */
 #pragma once
 
@@ -13,9 +13,6 @@
 #include "b2_terrain_planner/terrain.h"
 
 namespace b2_terrain_planner {
-// half_width는 XY 각 축의 반폭이며 필터 크기에 맞춰 자동 확대하지 않는다.
-// 기존 호출 호환을 위해 resolution/sigma 인자를 유지한다.
-double SupportPatchHalfWidth(double requested, double resolution, double sigma);
 // feet는 발 중심이다. 기록 시 반경을 한 번 빼서 지면 높이로 보관한다.
 // stamps가 주어지면 기록한 셀에 stamp_sec을 적는다(수명 관리용, 선택적).
 int ApplySupportPatches(HeightMap* map,

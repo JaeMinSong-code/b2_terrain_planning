@@ -1,9 +1,9 @@
 /**
  * @file swing_terrain_test.cpp
  * @brief 스윙·지지발의 높이 불일치 허용과 다음 착지점의 지형 검사를 검증한다.
- * @version 0.0.7
+ * @version 0.0.8
+ * @update 2026-11-03: 제거한 terrain_validation 결과 필드 검사를 정리함.
  * @update 2026-10-30: 보간 높이 조회와 원본 관측 마스크를 구분해 스윙·접촉 계약을 검증함.
- * @update 2026-10-29: 지면·발 중심 변환과 반경 누락·중복 방지 회귀를 검증함.
  */
 #include "b2_terrain_planner/planner.h"
 
@@ -50,7 +50,6 @@ void Run(double gait_time) {
   Check(result.success, "airborne replan failed: " + result.status);
   Check(result.optimization_started && result.stage == "complete",
         "successful solve missing optimization/completion diagnostic");
-  Check(!result.terrain_validation, "removed final terrain checker still ran");
   for (int leg = 0; leg < 4; ++leg) {
     Check(std::abs(result.footholds(leg, 2)) < settings.terrain.contact_tolerance,
           "future landing is above flat terrain");
@@ -136,7 +135,6 @@ void CheckSupportHeightOffset() {
           "zero-command support hold failed with height offset: " + result.status);
     Check(result.seed_context.initial_feet.isApprox(input.feet),
           "current support feet were projected onto the terrain");
-    Check(!result.terrain_validation, "removed final terrain checker still ran");
     for (int leg = 0; leg < 4; ++leg) {
       Check(std::abs(result.footholds(leg, 2)) < settings.terrain.contact_tolerance,
             "future foothold inherited current support height offset");

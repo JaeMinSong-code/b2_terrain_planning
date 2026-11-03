@@ -1,9 +1,9 @@
 /**
  * @file support_patch.cpp
  * @brief 좁은 접촉 영역의 높이를 로컬 지도에 기억하고 입력 복사본에 적용한다.
- * @version 0.0.3
+ * @version 0.0.4
+ * @update 2026-11-03: 호출자 없는 SupportPatchHalfWidth shim을 제거함.
  * @update 2026-10-29: 지도 지면과 발 중심의 높이 계약 및 반경 변환을 통일함.
- * @update 2026-10-27: 패치 폭을 그대로 사용하고 접촉 셀 기억·이동·재착지를 반영함.
  */
 #include "b2_terrain_planner/support_patch.h"
 
@@ -14,14 +14,6 @@
 #include <utility>
 
 namespace b2_terrain_planner {
-double SupportPatchHalfWidth(double requested, double resolution, double sigma) {
-  if (!std::isfinite(requested) || requested <= 0 || !std::isfinite(resolution) ||
-      resolution <= 0 || !std::isfinite(sigma) || sigma <= 0) {
-    throw std::invalid_argument("invalid support patch geometry");
-  }
-  return requested;
-}
-
 int ApplySupportPatches(HeightMap* map,
                         const std::array<Eigen::Vector3d, 4>& feet,
                         const std::array<bool, 4>& contacts, double half_width,

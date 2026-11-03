@@ -1,7 +1,8 @@
 /**
  * @file robot_model.h
  * @brief B2 URDF의 RBDL 동역학·FK·관절 제한 IK와 planner 상태 변환.
- * @version 0.0.1
+ * @version 0.0.2
+ * @update 2026-11-03: 미사용 LegIk·LegJacobian·질량행렬/바이어스를 제거하고 공용 DefaultModelPath를 추가함.
  * @update 2026-10-13: 실제 B2 모델과 CoM 기준 계획 모델의 변환 계약을 추가함.
  */
 #ifndef B2_TERRAIN_PLANNER_ROBOT_MODEL_H_
@@ -37,14 +38,6 @@ struct ModelSnapshot {
   Eigen::Matrix3d inertia_body = Eigen::Matrix3d::Zero();
   FootMatrix feet = FootMatrix::Zero();
   FootMatrix hips = FootMatrix::Zero();
-  Eigen::MatrixXd mass_matrix;
-  Eigen::VectorXd bias;
-};
-
-struct LegIkResult {
-  bool success = false;
-  Eigen::Vector3d joints = Eigen::Vector3d::Zero();
-  double error = 0;
 };
 
 class RobotModel : public std::enable_shared_from_this<RobotModel> {
@@ -54,9 +47,6 @@ class RobotModel : public std::enable_shared_from_this<RobotModel> {
   RobotModel(const RobotModel&) = delete;
   RobotModel& operator=(const RobotModel&) = delete;
   ModelSnapshot Evaluate(const ModelState& state) const;
-  Eigen::Matrix3d LegJacobian(const ModelState& state, int leg) const;
-  LegIkResult LegIk(int leg, const Eigen::Vector3d& target_body,
-                    const Eigen::Vector3d& seed) const;
   // make_shared로 생성한 모델의 소유권도 Robot에 함께 연결한다.
   void PopulatePlanner(const ModelState& state, Robot* robot, Input* input) const;
   const JointVector& lower() const;
@@ -67,5 +57,9 @@ class RobotModel : public std::enable_shared_from_this<RobotModel> {
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+// 설치본의 share 경로에서 B2 URDF를 찾고, 없으면 build_fallback을 반환한다.
+// 두 실행파일(CLI·ROS 노드)이 같은 탐색 규칙을 공유한다.
+std::string DefaultModelPath(const std::string& build_fallback);
 }  // namespace b2_terrain_planner
 #endif  // B2_TERRAIN_PLANNER_ROBOT_MODEL_H_

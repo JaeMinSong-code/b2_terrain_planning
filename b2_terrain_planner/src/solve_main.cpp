@@ -1,9 +1,9 @@
 /**
  * @file solve_main.cpp
  * @brief ROS 없이 단일 설정의 예제 또는 개별 평지·지형 입력을 읽고 몸통 계획을 YAML로 출력한다.
- * @version 0.0.29
+ * @version 0.0.30
+ * @update 2026-11-03: 은퇴한 IK·지형 검증 직렬화를 제거하고 DefaultModelPath를 공용 함수로 대체함.
  * @update 2026-10-30: TAMOLS 지형 처리·초기화 설정과 단계별 계산 시간을 CLI에 연결함.
- * @update 2026-10-29: 지도 지면과 발 중심의 높이 계약 및 반경 변환을 통일함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -39,16 +39,9 @@ void ReadMatrix(const YAML::Node& node, Eigen::MatrixBase<Derived>& destination)
   }
 }
 
-std::string DefaultModelPath() {
-  const auto executable = std::filesystem::canonical("/proc/self/exe");
-  const auto installed = executable.parent_path().parent_path().parent_path() /
-      "share/b2_terrain_planner/model/unitree_b2/b2.urdf";
-  if (std::filesystem::exists(installed)) return installed.string();
-  return B2_BUILD_MODEL_PATH;
-}
-
 void InitializeB2(b2_terrain_planner::Robot* robot, b2_terrain_planner::Input* input) {
-  auto model = std::make_shared<b2_terrain_planner::RobotModel>(DefaultModelPath());
+  auto model = std::make_shared<b2_terrain_planner::RobotModel>(
+      b2_terrain_planner::DefaultModelPath(B2_BUILD_MODEL_PATH));
   b2_terrain_planner::ModelState state;
   for (int leg = 0; leg < 4; ++leg) {
     state.joints.segment<3>(3 * leg) << 0, 44.30 * std::acos(-1) / 180,
@@ -85,7 +78,8 @@ void ReadInput(const std::string& path, b2_terrain_planner::Robot* robot,
       ReadVector(config["base_angular_velocity_body"], state.base_angular_velocity);
       ReadVector(config["joint_positions"], state.joints);
       ReadVector(config["joint_velocities"], state.joint_velocities);
-      std::filesystem::path model_path = DefaultModelPath();
+      std::filesystem::path model_path =
+          b2_terrain_planner::DefaultModelPath(B2_BUILD_MODEL_PATH);
       if (node["model_path"]) {
         model_path = node["model_path"].as<std::string>();
         if (model_path.is_relative()) model_path = std::filesystem::path(path).parent_path() / model_path;
@@ -331,24 +325,10 @@ void Print(const b2_terrain_planner::Result& result, bool show_profile,
   output << YAML::EndSeq << YAML::Key << "reference_joints" << YAML::Value << YAML::Flow << YAML::BeginSeq;
   for (int index = 0; index < 12; ++index) output << robot.reference_joints[index];
   output << YAML::EndSeq << YAML::EndMap;
-  PrintOptional(output, "kinematics_valid", result.kinematics_valid);
-  PrintOptional(output, "ik_failed_leg", result.ik_failed_leg);
-  PrintOptional(output, "ik_failed_time", result.ik_failed_time);
-  output << YAML::Key << "ik_checks" << YAML::Value << result.ik_checks
-         << YAML::Key << "max_ik_error" << YAML::Value << result.max_ik_error;
   output << YAML::Key << "variable_count" << YAML::Value << result.variable_count
          << YAML::Key << "margin_variable_count" << YAML::Value << result.margin_variable_count
          << YAML::Key << "constraint_count" << YAML::Value << result.constraint_count;
   PrintGroups(output, result.constraint_groups);
-  if (result.terrain_validation.has_value()) {
-    const auto& validation = *result.terrain_validation;
-    output << YAML::Key << "terrain_validation" << YAML::Value << YAML::BeginMap
-           << YAML::Key << "passed" << YAML::Value << validation.passed
-           << YAML::Key << "reason" << YAML::Value << validation.reason
-           << YAML::Key << "max_contact_error" << YAML::Value << validation.max_contact_error
-           << YAML::Key << "min_foot_distance" << YAML::Value << validation.min_foot_distance
-           << YAML::EndMap;
-  }
   if (show_profile) {
     const auto& p = result.profile;
     output << YAML::Key << "profile" << YAML::Value << YAML::BeginMap

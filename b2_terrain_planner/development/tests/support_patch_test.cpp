@@ -1,9 +1,9 @@
 /**
  * @file support_patch_test.cpp
  * @brief 접촉 지도 보정의 조회 가능성·높이·범위·접촉 마스크를 검증한다.
- * @version 0.0.4
+ * @version 0.0.5
+ * @update 2026-11-03: 제거한 SupportPatchHalfWidth 대신 반폭 상수를 직접 사용하도록 조정함.
  * @update 2026-10-30: 보간 높이 조회와 원본 관측 마스크를 구분해 스윙·접촉 계약을 검증함.
- * @update 2026-10-29: 지면·발 중심 변환과 반경 누락·중복 방지 회귀를 검증함.
  */
 #include "b2_terrain_planner/support_patch.h"
 #include "b2_terrain_planner/map_datum.h"
@@ -37,7 +37,7 @@ void Run(double resolution) {
   }
   const auto original = map;
   TerrainSettings settings;
-  const double half_width = SupportPatchHalfWidth(0.30, resolution, settings.smoothing_sigma);
+  const double half_width = 0.30;  // XY 각 축 반폭. 필터 크기에 맞춘 자동 확대는 없다.
   Check(ApplySupportPatches(&map, feet, {true, true, true, true}, half_width) > 0,
         "no cells patched");
   const TerrainModel terrain(map, settings);
@@ -81,8 +81,7 @@ void RunMemory(double resolution) {
   raw.variance = Eigen::MatrixXd::Constant(n, n, 0.01);
   std::array<Eigen::Vector3d, 4> feet{};
   feet[0] << 0.013, 0.021, 0.12;
-  const double width = SupportPatchHalfWidth(0.05, resolution, 0.5);
-  Check(width == 0.05, "filter enlarged the contact footprint");
+  const double width = 0.05;
   SupportPatchMemory memory;
   memory.SyncLayout(raw);
   memory.Observe(feet, {true, false, false, false}, width);
