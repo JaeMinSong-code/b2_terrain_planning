@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.43
+ * @version 0.0.44
+ * @update 2026-11-04: 이륙 전 지형 기반 회피 스윙 선택과 package-local 설정을 연결함.
  * @update 2026-11-03: 은퇴한 IK 진단 필드 제거·공용 DefaultModelPath 적용·TAMOLS 진단 로그를 DEBUG로 낮춤.
- * @update 2026-10-30: 접촉 기억 패치 기본 반폭을 0.025m로 줄여 5×5cm 영역에 기록함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -86,6 +86,18 @@ class TerrainPlannerNode : public rclcpp::Node {
       throw std::invalid_argument("handover_grace must not be NaN");
     }
     swing_height_ = declare_parameter<double>("swing_height", 0.10);
+    step_swing_.enabled = declare_parameter<bool>("step_swing.enabled", true);
+    step_swing_.proximity = declare_parameter<double>("step_swing.proximity", 0.05);
+    step_swing_.height_threshold =
+        declare_parameter<double>("step_swing.height_threshold", 0.05);
+    step_swing_.retract_distance =
+        declare_parameter<double>("step_swing.retract_distance", 0.05);
+    for (double value : {step_swing_.proximity, step_swing_.height_threshold,
+                         step_swing_.retract_distance}) {
+      if (!std::isfinite(value) || value <= 0.0) {
+        throw std::invalid_argument("step_swing distances must be finite and positive");
+      }
+    }
     // 구형 발 반경은 착지·패치·스윙·datum의 중심-지면 변환에 공통 사용한다.
     swing_terrain_clearance_ = declare_parameter<double>("swing_terrain_clearance", 0.03);
     foot_radius_ = declare_parameter<double>("foot_radius", kDefaultFootRadius);
@@ -746,6 +758,10 @@ class TerrainPlannerNode : public rclcpp::Node {
           next.apex_z = std::max(next.position.z(), next.target.z()) + swing_height_;
         }
         if (swing_terrain) {
+          // 진행 중인 발의 첫 수신에서는 새 후퇴 동작을 시작하지 않는다.
+          if (phase.start >= 1e-9 || state.contact_confirmed[leg]) {
+            next.SelectStepShape(*swing_terrain, step_swing_, foot_radius_);
+          }
           next.ShapeOverTerrain(*swing_terrain, swing_terrain_clearance_,
                                 foot_radius_);
         }
@@ -1353,6 +1369,7 @@ class TerrainPlannerNode : public rclcpp::Node {
   // 파라미터.
   std::string state_topic_, state_frame_, map_topic_, elevation_layer_, plan_topic_, frame_;
   std::string active_frame_ = "odom";
+  StepSwingSettings step_swing_;
   double swing_terrain_clearance_ = 0.03;
   double foot_radius_ = kDefaultFootRadius;
   double plan_rate_hz_ = 10.0, sample_dt_ = 0.02, swing_height_ = 0.10;

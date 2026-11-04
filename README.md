@@ -122,6 +122,9 @@ ros2 run b2_terrain_planner terrain_planner_node --ros-args \
 `scripts/generate_config.py`가 기존 이름의 ROS 파라미터 YAML과 CLI 예제 YAML을 설치
 경로에 생성한다. 생성 파일을 직접 수정하지 말고 원본을 고친 뒤 사용하는 설치 경로를 다시
 빌드한다. RViz 화면은 `config/*.rviz`에서 관리한다. 필드 설명은 design_notes를 참고한다.
+단차 회피 스윙은 `planner.common`의 `step_swing.*`로 조절한다. 기존 스윙으로
+비교하려면 `step_swing.enabled: false`로 설정하고 재빌드·노드 재시작한다.
+현재 회피 스윙은 궤적·연결 시험까지 검증했으며 실제 단차 보행은 미검증이다.
 
 ## 저장소 구조
 

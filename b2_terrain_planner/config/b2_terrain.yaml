@@ -131,6 +131,11 @@ planner:
     station_keeping.max_velocity: 0.06
     sample_dt: 0.02
     swing_height: 0.1
+    # 이륙 전 단차 근처에서만 둥근 스플라인으로 교체한다. OFF면 기존 스윙.
+    step_swing.enabled: true
+    step_swing.proximity: 0.05  # 발 표면부터 조회하는 거리, m.
+    step_swing.height_threshold: 0.05  # 지면 높이 차 선택 기준, m.
+    step_swing.retract_distance: 0.05  # 상승 시 진행률 0.25의 후퇴 거리, m.
     # MuJoCo와 두 URDF의 foot 링크 원점 중심 구형 충돌체와 같은 반경.
     # 모든 지도는 지면 Z, 발 상태·착지·스윙은 중심 Z. 패치/flat은 반경을 빼고
     # 착지 후보·비용·재사용은 반경을 더한다. flat 노드에도 이 값을 생성해 전달한다.

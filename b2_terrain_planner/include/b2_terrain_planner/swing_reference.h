@@ -1,9 +1,9 @@
 /**
  * @file swing_reference.h
- * @brief 절대 스윙 시각을 보존하는 5차 발 궤적과 지형 부족 구간에 맞춘 Z 보정.
- * @version 0.0.8
+ * @brief 일반·단차 회피 스윙 스플라인 선택과 지형 부족 구간의 Z 보정.
+ * @version 0.0.9
+ * @update 2026-11-04: 발 주변 단차에 따라 둥근 상승·하강 스플라인을 선택하고 경계 p/v/a를 보존함.
  * @update 2026-10-29: 지형 기반 XY 후퇴와 전용 재조회를 제거하고 기본 XY·Z 보정을 유지함.
- * @update 2026-10-28: 발 크기 조회를 구형 발 반경 하나로 통일함.
  */
 #pragma once
 
@@ -16,7 +16,16 @@
 #include "b2_terrain_planner/terrain.h"
 
 namespace b2_terrain_planner {
+// 탐색 거리는 발 표면 기준이며 후퇴량은 진행률 0.25에서의 이륙점 기준 거리다.
+struct StepSwingSettings {
+  bool enabled = true;
+  double proximity = 0.05;
+  double height_threshold = 0.05;
+  double retract_distance = 0.05;
+};
+
 struct SwingReference {
+  enum class Shape { kNormal, kStepUp, kStepDown };
   struct Kinematics {
     Eigen::Vector3d position = Eigen::Vector3d::Zero();
     Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
@@ -31,6 +40,9 @@ struct SwingReference {
   Eigen::Vector3d acceleration = Eigen::Vector3d::Zero();
   Eigen::Vector3d target = Eigen::Vector3d::Zero();
   // Z 보정: 부족 최대값과 부족이 나타난 진행률 구간(유지 구간 양 끝).
+  Shape shape = Shape::kNormal;
+  Eigen::Vector2d retreat = Eigen::Vector2d::Zero();
+  double rounded_height = 0.0;
   double terrain_lift = 0.0;
   double lift_rise_end = 0.5;
   double lift_fall_start = 0.5;
@@ -96,8 +108,135 @@ struct SwingReference {
     return {value[0], -value[1] / width, value[2] / (width * width)};
   }
 
+  // 양 끝 p/v/a가 0인 다항 봉우리와 진행률 미분. 정지 경유점 없이 둥근
+  // 스플라인을 만들며, (3,5)는 초반 후퇴, (3,3)은 전체 구간의 상승에 쓴다.
+  static Eigen::Vector3d PolynomialBump(double phase, int left, int right) {
+    const double u = std::clamp(phase, 0.0, 1.0);
+    const double v = 1.0 - u;
+    const double peak = static_cast<double>(left) / (left + right);
+    const double scale = 1.0 / (std::pow(peak, left) * std::pow(1.0 - peak, right));
+    const double p = std::pow(u, left) * std::pow(v, right);
+    const double d = left * std::pow(u, left - 1) * std::pow(v, right) -
+                     right * std::pow(u, left) * std::pow(v, right - 1);
+    const double dd = left * (left - 1) * std::pow(u, left - 2) * std::pow(v, right) -
+        2 * left * right * std::pow(u, left - 1) * std::pow(v, right - 1) +
+        right * (right - 1) * std::pow(u, left) * std::pow(v, right - 2);
+    return scale * Eigen::Vector3d(p, d, dd);
+  }
+
+  Kinematics SampleRoundedKinematics(double time) const {
+    Kinematics sample;
+    const double duration = end - start;
+    if (duration <= 1e-9) {
+      sample.position = target;
+      return sample;
+    }
+    const double phase = std::clamp((time - start) / duration, 0.0, 1.0);
+    for (int axis = 0; axis < 3; ++axis) {
+      const auto value = Quintic(position[axis], velocity[axis], acceleration[axis],
+                                 target[axis], duration, time - start);
+      sample.position[axis] = value[0];
+      sample.velocity[axis] = value[1];
+      sample.acceleration[axis] = value[2];
+    }
+    if (shape == Shape::kStepUp) {
+      const auto pull = PolynomialBump(phase, 3, 5);
+      sample.position.head<2>() -= retreat * pull[0];
+      sample.velocity.head<2>() -= retreat * pull[1] / duration;
+      sample.acceleration.head<2>() -= retreat * pull[2] / (duration * duration);
+    }
+    Eigen::Vector3d lift = rounded_height * PolynomialBump(phase, 3, 3);
+    if (shape == Shape::kStepDown) {
+      // 하강 진행률을 s에서 s³로 옮긴다. XY 이동 시간은 압축하지 않으며
+      // 시작의 측정 v/a와 착지의 v=a=0을 그대로 보존한다.
+      const auto early = SmoothStep(phase);
+      const double square = phase * phase;
+      const auto late = SmoothStep(square * phase);
+      const Eigen::Vector3d delayed(late[0], 3.0 * square * late[1],
+          9.0 * square * square * late[2] + 6.0 * phase * late[1]);
+      lift += (target.z() - position.z()) * (delayed - early);
+    }
+    sample.position.z() += lift[0];
+    sample.velocity.z() += lift[1] / duration;
+    sample.acceleration.z() += lift[2] / (duration * duration);
+    return sample;
+  }
+
+  // 발 중심 앞의 좁은 반원에서 높이 차만 조회한다. 링크 충돌 검사가 아니며
+  // 유효 셀이 없으면 일반 궤적을 유지한다. 지면 기준에 발 반경은 한 번만 뺀다.
+  bool NearbyStep(const HeightMap& map, const Eigen::Vector3d& foot,
+                  const Eigen::Vector2d& direction, double sign,
+                  const StepSwingSettings& settings, double foot_radius) const {
+    const double radius = foot_radius + settings.proximity;
+    const Eigen::Vector2d index = (foot.head<2>() - map.origin) / map.resolution;
+    const double cells = radius / map.resolution;
+    // 지도 밖의 먼 좌표를 정수로 변환하지 않는다.
+    if (index.x() + cells < 0 || index.y() + cells < 0 ||
+        index.x() - cells > map.heights.cols() - 1 ||
+        index.y() - cells > map.heights.rows() - 1) return false;
+    const int x0 = static_cast<int>(std::max(0.0, std::floor(index.x() - cells)));
+    const int y0 = static_cast<int>(std::max(0.0, std::floor(index.y() - cells)));
+    const int x1 = static_cast<int>(std::min<double>(
+        map.heights.cols() - 1, std::ceil(index.x() + cells)));
+    const int y1 = static_cast<int>(std::min<double>(
+        map.heights.rows() - 1, std::ceil(index.y() + cells)));
+    const double ground = foot.z() - foot_radius;
+    for (int row = y0; row <= y1; ++row) {
+      for (int col = x0; col <= x1; ++col) {
+        if (!map.valid(row, col) || !std::isfinite(map.heights(row, col))) continue;
+        const Eigen::Vector2d delta = map.origin +
+            map.resolution * Eigen::Vector2d(col, row) - foot.head<2>();
+        const double along = delta.dot(direction);
+        const double across = std::abs(delta.x() * direction.y() -
+                                       delta.y() * direction.x());
+        if (along <= 0.0 || delta.squaredNorm() > radius * radius ||
+            across > foot_radius + 0.5 * map.resolution) continue;
+        if (sign * (map.heights(row, col) - ground) >= settings.height_threshold) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  // 이륙 전 후보를 만들 때 한 번 선택한다. 단차 선택 실패는 계획 거부가 아니라
+  // 기존 스윙 사용이다. 최적화의 착지점·위상·실행 중 곡선은 바꾸지 않는다.
+  void SelectStepShape(const HeightMap& map, const StepSwingSettings& settings,
+                       double foot_radius) {
+    shape = Shape::kNormal;
+    retreat.setZero();
+    rounded_height = 0.0;
+    if (!settings.enabled || end <= start || !std::isfinite(map.resolution) ||
+        map.resolution <= 0.0 || map.heights.size() == 0 ||
+        map.heights.rows() != map.valid.rows() || map.heights.cols() != map.valid.cols() ||
+        !map.origin.allFinite() || !position.allFinite() || !target.allFinite()) return;
+    const Eigen::Vector2d travel = target.head<2>() - position.head<2>();
+    if (travel.norm() < 1e-6) return;
+    const Eigen::Vector2d direction = travel.normalized();
+    if (target.z() < position.z() - settings.height_threshold) {
+      if (NearbyStep(map, position, direction, -1.0, settings, foot_radius) ||
+          NearbyStep(map, target, -direction, 1.0, settings, foot_radius)) {
+        shape = Shape::kStepDown;
+        rounded_height = std::max(0.0, apex_z - position.z());
+      }
+    } else if (NearbyStep(map, position, direction, 1.0, settings, foot_radius)) {
+      shape = Shape::kStepUp;
+      rounded_height = std::max(0.0, apex_z - 0.5 * (position.z() + target.z()));
+      constexpr double kPullPhase = 0.25;
+      Eigen::Vector2d early;
+      for (int axis = 0; axis < 2; ++axis) {
+        early[axis] = Quintic(position[axis], velocity[axis], acceleration[axis],
+                              target[axis], end - start, kPullPhase * (end - start))[0];
+      }
+      const double pull = std::max(0.0, settings.retract_distance +
+          (early - position.head<2>()).dot(direction));
+      retreat = direction * pull / PolynomialBump(kPullPhase, 3, 5)[0];
+    }
+  }
+
   // XY는 스윙 전체 시간을 사용한다. Z만 정점을 경유하는 두 5차 구간이다.
   Kinematics SampleBaseKinematics(double time) const {
+    if (shape != Shape::kNormal) return SampleRoundedKinematics(time);
     Kinematics sample;
     for (int axis = 0; axis < 3; ++axis) {
       auto value = Quintic(position[axis], velocity[axis], acceleration[axis],
@@ -138,7 +277,7 @@ struct SwingReference {
   }
 
   // 경계 부족을 그대로 반영하면 Z 상승·하강 구간이 지나치게 짧아진다.
-  // 기존 경계 제외를 유지하며 지형에 따른 XY 우회는 수행하지 않는다.
+  // 기존 경계 제외를 유지하며 선택한 XY 경로에 추가 우회를 넣지 않는다.
   static constexpr double kLiftEdgePhase = 0.15;
 
   // 기본 XY 경로에서 Z 부족 최대값과 유지 구간을 구한다.
@@ -189,7 +328,7 @@ struct SwingReference {
     }
   }
 
-  // 기본 XY 경로를 유지하고 부족 구간에 상승→유지→하강 Z 보정만 더한다.
+  // 선택한 스플라인의 XY 경로에서 기존 상승→유지→하강 Z 보정을 적용한다.
   // 착지점·착지 시각·양 끝 p/v/a를 유지하며 발행 거부 조건을 추가하지 않는다.
   void ShapeOverTerrain(const HeightMap& map, double clearance,
                         double foot_radius) {
@@ -198,6 +337,7 @@ struct SwingReference {
     lift_fall_start = 0.5;
     if (end <= start) return;
     const double travel = (target.head<2>() - position.head<2>()).norm() +
+                          2.0 * retreat.norm() +
                           (end - start) * velocity.head<2>().norm();
     const int intervals = std::max(16, static_cast<int>(
         std::ceil(2.0 * travel / map.resolution)));

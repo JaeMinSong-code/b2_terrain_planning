@@ -1,9 +1,9 @@
 /**
  * @file planner_retry_test.cpp
  * @brief 지연·실패를 주입해 비동기 재계획과 성공해 보존 및 발행 차단을 검증한다.
- * @version 0.0.18
+ * @version 0.0.19
+ * @update 2026-11-04: 단차 회피 스윙의 이륙 전 선택과 이륙 후 지도·설정 변경에도 곡선 보존을 검증함.
  * @update 2026-11-03: 제거한 IK 검증 결과 필드 검사를 정리함.
- * @update 2026-10-28: development 폴더 이동에 맞춰 플래너 노드 소스 포함 경로를 조정함.
  */
 #define B2_TERRAIN_PLANNER_NO_MAIN
 #include "../../src/terrain_planner_node.cpp"
@@ -310,11 +310,16 @@ struct TerrainPlannerRetryTest {
     Result plan;
     plan.footholds = measured;
     plan.footholds.col(0).array() += .1;
+    HeightMap swing_map;
+    swing_map.resolution = 0.01;
+    swing_map.origin = measured.row(1).head<2>().transpose() - Eigen::Vector2d(.2, .2);
+    swing_map.heights = Eigen::MatrixXd::Constant(41, 61, measured(1, 2) - node.foot_radius_);
+    swing_map.valid = Eigen::ArrayXXi::Ones(41, 61);
     const auto update = [&](double gait_time) {
       state.gait_time = gait_time;
       plan.seed_context.gait_time = gait_time;
       plan.phases = MakeHorizon(gait_time, node.robot_.period, node.robot_.duty);
-      node.UpdateSwingReferences(plan, measured, state);
+      node.UpdateSwingReferences(plan, measured, state, &swing_map);
     };
     update(0.0);
     const auto original = node.swing_references_[1];
@@ -348,7 +353,19 @@ struct TerrainPlannerRetryTest {
             "paused future swing retained stale start, target or apex");
     }
     state.gait_paused = false;
+    // 최종 이륙 후보의 앞 6cm부터 15cm 상승 단차를 둔다.
+    swing_map.origin = measured.row(1).head<2>().transpose() - Eigen::Vector2d(.2, .2);
+    swing_map.heights.setConstant(measured(1, 2) - node.foot_radius_);
+    swing_map.heights.rightCols(35).array() += .15;
+    plan.footholds(1, 2) = measured(1, 2) + .15;
+    update(.04);
     const auto committed = node.swing_references_[1];
+    Check(committed.shape == SwingReference::Shape::kStepUp,
+          "nearby riser did not select rounded swing through node");
+    swing_map.heights.setZero();
+    swing_map.valid.setZero();
+    const bool enabled = node.step_swing_.enabled;
+    node.step_swing_.enabled = false;
     state.contact_confirmed[1] = false;
     state.contact_confirmed[2] = false;
     // 이륙 경계와 진행 중에는 추정 위치·후보 착지점이 달라져도 실행 곡선을 보존한다.
@@ -382,6 +399,7 @@ struct TerrainPlannerRetryTest {
     Check((node.swing_references_[1].position - measured.row(1).transpose()).norm() < 1e-12 &&
           node.swing_references_[1].start > committed.end,
           "next swing inherited the completed swing start");
+    node.step_swing_.enabled = enabled;
   }
 
   static void Run() {

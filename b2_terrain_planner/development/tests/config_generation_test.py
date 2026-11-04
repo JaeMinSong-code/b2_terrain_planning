@@ -19,6 +19,16 @@ class ConfigGenerationTest(unittest.TestCase):
     def setUp(self):
         self.source = PACKAGE / 'config/b2_terrain.yaml'
 
+    def test_step_swing_parameters(self):
+        configs = load_configs(self.source)
+        for mode in ('wbc', 'flat'):
+            params = configs[f'terrain_planner_{mode}.yaml'][
+                'terrain_planner_node']['ros__parameters']
+            self.assertTrue(params['step_swing.enabled'])
+            self.assertEqual(params['step_swing.proximity'], 0.05)
+            self.assertEqual(params['step_swing.height_threshold'], 0.05)
+            self.assertEqual(params['step_swing.retract_distance'], 0.05)
+
     def test_runtime_modes(self):
         configs = load_configs(self.source)
         self.assertEqual(len(configs), 7)

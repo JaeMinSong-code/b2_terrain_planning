@@ -1,9 +1,9 @@
 /**
  * @file swing_reference_test.cpp
- * @brief 전체 시간 XY 5차 연결과 지형 여유 기반 Z 보정의 경계·속도 검증.
- * @version 0.0.7
+ * @brief 일반·단차 스윙 선택과 지형 보정의 경계·미분·방향·후퇴 동작 검증.
+ * @version 0.0.8
+ * @update 2026-11-04: 단차 스윙 선택·회전 방향·후퇴·하강 지연 및 경계 미분을 검증함.
  * @update 2026-10-29: 이륙 장애물에서도 XY p/v/a가 바뀌지 않는 지형 보정을 검증함.
- * @update 2026-10-28: 32mm 구형 발의 조회 범위와 기존 스윙 경계를 검증함.
  */
 #include "b2_terrain_planner/swing_reference.h"
 #undef NDEBUG
@@ -227,9 +227,147 @@ void CheckFailureDistance() {
             << " m/s, sampled=" << sampled_peak << " m/s\n";
   CheckConnections(curve);
 }
+
+// 지형과 궤적을 함께 회전시켜 전진·후진·옆걸음에서 같은 선택과 후퇴를 확인한다.
+void CheckStepShapes() {
+  using b2_terrain_planner::StepSwingSettings;
+  using ShapeKind = SwingReference::Shape;
+  const StepSwingSettings settings;
+  for (const Eigen::Vector2d direction : {Eigen::Vector2d(1, 0), Eigen::Vector2d(-1, 0),
+                                        Eigen::Vector2d(0, 1), Eigen::Vector2d(0, -1)}) {
+    auto map = MakeMap();
+    map.origin = Eigen::Vector2d(-0.5, -0.5);
+    map.heights = Eigen::MatrixXd::Zero(101, 101);
+    map.valid = Eigen::ArrayXXi::Ones(101, 101);
+    const auto fill_step = [&](double edge, bool ascending) {
+      for (int row = 0; row < map.heights.rows(); ++row) {
+        for (int col = 0; col < map.heights.cols(); ++col) {
+          const Eigen::Vector2d xy = map.origin + map.resolution * Eigen::Vector2d(col, row);
+          double height = 0.0;
+          if ((ascending && xy.dot(direction) >= edge) ||
+              (!ascending && xy.dot(direction) < edge)) height = 0.15;
+          map.heights(row, col) = height;
+        }
+      }
+    };
+    auto curve = MakeCurve();
+    curve.target.head<2>() = 0.25 * direction;
+    curve.target.z() += 0.15;
+    curve.apex_z = curve.target.z() + 0.1;
+    const auto original = curve;
+    fill_step(0.06, true);  // 발 중심 6cm, 발 표면에서 2.8cm 앞의 단차.
+    curve.SelectStepShape(map, settings, kRadius);
+    assert(curve.shape == ShapeKind::kStepUp);
+    const double quarter = curve.start + 0.25 * (curve.end - curve.start);
+    assert(std::abs((curve.Sample(quarter).first.head<2>() -
+                    curve.position.head<2>()).dot(direction) + settings.retract_distance) < 1e-10);
+    assert(curve.Sample(quarter).first.z() > curve.position.z());
+    // 선택한 XY를 기존 지형 보정에 사용하며 종점·시각을 바꾸지 않는다.
+    Shape(&curve, map);
+    CheckConnections(curve);
+    assert(curve.target.isApprox(original.target) && curve.end == original.end);
+    // 방향 전환에도 Z 속도가 남아 후퇴 뒤 전축이 정지하지 않는다.
+    double min_speed = 1e9;
+    double peak_speed = 0.0;
+    for (int i = 10; i <= 90; ++i) {
+      const double t = curve.start + 0.01 * i * (curve.end - curve.start);
+      const auto value = curve.SampleKinematics(t);
+      min_speed = std::min(min_speed, value.velocity.norm());
+      peak_speed = std::max(peak_speed, value.velocity.norm());
+      constexpr double dt = 1e-7;
+      const auto before = curve.SampleKinematics(t - dt);
+      const auto after = curve.SampleKinematics(t + dt);
+      assert(((after.position - before.position) / (2 * dt) - value.velocity).norm() < 1e-6);
+      assert(((after.velocity - before.velocity) / (2 * dt) - value.acceleration).norm() < 1e-4);
+    }
+    assert(min_speed > 0.01);
+    std::cout << "step-up speed=" << peak_speed << " m/s\n";
+    auto off = settings;
+    off.enabled = false;
+    curve.SelectStepShape(map, off, kRadius);
+    assert(curve.shape == ShapeKind::kNormal);
+    fill_step(0.12, true);
+    curve.SelectStepShape(map, settings, kRadius);
+    assert(curve.shape == ShapeKind::kNormal);  // 먼 단차에서는 교체하지 않는다.
+    fill_step(0.06, true);
+    map.valid.setZero();
+    curve.SelectStepShape(map, settings, kRadius);
+    assert(curve.shape == ShapeKind::kNormal);
+    map.valid.setOnes();
+
+    fill_step(0.06, false);
+    curve = MakeCurve();
+    curve.target.head<2>() = 0.25 * direction;
+    curve.position.z() += 0.15;
+    curve.apex_z = curve.position.z() + 0.1;
+    const auto normal_down = curve;
+    curve.SelectStepShape(map, settings, kRadius);
+    assert(curve.shape == ShapeKind::kStepDown);
+    Shape(&curve, map);
+    CheckConnections(curve);
+    const double late = curve.start + 0.8 * (curve.end - curve.start);
+    assert(curve.Sample(late).first.z() > normal_down.Sample(late).first.z());
+    for (int i = 1; i < 100; ++i) {
+      const double t = curve.start + 0.01 * i * (curve.end - curve.start);
+      const auto value = curve.SampleKinematics(t);
+      assert((value.position.head<2>() - normal_down.Sample(t).first.head<2>()).norm() < 1e-12);
+      constexpr double dt = 1e-7;
+      const auto before = curve.SampleKinematics(t - dt);
+      const auto after = curve.SampleKinematics(t + dt);
+      assert(((after.position - before.position) / (2 * dt) - value.velocity).norm() < 1e-6);
+      assert(((after.velocity - before.velocity) / (2 * dt) - value.acceleration).norm() < 1e-4);
+    }
+    // 착지점 뒤 벽이 가까우면 이륙점이 멀어도 하강형을 선택한다.
+    fill_step(0.20, false);
+    curve.SelectStepShape(map, settings, kRadius);
+    assert(curve.shape == ShapeKind::kStepDown);
+  }
+}
+
+void CheckStepSelectionAndBoundaries() {
+  const b2_terrain_planner::StepSwingSettings settings;
+  auto curve = MakeCurve();
+  curve.target.x() = 0.25;
+  auto map = MakeMap();
+  for (double height : {0.0, 0.049}) {
+    map.heights.rightCols(75).setConstant(height);
+    curve.SelectStepShape(map, settings, kRadius);
+    assert(curve.shape == SwingReference::Shape::kNormal);
+  }
+  map.heights.setZero();
+  map.heights(26, 20) = 0.15;  // 옆 단차는 진행 방향에 없다.
+  map.heights(20, 14) = 0.15;  // 뒤 단차도 선택에서 제외한다.
+  curve.SelectStepShape(map, settings, kRadius);
+  assert(curve.shape == SwingReference::Shape::kNormal);
+  map.heights.setZero();
+  map.heights.rightCols(75).setConstant(0.15);
+  curve.target.z() += 0.15;
+  curve.apex_z = curve.target.z() + 0.1;
+  curve.velocity = Eigen::Vector3d(0.02, -0.01, 0.03);
+  curve.acceleration = Eigen::Vector3d(0.1, -0.2, 0.3);
+  curve.SelectStepShape(map, settings, kRadius);
+  assert(curve.shape == SwingReference::Shape::kStepUp);
+  Shape(&curve, map);
+  for (auto shape : {SwingReference::Shape::kStepUp, SwingReference::Shape::kStepDown}) {
+    curve.shape = shape;
+    const auto first = curve.SampleKinematics(curve.start);
+    const auto last = curve.SampleKinematics(curve.end);
+    assert((first.position - curve.position).norm() < 1e-10);
+    assert((first.velocity - curve.velocity).norm() < 1e-10);
+    assert((first.acceleration - curve.acceleration).norm() < 1e-9);
+    assert((last.position - curve.target).norm() < 1e-10);
+    assert(last.velocity.norm() < 1e-10 && last.acceleration.norm() < 1e-9);
+  }
+  curve.target.head<2>() = curve.position.head<2>();
+  curve.SelectStepShape(map, settings, kRadius);
+  assert(curve.shape == SwingReference::Shape::kNormal);
+}
+
 }  // namespace
 
 int main() {
+  CheckStepShapes();
+  CheckStepSelectionAndBoundaries();
   CheckTerrain();
   CheckLateObstacle();
   CheckTakeoffRiser();
