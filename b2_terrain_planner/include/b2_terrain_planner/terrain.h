@@ -1,13 +1,14 @@
 /**
  * @file terrain.h
  * @brief 정적 높이맵의 보간·유효성·착지 비용과 후보 검색 계약.
- * @version 0.0.14
+ * @version 0.0.15
+ * @update 2026-11-05: 착지점 단계·지도 관측·비용 진단을 추가하고 제어 계산과 분리함.
  * @update 2026-11-04: 앞/뒤 좌우 발 쌍의 Y 간격에만 근접 지수 비용을 적용함.
- * @update 2026-11-04: 발 주변 셀·착지점의 방향별 지수 거리 비용을 연결함.
  */
 #ifndef B2_TERRAIN_PLANNER_TERRAIN_H_
 #define B2_TERRAIN_PLANNER_TERRAIN_H_
 
+#include <array>
 #include <functional>
 #include <stdexcept>
 #include <string>
@@ -88,6 +89,18 @@ struct TerrainSample {
       Eigen::Matrix<double, 4, 2>::Zero();
 };
 
+// 네 셀 순서: (x0,y0), (x1,y0), (x0,y1), (x1,y1). 관측은 solve 입력 기준이다.
+struct TerrainPointDiagnostic {
+  bool valid = false;  // 보간 영역 내부 여부이며 관측·착지 가능 판정이 아니다.
+  Eigen::Vector2i lower_cell = Eigen::Vector2i::Zero();
+  std::array<double, 4> weights{};
+  std::array<bool, 4> observed{};
+  std::array<double, 4> input_heights{};
+  std::array<double, 4> processed_heights{};
+  double height = 0.0;
+  double occlusion = 0.0;
+};
+
 struct TerrainResidual {
   Eigen::Matrix<double, 5, 1> values;
   Eigen::Matrix<double, 5, 3> jacobian;
@@ -112,6 +125,13 @@ class TerrainModel {
   // delta의 몸통 Y 투영만 사용한다. 호출자가 FL/FR 또는 RL/RR 쌍을 지정한다.
   CollisionResidual FootSeparation(const Eigen::Vector2d& delta,
                                   double heading) const;
+  TerrainPointDiagnostic Inspect(const Eigen::Vector2d& xy,
+                                 TerrainLayer layer = TerrainLayer::kGround) const;
+  // 순서: nominal, backward, edge, occlusion, curvature, virtual_height, separation.
+  std::array<double, 7> CandidateCosts(
+      const Eigen::Vector2d& xy, const Eigen::Vector2d& nominal,
+      const Eigen::Vector2d& direction, double backward_weight, TerrainLayer layer,
+      const SupportPositions& separation_supports, double heading) const;
   bool IsQueryable(const Eigen::Vector2d& xy) const;
   // origin은 셀 중심이다. 점유 셀과 대각선을 포함한 주변 1칸을 제외한다.
   bool IsOccupiedCell(const Eigen::Vector2d& xy,

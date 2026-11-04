@@ -78,6 +78,11 @@ install(FILES scripts/elevation_common.py DESTINATION lib/${PROJECT_NAME})
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(foothold_diagnostics_test development/tests/foothold_diagnostics_test.cpp)
+    target_link_libraries(foothold_diagnostics_test PRIVATE tamols_sqp)
+    add_test(NAME foothold_diagnostics_test COMMAND foothold_diagnostics_test)
+    set_tests_properties(foothold_diagnostics_test PROPERTIES
+        ENVIRONMENT "OPENBLAS_NUM_THREADS=1;OMP_NUM_THREADS=1;LD_LIBRARY_PATH=$<TARGET_FILE_DIR:tamols_sqp>:$ENV{LD_LIBRARY_PATH}")
     add_executable(lateral_separation_test development/tests/lateral_separation_test.cpp)
     target_link_libraries(lateral_separation_test PRIVATE tamols_sqp)
     add_test(NAME lateral_separation_test COMMAND lateral_separation_test)

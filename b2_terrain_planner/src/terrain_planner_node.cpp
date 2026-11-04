@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.46
+ * @version 0.0.47
+ * @update 2026-11-05: 원본·보정 지도와 단계별 착지점 진단을 solve_status로 발행함.
  * @update 2026-11-04: 앞/뒤 좌우 발 쌍의 Y 간격에만 근접 지수 비용을 적용함.
- * @update 2026-11-04: 발 주변 셀·착지점의 방향별 지수 거리 비용을 연결함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -201,6 +201,7 @@ class TerrainPlannerNode : public rclcpp::Node {
     std::uint64_t generation = 0;
     bool touchdown_stop = false;
     std::optional<HeightMap> swing_terrain;
+    double diagnostic_datum_offset = 0.0;
   };
 
   struct PublishedPlan {
@@ -436,7 +437,106 @@ class TerrainPlannerNode : public rclcpp::Node {
       out << "{\"leg\":" << attempt.leg << ",\"status\":" << std::quoted(attempt.status)
           << ",\"success\":" << attempt.success << ",\"elapsed\":" << number(attempt.elapsed) << '}';
     }
-    out << "]}";
+    out << "],\"foothold_diagnostics\":{\"schema_version\":1,\"enabled\":"
+        << settings_.foothold_diagnostics << ",\"frame\":" << std::quoted(input.frame)
+        << ",\"map_stamp_ns\":" << rclcpp::Time(pending.map_stamp).nanoseconds()
+        << ",\"datum_offset\":" << number(pending.diagnostic_datum_offset)
+        << ",\"capture_seconds\":" << number(result.foothold_diagnostic_seconds);
+    if (input.terrain) {
+      out << ",\"map_origin\":[" << number(input.terrain->origin.x()) << ','
+          << number(input.terrain->origin.y()) << "],\"resolution\":"
+          << number(input.terrain->resolution);
+    }
+    out << ",\"cost_names\":[";
+    for (std::size_t k = 0; k < kFootholdCostNames.size(); ++k) {
+      if (k > 0) out << ',';
+      out << std::quoted(kFootholdCostNames[k]);
+    }
+    out << "],\"candidate_cost_names\":[\"nominal\",\"backward\",\"edge\","
+           "\"occlusion\",\"curvature\",\"virtual_height\",\"separation\"],\"stages\":[";
+    for (std::size_t k = 0; k < result.foothold_trace.size(); ++k) {
+      if (k > 0) out << ',';
+      const auto& trace = result.foothold_trace[k];
+      out << "{\"stage\":" << std::quoted(trace.stage) << ",\"layer\":" << std::quoted(trace.layer)
+          << ",\"attempt_leg\":" << trace.attempt_leg << ",\"iteration\":" << trace.iteration
+          << ",\"crossing_leg\":" << trace.crossing_leg
+          << ",\"sqp_valid\":" << trace.sqp_valid << ",\"sqp_cost\":";
+      if (trace.sqp_valid) out << number(trace.total_cost);
+      else out << "null";
+      out << ",\"sqp_cost_terms\":[";
+      for (std::size_t j = 0; j < trace.sqp_costs.size(); ++j) {
+        if (j > 0) out << ',';
+        if (trace.sqp_valid) out << number(trace.sqp_costs[j]);
+        else out << "null";
+      }
+      out << "],\"violation\":";
+      if (trace.sqp_valid) out << number(trace.violation);
+      else out << "null";
+      if (trace.crossing_leg >= 0) {
+        out << ",\"merit\":" << number(trace.merit)
+            << ",\"scaled_violation\":" << number(trace.scaled_violation)
+            << ",\"alpha\":" << number(trace.alpha)
+            << ",\"penalty\":" << number(trace.penalty);
+      } else {
+        out << ",\"merit\":null,\"scaled_violation\":null,\"alpha\":null,\"penalty\":null";
+      }
+      out << ",\"feet\":[";
+      for (int leg = 0; leg < 4; ++leg) {
+        if (leg > 0) out << ',';
+        const auto& point = trace.terrain[leg];
+        out << "{\"leg\":" << leg << ",\"source\":" << std::quoted(trace.sources[leg])
+            << ",\"xyz\":[" << number(trace.feet(leg, 0)) << ',' << number(trace.feet(leg, 1))
+            << ',' << number(trace.feet(leg, 2)) << "],\"map_valid\":" << point.valid
+            << ",\"height\":";
+        if (point.valid) out << number(point.height);
+        else out << "null";
+        out << ",\"occlusion\":";
+        if (point.valid) out << number(point.occlusion);
+        else out << "null";
+        out << ",\"candidate_cost_valid\":" << trace.candidate_valid[leg]
+            << ",\"candidate_costs\":[";
+        for (int j = 0; j < 7; ++j) {
+          if (j > 0) out << ',';
+          if (trace.candidate_valid[leg]) out << number(trace.candidate_costs[leg][j]);
+          else out << "null";
+        }
+        out << "],\"cells\":[";
+        if (point.valid) {
+          for (int j = 0; j < 4; ++j) {
+            if (j > 0) out << ',';
+            const int col = point.lower_cell.x() + j % 2;
+            const int row = point.lower_cell.y() + j / 2;
+            out << "{\"col\":" << col << ",\"row\":" << row
+                << ",\"weight\":" << number(point.weights[j])
+                << ",\"input_observed\":" << point.observed[j] << ",\"input_height\":";
+            if (point.observed[j]) out << number(point.input_heights[j]);
+            else out << "null";
+            out << ",\"processed_height\":" << number(point.processed_heights[j])
+                << ",\"sensor_observed\":";
+            bool sensor_available = false;
+            bool sensor_observed = false;
+            if (pending.swing_terrain) {
+              const auto& raw = *pending.swing_terrain;
+              sensor_available = col >= 0 && row >= 0 && col < raw.heights.cols() &&
+                  row < raw.heights.rows();
+              if (sensor_available) {
+                sensor_observed = raw.valid(row, col) && std::isfinite(raw.heights(row, col));
+              }
+            }
+            if (sensor_available) out << sensor_observed;
+            else out << "null";
+            out << ",\"sensor_height\":";
+            if (sensor_observed) {
+              out << number(pending.swing_terrain->heights(row, col) - pending.diagnostic_datum_offset);
+            } else out << "null";
+            out << '}';
+          }
+        }
+        out << "]}";
+      }
+      out << "]}";
+    }
+    out << "]}}";
     std_msgs::msg::String message;
     message.data = out.str();
     solve_status_pub_->publish(message);
@@ -502,6 +602,7 @@ class TerrainPlannerNode : public rclcpp::Node {
     settings_.qp_eps_rel = 1e-3;
     settings_.qp_max_iterations = 4000;
     settings_.time_limit = declare_parameter<double>("time_limit", 0.1);
+    settings_.foothold_diagnostics = declare_parameter<bool>("foothold_diagnostics", true);
     settings_.orientation_limit =
         declare_parameter<double>("orientation_limit_deg", 60.0) * M_PI / 180.0;
     settings_.pitch_weight = declare_parameter<double>("pitch_weight", 10.0);
@@ -1033,6 +1134,7 @@ class TerrainPlannerNode : public rclcpp::Node {
     retry_requested_ = false;
     pending_solve_ = PendingSolve{input, state, map_stamp_, generation_,
                                   touchdown_stop_, swing_terrain};
+    if (map_datum_reanchor_enabled_) pending_solve_->diagnostic_datum_offset = map_datum_.offset;
     ++attempt_seq_;
     solve_state_stamp_ns_ = stamp_ns;
     solve_start_ns_ = now().nanoseconds();

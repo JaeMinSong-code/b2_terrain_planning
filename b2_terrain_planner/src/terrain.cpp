@@ -1,9 +1,9 @@
 /**
  * @file terrain.cpp
  * @brief 유효성 보존 높이맵 필터와 일관된 보간 미분·착지 후보 검색.
- * @version 0.0.14
+ * @version 0.0.15
+ * @update 2026-11-05: 착지점 단계·지도 관측·비용 진단을 추가하고 제어 계산과 분리함.
  * @update 2026-11-04: 앞/뒤 좌우 발 쌍의 Y 간격에만 근접 지수 비용을 적용함.
- * @update 2026-11-04: 발 주변 셀·착지점의 방향별 지수 거리 비용을 연결함.
  */
 #include "b2_terrain_planner/terrain.h"
 
@@ -373,6 +373,52 @@ CollisionResidual TerrainModel::FootSeparation(
       (2.0 * settings_.foot_separation_scale * distance) *
       (y * lateral);
   return result;
+}
+
+TerrainPointDiagnostic TerrainModel::Inspect(const Eigen::Vector2d& xy,
+                                            TerrainLayer layer) const {
+  TerrainPointDiagnostic out;
+  if (!xy.allFinite()) return out;
+  const Eigen::Vector2d v = (xy - map_.origin) / map_.resolution;
+  if (v.x() < 0 || v.y() < 0 || v.x() >= map_.heights.cols() - 1 ||
+      v.y() >= map_.heights.rows() - 1) return out;
+  out.lower_cell = v.array().floor().cast<int>();
+  const double x = v.x() - out.lower_cell.x();
+  const double y = v.y() - out.lower_cell.y();
+  out.weights = {(1 - x) * (1 - y), x * (1 - y), (1 - x) * y, x * y};
+  for (int k = 0; k < 4; ++k) {
+    const int col = out.lower_cell.x() + k % 2;
+    const int row = out.lower_cell.y() + k / 2;
+    out.observed[k] = map_.valid(row, col) && std::isfinite(map_.heights(row, col));
+    out.input_heights[k] = map_.heights(row, col);
+    out.processed_heights[k] = processed_.heights(row, col);
+    if (layer == TerrainLayer::kVirtualFloor) out.processed_heights[k] = virtual_.heights(row, col);
+    out.height += out.weights[k] * out.processed_heights[k];
+    if (!out.observed[k]) out.occlusion += out.weights[k];
+  }
+  out.valid = true;
+  return out;
+}
+
+std::array<double, 7> TerrainModel::CandidateCosts(
+    const Eigen::Vector2d& xy, const Eigen::Vector2d& nominal,
+    const Eigen::Vector2d& direction, double backward_weight, TerrainLayer layer,
+    const SupportPositions& separation_supports, double heading) const {
+  const auto sample = Sample(xy, layer);
+  const Eigen::Vector2d offset = xy - nominal;
+  const double behind = std::min(0.0, direction.dot(offset));
+  std::array<double, 7> costs{0.7 * offset.squaredNorm(), backward_weight * behind * behind,
+                            settings_.edge_weight * sample.edge.squaredNorm(), 0, 0, 0, 0};
+  if (settings_.pipeline_enabled && layer == TerrainLayer::kGround) {
+    costs[3] = settings_.occlusion_weight * sample.occlusion;
+    costs[4] = settings_.curvature_weight * sample.curvature_cost;
+    costs[5] = settings_.virtual_height_weight * std::pow(sample.height - sample.virtual_height, 2);
+  }
+  for (const auto& support : separation_supports) {
+    const auto residual = FootSeparation(xy - support, heading);
+    costs[6] += residual.value * residual.value;
+  }
+  return costs;
 }
 
 bool TerrainModel::IsQueryable(const Eigen::Vector2d& xy) const {

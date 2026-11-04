@@ -1,9 +1,9 @@
 /**
  * @file planner.cpp
  * @brief 접촉 조합별 생성 Jacobian과 지형 비용의 Gauss–Newton QP로 trot을 최적화한다.
- * @version 0.0.46
+ * @version 0.0.47
+ * @update 2026-11-05: 착지점 단계·지도 관측·비용 진단을 추가하고 제어 계산과 분리함.
  * @update 2026-11-04: 앞/뒤 좌우 발 쌍의 Y 간격에만 근접 지수 비용을 적용함.
- * @update 2026-11-04: 발 주변 셀·착지점의 방향별 지수 거리 비용을 연결함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -93,6 +93,7 @@ const std::array<std::string, kGroupCount> kGroupNames{
 
 struct Evaluation {
   double cost = 0.0;
+  std::array<double, 14> cost_terms{};
   Vector gradient;
   Matrix hessian;
   Vector values;
@@ -401,10 +402,14 @@ class Problem {
           // 확정 착지점은 지도 갱신·미관측 여부와 무관하게 전달받은 XYZ를 유지한다.
           const auto& committed = *input_.committed_footholds[leg];
           terrain_initial_.row(leg) = committed.transpose();
+          candidate_sources_[leg] = "committed_swing";
           continue;
         }
         double limit = 0.30;
-        if (FootFixed(leg)) limit = 0.0;
+        if (FootFixed(leg)) {
+          limit = 0.0;
+          candidate_sources_[leg] = "fixed";
+        }
         const Eigen::Vector2d nominal = nominal_.row(leg).transpose();
         occupied_supports_[leg] = OccupiedSupports(input_, phases_, leg);
         lateral_supports_[leg] = LateralSupport(input_, phases_, leg);
@@ -416,9 +421,40 @@ class Problem {
         } catch (const OccupiedFootholdError&) {
           // 후보 제외만으로 계산을 중단하지 않는다. 자기 발의 현재 XYZ에서 SQP를 계속한다.
           terrain_initial_.row(leg) = input_.feet.row(leg);
+          candidate_sources_[leg] = "occupied_fallback_current";
         }
       }
     }
+  }
+
+  std::array<std::string, 4> CandidateSources() const { return candidate_sources_; }
+
+  FootholdTrace Trace(const Feet& feet, const std::string& stage,
+                      const std::array<std::string, 4>& sources) const {
+    FootholdTrace trace;
+    trace.stage = stage;
+    trace.layer = "ground";
+    if (terrain_layer_ == TerrainLayer::kVirtualFloor) trace.layer = "virtual";
+    trace.sources = sources;
+    trace.feet = feet;
+    for (int leg = 0; leg < 4; ++leg) {
+      if (input_.fixed[leg]) trace.sources[leg] = "fixed";
+      if (input_.committed_footholds[leg]) trace.sources[leg] = "committed_swing";
+    }
+    if (!terrain_) return trace;
+    for (int leg = 0; leg < 4; ++leg) {
+      const Eigen::Vector2d xy = feet.row(leg).head<2>().transpose();
+      trace.terrain[leg] = terrain_->Inspect(xy, terrain_layer_);
+      try {
+        trace.candidate_costs[leg] = terrain_->CandidateCosts(
+            xy, nominal_.row(leg).transpose(), direction_, backward_weight_, terrain_layer_,
+            lateral_supports_[leg], input_.position[3]);
+        trace.candidate_valid[leg] = true;
+      } catch (const TerrainDomainError&) {
+        // 조회 불가를 기록할 뿐 제어 채택 조건에 사용하지 않는다.
+      }
+    }
+    return trace;
   }
 
   Vector Initial() const {
@@ -446,7 +482,8 @@ class Problem {
     return x;
   }
 
-  Vector Initial(const Result* previous, WarmStartDiagnostic* diagnostic, int replaced_leg = -1) const {
+  Vector Initial(const Result* previous, WarmStartDiagnostic* diagnostic, int replaced_leg = -1,
+                 std::array<std::string, 4>* sources = nullptr) const {
     Vector x = Initial();
     if (previous == nullptr) return x;
     diagnostic->requested = true;
@@ -613,6 +650,7 @@ class Problem {
             ++diagnostic->reach_reselected_footholds;
           }
           x.segment<3>(feet_offset_ + 3 * leg) = selected_terrain.row(leg).transpose();
+          if (sources) (*sources)[leg] = "reach_reselected";
         } catch (const TerrainDomainError&) {
           // 예측 몸통 자체를 SQP가 수정해야 하는 경우에는 원래 후보로 시작한다.
           ++diagnostic->reach_candidate_fallbacks;
@@ -654,6 +692,10 @@ class Problem {
           if (new_score + 1e-10 < old_score) continue;
         }
         x.segment<3>(feet_offset_ + 3 * leg) = foot;
+        if (sources) {
+          (*sources)[leg] = "previous_success";
+          if (!old.success) (*sources)[leg] = "retry_iterate";
+        }
         ++diagnostic->reused_footholds;
         continue;
       }
@@ -668,6 +710,7 @@ class Problem {
       *diagnostic = WarmStartDiagnostic();
       diagnostic->requested = true;
       diagnostic->reason = "nonfinite_shifted_plan";
+      if (sources) *sources = CandidateSources();
       return Initial();
     }
     diagnostic->used = true;
@@ -714,6 +757,7 @@ class Problem {
       const double residual = point.z() - height - floor.height;
       const double scale = weight * terrain_->settings().body_alignment_weight;
       out->cost += scale * residual * residual;
+      out->cost_terms[8] += scale * residual * residual;
       if (derivatives) {
         const Eigen::Matrix<double, 1, 6> j = jacobian.row(2) - floor.gradient.transpose() * jacobian.topRows<2>();
         Eigen::Matrix<double, 1, 30> row;
@@ -760,6 +804,7 @@ class Problem {
         if (derivatives) outputs[1] = derivative.data();
         tamols_nominal_kinematics(arguments, outputs, nullptr, nullptr, 0);
         out->cost += nominal_kinematics_weight_ * residual.squaredNorm();
+        out->cost_terms[9] += nominal_kinematics_weight_ * residual.squaredNorm();
         if (!derivatives) continue;
         Matrix jacobian = Matrix::Zero(3, size_);
         for (int axis = 0; axis < 6; ++axis) {
@@ -851,7 +896,10 @@ class Problem {
       const int foot_column = feet_offset_ + foot_dimensions_ * leg;
       const Eigen::Vector2d offset = x.segment<2>(foot_column) - nominal_.row(leg).transpose();
       const double behind = std::min(0.0, direction_.dot(offset));
-      if (need_cost) out.cost += backward_weight_ * behind * behind;
+      if (need_cost) {
+        out.cost += backward_weight_ * behind * behind;
+        out.cost_terms[0] += backward_weight_ * behind * behind;
+      }
       if (full && behind < 0) {
         out.gradient.segment<2>(foot_column) += 2 * backward_weight_ * behind * direction_;
         out.hessian.block<2, 2>(foot_column, foot_column) +=
@@ -862,7 +910,10 @@ class Problem {
         // 직전 해 anchor 비용: 인접 solve 간 발 목표 점프를 누른다(논문 V-B.6).
         if (previous_footholds_[leg] && previous_foothold_weight_ > 0) {
           const double held = x[column] - (*previous_footholds_[leg])[axis];
-          if (need_cost) out.cost += previous_foothold_weight_ * held * held;
+          if (need_cost) {
+            out.cost += previous_foothold_weight_ * held * held;
+            out.cost_terms[1] += previous_foothold_weight_ * held * held;
+          }
           if (full) {
             out.gradient[column] += 2 * previous_foothold_weight_ * held;
             out.hessian(column, column) += 2 * previous_foothold_weight_;
@@ -882,7 +933,11 @@ class Problem {
         // XY 등식은 유지하므로 지도 구멍이 생겨도 착지점은 변하지 않는다.
         if (!input_.committed_footholds[leg]) {
           const auto residual = terrain_->Residual(x.segment<3>(column), terrain_layer_);
-          if (need_cost) out.cost += residual.values.squaredNorm();
+          if (need_cost) {
+            out.cost += residual.values.squaredNorm();
+            out.cost_terms[2] += residual.values[0] * residual.values[0];
+            out.cost_terms[3] += residual.values.tail<4>().squaredNorm();
+          }
           if (full) {
             out.gradient.segment<3>(column).noalias() +=
                 2 * residual.jacobian.transpose() * residual.values;
@@ -904,8 +959,11 @@ class Problem {
         const Feet feet = Configuration(x, landed);
         for (int i = 0; i < 4; ++i) {
           for (int j = i + 1; j < 4; ++j) {
-            auto add_separation = [&](const CollisionResidual& residual) {
-              if (need_cost) out.cost += residual.value * residual.value;
+            auto add_separation = [&](const CollisionResidual& residual, int cost_group) {
+              if (need_cost) {
+                out.cost += residual.value * residual.value;
+                out.cost_terms[cost_group] += residual.value * residual.value;
+              }
               if (full) {
                 Eigen::RowVectorXd row = Eigen::RowVectorXd::Zero(size_);
                 if (landed[i]) row.segment<2>(feet_offset_ + 3 * i) += residual.gradient.transpose();
@@ -915,10 +973,10 @@ class Problem {
               }
             };
             const Eigen::Vector2d delta = (feet.row(i) - feet.row(j)).head<2>().transpose();
-            add_separation(terrain_->Separation(delta));
+            add_separation(terrain_->Separation(delta), 4);
             // 앞/뒤 좌우 쌍만 몸통 Y 간격을 벌린다. X 방향 비용은 더하지 않는다.
             if (i % 2 == 0 && j == i + 1) {
-              add_separation(terrain_->FootSeparation(delta, input_.position[3]));
+              add_separation(terrain_->FootSeparation(delta, input_.position[3]), 5);
             }
           }
         }
@@ -993,7 +1051,10 @@ class Problem {
         // 위치·속도는 고정 앞부분과의 C1 연결로 이미 지정했다.
         const Matrix jacobian = join.middleRows(12, 6);
         const Vector residual = value.tail(6) - target_join.tail(6);
-        if (need_cost) out.cost += residual.squaredNorm();
+        if (need_cost) {
+          out.cost += residual.squaredNorm();
+          out.cost_terms[6] += residual.squaredNorm();
+        }
         if (full) {
           out.gradient.noalias() += 2 * jacobian.transpose() * residual;
           out.hessian.noalias() += 2 * jacobian.transpose() * jacobian;
@@ -1001,7 +1062,10 @@ class Problem {
       }
       if (margin_[k] >= 0) {
         const int column = margin_[k];
-        if (need_cost) out.cost += 0.007 * x[column];
+        if (need_cost) {
+          out.cost += 0.007 * x[column];
+          out.cost_terms[7] += 0.007 * x[column];
+        }
         if (full) out.gradient[column] += 0.007;
         group = kGiacInequality;
         local_row = -1;
@@ -1139,7 +1203,13 @@ class Problem {
           throw std::runtime_error("generated kernel failed");
         }
         Matrix jacobian_g;
-        if (need_cost) out.cost += weight * residual.squaredNorm();
+        if (need_cost) {
+          out.cost += weight * residual.squaredNorm();
+          out.cost_terms[10] += weight * residual.head<3>().squaredNorm();
+          out.cost_terms[11] += weight * residual.segment<3>(3).squaredNorm();
+          out.cost_terms[12] += weight * residual.segment<3>(6).squaredNorm();
+          out.cost_terms[13] += weight * residual.tail<3>().squaredNorm();
+        }
         if (block_assembly_ && need_jacobian) {
           auto compose = [&](const Matrix& derivative) {
             Matrix local(derivative.rows(), columns.size());
@@ -1352,6 +1422,7 @@ class Problem {
   double nominal_kinematics_weight_ = 7.0;
   Vector parameters_;
   Eigen::Matrix<double, 4, 2, Eigen::RowMajor> nominal_;
+  std::array<std::string, 4> candidate_sources_{"candidate", "candidate", "candidate", "candidate"};
   std::array<SupportPositions, 4> occupied_supports_;
   std::array<SupportPositions, 4> lateral_supports_;
   std::array<std::optional<Eigen::Vector2d>, 4> previous_footholds_{};
@@ -2299,13 +2370,49 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
     }
     const Result* seed = previous;
     if (initializer) seed = initializer;
-    Vector x = problem.Initial(seed, &result.warm_start, replaced_leg);
-    if (refined) {
-      for (int leg = 0; leg < 4; ++leg) {
-        if ((*refined)[leg]) problem.ReplaceFootholdSeed(leg, *(*refined)[leg], &x);
+    auto sources = problem.CandidateSources();
+    auto trace = [&](const Feet& feet, const std::string& stage,
+                     const Evaluation* evaluation = nullptr) -> FootholdTrace* {
+      if (!settings.foothold_diagnostics || !terrain_pointer) return nullptr;
+      const auto diagnostic_begin = Clock::now();
+      auto record = problem.Trace(feet, stage, sources);
+      record.attempt_leg = replaced_leg;
+      if (evaluation) {
+        record.sqp_valid = true;
+        record.sqp_costs = evaluation->cost_terms;
+        record.total_cost = evaluation->cost;
+        record.violation = Violation(*evaluation, Vector::Ones(evaluation->values.size()));
+      }
+      result.foothold_trace.push_back(std::move(record));
+      result.foothold_diagnostic_seconds +=
+          std::chrono::duration<double>(Clock::now() - diagnostic_begin).count();
+      return &result.foothold_trace.back();
+    };
+    if (settings.foothold_diagnostics && terrain_pointer) result.foothold_trace.reserve(14);
+    if (settings.foothold_diagnostics && terrain_pointer) {
+      trace(problem.InitialFootholds(problem.Initial()), "candidate");
+    }
+    Vector x = problem.Initial(seed, &result.warm_start, replaced_leg, &sources);
+    if (initializer) {
+      for (auto& source : sources) {
+        if (source == "previous_success" || source == "retry_iterate") source = "coarse_solution";
       }
     }
-    if (alternative != nullptr) problem.ReplaceFootholdSeed(alternative->leg, alternative->seed, &x);
+    if (settings.foothold_diagnostics && terrain_pointer) {
+      trace(problem.InitialFootholds(x), "after_reuse");
+    }
+    if (refined) {
+      for (int leg = 0; leg < 4; ++leg) {
+        if ((*refined)[leg]) {
+          problem.ReplaceFootholdSeed(leg, *(*refined)[leg], &x);
+          sources[leg] = "refined_candidate";
+        }
+      }
+    }
+    if (alternative != nullptr) {
+      problem.ReplaceFootholdSeed(alternative->leg, alternative->seed, &x);
+      sources[alternative->leg] = "alternative_height";
+    }
     if (initial_feet != nullptr && input.terrain.has_value()) {
       *initial_feet = problem.InitialFootholds(x);
     }
@@ -2316,6 +2423,22 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
         std::isfinite(previous->seed_penalty)) {
       penalty = std::clamp(previous->seed_penalty, 10.0, 1e6);
     }
+    std::array<bool, 4> crossed{};
+    std::optional<FootholdTrace> final_trace;
+    auto remember_final = [&](const Evaluation& evaluation) {
+      if (!settings.foothold_diagnostics || !terrain_pointer) return;
+      const auto diagnostic_begin = Clock::now();
+      // 위치와 이미 계산한 비용만 보존한다. 지도·후보 비용은 종료 시 한 번 조회한다.
+      if (!final_trace) final_trace.emplace();
+      final_trace->feet = problem.InitialFootholds(x);
+      final_trace->iteration = result.iterations;
+      final_trace->sqp_valid = true;
+      final_trace->sqp_costs = evaluation.cost_terms;
+      final_trace->total_cost = evaluation.cost;
+      final_trace->violation = result.violation;
+      result.foothold_diagnostic_seconds +=
+          std::chrono::duration<double>(Clock::now() - diagnostic_begin).count();
+    };
     int small_improvements = 0;
     result.stage = "optimization";
     result.status = "iteration_limit";
@@ -2327,6 +2450,10 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
       result.cost = eval.cost;
       result.violation = Violation(eval, Vector::Ones(eval.values.size()));
       problem.Describe(x, eval, &result);
+      remember_final(eval);
+      if (iteration == 0 && settings.foothold_diagnostics && terrain_pointer) {
+        trace(problem.InitialFootholds(x), "sqp_start", &eval);
+      }
       if (elapsed() >= settings.time_limit) {
         result.status = "time_limit";
         break;
@@ -2399,10 +2526,41 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
           } else {
             small_improvements = 0;
           }
+          if (settings.foothold_diagnostics && terrain_pointer) {
+            const auto diagnostic_begin = Clock::now();
+            const double prior_diagnostic_seconds = result.foothold_diagnostic_seconds;
+            const Feet before = problem.InitialFootholds(x);
+            const Feet after = problem.InitialFootholds(trial_x);
+            for (int leg = 0; leg < 4; ++leg) {
+              if (crossed[leg]) continue;
+              const auto old_map = terrain_pointer->Inspect(before.row(leg).head<2>().transpose());
+              const auto new_map = terrain_pointer->Inspect(after.row(leg).head<2>().transpose());
+              if (!old_map.valid || !new_map.valid || old_map.occlusion > 1e-9 ||
+                  new_map.occlusion <= 1e-9) continue;
+              crossed[leg] = true;
+              auto* from = trace(before, "first_unobserved_before", &eval);
+              from->crossing_leg = leg;
+              from->iteration = iteration + 1;
+              from->merit = current_merit;
+              from->scaled_violation = current_violation;
+              from->penalty = penalty;
+              from->alpha = alpha;
+              auto* to = trace(after, "first_unobserved_after", &candidate);
+              to->crossing_leg = leg;
+              to->iteration = iteration + 1;
+              to->merit = merit;
+              to->scaled_violation = Violation(candidate, scaling);
+              to->penalty = penalty;
+              to->alpha = alpha;
+            }
+            result.foothold_diagnostic_seconds = prior_diagnostic_seconds +
+                std::chrono::duration<double>(Clock::now() - diagnostic_begin).count();
+          }
           x = trial_x;
           result.cost = candidate.cost;
           result.violation = candidate_violation;
           problem.Describe(x, candidate, &result);
+          remember_final(candidate);
           accepted_violation = candidate_violation;
           accepted = true;
           break;
@@ -2429,6 +2587,14 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
         result.status = "line_search_failed";
         break;
       }
+    }
+    if (final_trace) {
+      auto* last = trace(final_trace->feet, "sqp_final");
+      last->sqp_valid = true;
+      last->sqp_costs = final_trace->sqp_costs;
+      last->total_cost = final_trace->total_cost;
+      last->violation = final_trace->violation;
+      last->iteration = final_trace->iteration;
     }
     const bool resumable = result.status == "time_limit" || result.status == "iteration_limit" ||
                            result.status == "line_search_failed";
@@ -2491,6 +2657,8 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
   }
   if (input.hold_contacts && std::all_of(input.hold_contacts->begin(), input.hold_contacts->end(),
                                        [](bool contact) { return contact; })) new_slot = false;
+  std::vector<FootholdTrace> preparation_trace;
+  double preparation_diagnostics = 0.0;
   std::optional<Result> coarse;
   std::array<std::optional<Eigen::Vector3d>, 4> refined;
   const double preparation_end = settings.time_limit * settings.graduated_budget_fraction;
@@ -2501,6 +2669,8 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
     warm.time_limit = preparation_end - elapsed();
     Result candidate = SolveAttempt(robot, input, warm, previous, nullptr, nullptr,
                                     prepared, TerrainLayer::kVirtualFloor);
+    preparation_diagnostics = candidate.foothold_diagnostic_seconds;
+    preparation_trace = std::move(candidate.foothold_trace);
     initialization_status = "coarse_fallback:" + candidate.status;
     if ((candidate.success || candidate.seed_available) && elapsed() < preparation_end) {
       const auto phases = MakeHorizon(input.gait_time, robot.period, robot.duty,
@@ -2526,6 +2696,31 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
                                               input.position[3], LateralSupport(input, phases, leg));
         } catch (const TerrainDomainError&) { complete = false; break; }
       }
+      if (settings.foothold_diagnostics) {
+        const auto diagnostic_begin = Clock::now();
+        FootholdTrace trace;
+        trace.stage = "refinement_discarded";
+        if (complete) trace.stage = "refinement_selected";
+        trace.layer = "ground";
+        trace.feet = candidate.footholds;
+        for (int leg = 0; leg < 4; ++leg) {
+          trace.sources[leg] = "not_refined";
+          if (!refined[leg]) continue;
+          trace.sources[leg] = "refined_candidate";
+          trace.feet.row(leg) = refined[leg]->transpose();
+          const Eigen::Vector2d xy = refined[leg]->head<2>();
+          trace.terrain[leg] = prepared->Inspect(xy);
+          try {
+            trace.candidate_costs[leg] = prepared->CandidateCosts(
+                xy, candidate.footholds.row(leg).head<2>().transpose(), direction,
+                settings.foothold_backward_weight, TerrainLayer::kGround,
+                LateralSupport(input, phases, leg), input.position[3]);
+            trace.candidate_valid[leg] = true;
+          } catch (const TerrainDomainError&) {}
+        }
+        preparation_trace.push_back(std::move(trace));
+        preparation_diagnostics += std::chrono::duration<double>(Clock::now() - diagnostic_begin).count();
+      }
       if (complete) {
         coarse = std::move(candidate);
         initialization_status = "refined_virtual_floor";
@@ -2546,6 +2741,10 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
   Result result = SolveAttempt(robot, input, final_settings, previous, nullptr, &initial,
                               prepared, TerrainLayer::kGround, initializer, refined_ptr);
   auto finish = [&]() {
+    result.foothold_trace.insert(result.foothold_trace.begin(),
+        std::make_move_iterator(preparation_trace.begin()),
+        std::make_move_iterator(preparation_trace.end()));
+    result.foothold_diagnostic_seconds += preparation_diagnostics;
     result.terrain_snapshot = terrain;
     result.terrain_processing_seconds = processing_seconds;
     result.terrain_initialization_seconds = initialization_seconds;
@@ -2606,6 +2805,18 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
       entry.second.elapsed = trial.elapsed;
       entry.second.success = trial.success;
       attempts.push_back(entry.second);
+      preparation_diagnostics += result.foothold_diagnostic_seconds;
+      preparation_trace.insert(preparation_trace.end(),
+          std::make_move_iterator(result.foothold_trace.begin()),
+          std::make_move_iterator(result.foothold_trace.end()));
+      result.foothold_trace.clear();
+      if (!trial.success) {
+        preparation_diagnostics += trial.foothold_diagnostic_seconds;
+        preparation_trace.insert(preparation_trace.end(),
+            std::make_move_iterator(trial.foothold_trace.begin()),
+            std::make_move_iterator(trial.foothold_trace.end()));
+        result.foothold_diagnostic_seconds = 0.0;
+      }
       if (trial.success) { result = std::move(trial); break; }
     }
   }

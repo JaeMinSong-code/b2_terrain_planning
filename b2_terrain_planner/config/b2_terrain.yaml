@@ -117,6 +117,7 @@ planner:
     terrain.virtual_height_weight: 100.0
     terrain.body_alignment_weight: 100.0
     # 발 주변 셀·최종 착지점의 거리 비용. 앞/뒤 좌우 쌍의 몸통 Y 간격 8cm 안쪽에서 급증한다.
+    foothold_diagnostics: true  # 단계별 착지점·지도·비용 진단. 제어 조건과 독립.
     terrain.foot_separation_weight: 0.1
     terrain.foot_separation_distance_y: 0.08
     terrain.foot_separation_scale: 0.01

@@ -1,9 +1,9 @@
 /**
  * @file planner.h
  * @brief 평지·지형 trot의 SQP 입력·출력 및 시간 구간 계획 계약.
- * @version 0.0.35
+ * @version 0.0.36
+ * @update 2026-11-05: 착지점 단계·지도 관측·비용 진단을 추가하고 제어 계산과 분리함.
  * @update 2026-11-03: 은퇴한 IK·지형 검증 결과 필드와 TerrainValidation 구조체를 제거함.
- * @update 2026-10-30: 접촉 추정 입력의 초기 후보 점유 제외 용도를 명시함.
  */
 #ifndef B2_TERRAIN_PLANNER_PLANNER_H_
 #define B2_TERRAIN_PLANNER_PLANNER_H_
@@ -87,6 +87,7 @@ std::string QpReuseModeName(QpReuseMode mode);
 struct Settings {
   QpReuseMode qp_reuse = QpReuseMode::kNone;
   bool full_evaluation = false;
+  bool foothold_diagnostics = false;  // 진단 전용. ROS 기본값은 true.
   bool qp_working_set = false;
   bool structured_equalities = false;
   bool block_assembly = false;
@@ -238,7 +239,35 @@ struct TerrainAttempt {
   bool success = false;
 };
 
+// 실제 SQP 평가에 사용된 항목별 비용. 순서는 로그의 cost_names와 같다.
+inline constexpr std::array<const char*, 14> kFootholdCostNames{
+    "backward", "previous", "ground", "edge", "radial_separation", "lateral_separation",
+    "junction", "margin", "base_alignment", "nominal_kinematics", "tracking",
+    "linear_acceleration", "angular_acceleration", "attitude_and_vz"};
+struct FootholdTrace {
+  std::string stage;
+  std::string layer;
+  int attempt_leg = -1;
+  int iteration = 0;
+  int crossing_leg = -1;
+  std::array<std::string, 4> sources;
+  Feet feet = Feet::Zero();
+  std::array<TerrainPointDiagnostic, 4> terrain;
+  std::array<std::array<double, 7>, 4> candidate_costs{};
+  std::array<bool, 4> candidate_valid{};
+  bool sqp_valid = false;
+  std::array<double, 14> sqp_costs{};
+  double total_cost = 0.0;
+  double violation = 0.0;
+  double merit = 0.0;
+  double scaled_violation = 0.0;
+  double alpha = 0.0;
+  double penalty = 0.0;
+};
+
 struct Result {
+  std::vector<FootholdTrace> foothold_trace;
+  double foothold_diagnostic_seconds = 0.0;
   // 수치 반복의 초기값으로만 사용 가능. success가 아니면 제어 계획으로 발행할 수 없다.
   bool seed_available = false;
   double seed_penalty = 10.0;

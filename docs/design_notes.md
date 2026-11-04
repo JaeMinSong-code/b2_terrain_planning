@@ -604,6 +604,49 @@ ROS_DOMAIN_ID=174 RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
 
 TAMOLS 추종의 다음 스윙은 이륙 후에도 확인 지지발이 최소 두 개 남을 때 허용한다. 부족하면 이륙 직전에서 기다리며, 대각쌍 대기 시간 0.3초로 종료하지 않는다. 발별 탐색 제한과 계획 만료는 별개다.
 
+### 착지점 선택 경로 진단
+
+`foothold_diagnostics: true`가 ROS 기본값이며, `/terrain_planner_node/solve_status`의
+`foothold_diagnostics` 객체에 기록한다. B2 기본 지도 실행의 `map_history_*` rosbag에
+이 토픽이 포함된다. 콘솔 `TAMOLS_SOLVE`는 현재 DEBUG 레벨이므로 기본 INFO 파일에
+동일 JSON이 있다고 가정하지 않는다. `state_stamp_ns`로 WBC의 계획 stamp와 연결하고,
+`map_stamp_ns`는 해당 solve가 실제 사용한 지도 시각이다. 이전 실행에는 새 필드가 없다.
+
+- `candidate` → `after_reuse` → `sqp_start` → `sqp_final`의 네 발 XYZ를 비교한다.
+  `layer=virtual/ground`는 coarse/최종 지형 계산이며, 중간 후보 보정은
+  `refinement_selected` 또는 `refinement_discarded`다. `attempt_leg=-1`은 기본 시도,
+  0~3은 해당 다리의 다른 높이 후보 재시도다. 실패한 시도의 기록도 보존한다.
+- 각 발의 `source`는 `candidate`, `previous_success`, `retry_iterate`, `coarse_solution`,
+  `refined_candidate`, `reach_reselected`, `alternative_height`, `fixed`,
+  `committed_swing`, `occupied_fallback_current`를 구분한다. 초기화 출처이며 SQP가
+  좌표를 그대로 유지했다는 뜻은 아니다. 보정을 생략한 발은 `not_refined`다.
+- `cells`는 실제 보간의 네 셀과 가중치다. `sensor_observed/sensor_height`는 접촉 기록
+  적용 전 센서 지도이고, `input_observed/input_height`는 높이 datum·접촉 기록을 반영한
+  solve 입력이다. `processed_height`는 inpainting/median 또는 virtual floor 처리 후다.
+  sensor 높이에 `datum_offset`을 더해야 solve 높이와 비교할 수 있다. `map_origin`은
+  (0,0) 셀 중심, `frame`은 착지 좌표계다. `map_valid`는 지도 내부 보간 영역 여부이며
+  실제 관측·안전한 착지 판정이 아니다. `occlusion`은 solve 입력의 미관측 가중치다.
+- `candidate_cost_names/candidate_costs`는 후보 검색 점수이고,
+  `cost_names/sqp_cost_terms`는 실제 SQP 목적함수의 항별 합이다. 두 값을 혼동하지 않는다.
+  후보 보정 단계의 nominal 항은 coarse 발 위치 기준, 다른 단계는 보행 nominal 기준이다.
+  후보 점수는 해당 단계 좌표를 조회한 값이며 후보 전체 순위나 선택 마진은 기록하지 않는다.
+  최종 SQP에는 별도 미관측 비용이 없다. 미평가·조회 불가 비용은 `null`이다.
+- 각 내부 시도·다리마다 처음으로 미관측 가중치가 0에서 양수로 바뀌는 **채택된** SQP
+  이동만 `first_unobserved_before/after`로 남긴다. `crossing_leg`, `iteration`,
+  목적함수·`violation`, `scaled_violation`, `merit`, `penalty`, `alpha`를 비교한다.
+  제약 투영까지 끝낸 채택 지점이며 미채택 line-search 후보 전체는 저장하지 않는다.
+  시작점부터 미관측이면 이벤트가 없으므로 `sqp_start`도 확인한다. 접촉 보정으로 관측
+  처리된 셀은 이 이벤트 대상이 아니며 `sensor_observed`와 `input_observed` 차이로 찾는다.
+
+진단은 기존 평가값을 재사용하며 목적함수·제약·계획 거부 조건을 바꾸지 않는다. 전체 지도나
+QP 행렬을 매 반복 복사하지 않고 단계 기록을 모은 뒤 ROS 스레드에서 JSON을 만든다.
+`capture_seconds`는 명시적인 worker 진단 수집 구간이며 항별 비용 누적·JSON 변환·전송
+시간 전체를 뜻하지 않는다. 수집 시간도 기존 solver 시간 예산 안에 포함된다.
+`foothold_diagnostics_test`는 원본 관측 보존·비용 합·진단 ON/OFF 계획 일치와
+미관측 띠로 넘어가는 채택 단계의 전후 merit 기록을 검증한다.
+라이브러리 `Settings` 기본값은 OFF이며 ROS 비교 실행에서는 `foothold_diagnostics:=false`로
+끈다. 평지 시뮬 JSON 발행 검증은 기존 parkour 추락의 재현·원인 확정을 대신하지 않는다.
+
 ### 계획 갱신 중단 진단
 
 기본 실행에서는 진단 토픽뿐 아니라 `~/.ros/log/`(`ROS_LOG_DIR` 지정 시 해당 경로)의
