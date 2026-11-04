@@ -1,9 +1,9 @@
 /**
  * @file planner.cpp
  * @brief 접촉 조합별 생성 Jacobian과 지형 비용의 Gauss–Newton QP로 trot을 최적화한다.
- * @version 0.0.47
+ * @version 0.0.48
+ * @update 2026-11-05: 측정 발만으로 된 상수 면적 제약을 제외해 해소 불가능한 QP 실패를 막음.
  * @update 2026-11-05: 착지점 단계·지도 관측·비용 진단을 추가하고 제어 계산과 분리함.
- * @update 2026-11-04: 앞/뒤 좌우 발 쌍의 Y 간격에만 근접 지수 비용을 적용함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -984,6 +984,10 @@ class Problem {
         for (int index = 0; index < 4; ++index) {
           const int i = order[index], j = order[(index + 1) % 4];
           const int h = order[(index + 2) % 4];
+          // 측정 발만으로 된 면적은 최적화로 바꿀 수 없다. 이 상수 부등식이
+          // 위반되면 Jacobian이 0인 QP가 불능이 된다. 새 착지점이 포함된
+          // 삼각형과 각 실제 지지 조합의 동역학 제약은 그대로 유지한다.
+          if (!landed[i] && !landed[j] && !landed[h]) continue;
           const Eigen::Vector2d a = (feet.row(j) - feet.row(i)).head<2>().transpose();
           const Eigen::Vector2d b = (feet.row(h) - feet.row(i)).head<2>().transpose();
           add(a.x() * b.y() - a.y() * b.x(), 0.01,

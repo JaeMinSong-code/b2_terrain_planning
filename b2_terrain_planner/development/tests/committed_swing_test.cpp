@@ -1,9 +1,9 @@
 /**
  * @file committed_swing_test.cpp
  * @brief 명령·지도 변경 시 진행 중 착지점의 최적화 고정과 착지 후 해제를 검증한다.
- * @version 0.0.6
+ * @version 0.0.7
+ * @update 2026-11-05: 좁은 현재 발 배치의 계획 생성과 미래 착지점 면적 제약을 검증함.
  * @update 2026-10-30: 보간 높이 조회와 원본 관측 마스크를 구분해 스윙·접촉 계약을 검증함.
- * @update 2026-10-29: 지면·발 중심 변환과 반경 누락·중복 방지 회귀를 검증함.
  */
 #include "b2_terrain_planner/committed_swing.h"
 #include <cmath>
@@ -55,6 +55,38 @@ int main() {
           !input.committed_footholds[0] && !input.committed_footholds[3], "wrong committed legs");
     const auto baseline = Solve(robot, input, settings, &first);
     Check(baseline.success, "baseline: " + baseline.status);
+    // 스윙 중인 RL 측정점이 FL/RR 선분에 있어도 현재 지지는 그대로다.
+    // 측정값만으로 된 면적 부족은 최적화 변수로 해소할 수 없다.
+    Input narrow = input;
+    narrow.feet.row(2).head<2>() =
+        .5 * (input.feet.row(0).head<2>() + input.feet.row(3).head<2>());
+    const auto narrow_result = Solve(robot, narrow, settings, &first);
+    Check(narrow_result.success,
+          "measured swing geometry blocked planning: " + narrow_result.status);
+    for (int leg : {1, 2}) {
+      Check((narrow_result.footholds.row(leg).transpose() - references[leg].target).norm() < 1e-7,
+            "narrow measured geometry changed a committed touchdown");
+    }
+    // 새 착지점이 하나라도 포함된 혼합/최종 배치에는 기존 면적 하한이 남는다.
+    const std::array<int, 4> order{0, 2, 3, 1};
+    auto check_future_area = [&](const std::array<bool, 4>& landed) {
+      Feet feet = narrow.feet;
+      for (int leg = 0; leg < 4; ++leg) {
+        if (landed[leg]) feet.row(leg) = narrow_result.footholds.row(leg);
+      }
+      for (int index = 0; index < 4; ++index) {
+        const int i = order[index];
+        const int j = order[(index + 1) % 4];
+        const int h = order[(index + 2) % 4];
+        if (!landed[i] && !landed[j] && !landed[h]) continue;
+        const Eigen::Vector2d a = (feet.row(j) - feet.row(i)).head<2>();
+        const Eigen::Vector2d b = (feet.row(h) - feet.row(i)).head<2>();
+        Check(a.x() * b.y() - a.y() * b.x() >= .01 - 1e-6,
+              "future touchdown polygon lost its area bound");
+      }
+    };
+    for (const auto& phase : narrow_result.phases) check_future_area(phase.landed);
+    check_future_area({true, true, true, true});
     Input missing_committed = input;
     auto& missing_map = *missing_committed.terrain;
     for (int leg : {1, 2}) {
