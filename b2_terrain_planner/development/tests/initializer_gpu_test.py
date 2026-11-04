@@ -57,10 +57,11 @@ def main():
         mapper.pose_update()
         m = mapper._map
         center = cp.asnumpy(m.center)
-        idx = ((np.array([0.0, 0.0]) - center[:2]) / m.resolution + m.cell_n / 2).astype(int)
-        m.elevation_map[0, idx[0], idx[1]] = 0.42
-        m.elevation_map[1, idx[0], idx[1]] = 0.004
-        m.elevation_map[2, idx[0], idx[1]] = 1.0
+        # CuPy 배열은 행=Y, 열=X이므로 월드 좌표와 축 순서가 다르다.
+        col, row = ((np.array([0.0, 0.0]) - center[:2]) / m.resolution + m.cell_n / 2).astype(int)
+        m.elevation_map[0, row, col] = 0.42
+        m.elevation_map[1, row, col] = 0.004
+        m.elevation_map[2, row, col] = 1.0
         before = m.elevation_map.copy()
         mapper.last_initializer_attempt = -math.inf
         mapper.try_initialize_from_ground(create_cloud_xyz32(header, []))
@@ -74,15 +75,19 @@ def main():
         count = int(cp.count_nonzero(seeded).item())
         expected = mapper.initialize_patch_length * mapper.initialize_patch_width / m.resolution**2
         assert 0.9 * expected < count < 1.1 * expected, count
-        assert bool(cp.array_equal(before[:3, idx[0], idx[1]],
-                                   m.elevation_map[:3, idx[0], idx[1]]).item()), 'observed obstacle changed'
+        assert bool(cp.array_equal(before[:3, row, col],
+                                   m.elevation_map[:3, row, col]).item()), 'observed obstacle changed'
         assert float(cp.max(cp.abs(m.elevation_map[0, seeded] + center[2] - ground_z)).item()) < 1e-5
-        ix, iy = np.nonzero(cp.asnumpy(seeded))
-        xy = (np.column_stack((ix, iy)) - m.cell_n / 2) * m.resolution + center[:2]
+        rows, cols = np.nonzero(cp.asnumpy(seeded))
+        xy = (np.column_stack((cols, rows)) - m.cell_n / 2) * m.resolution + center[:2]
         c, s = math.cos(yaw), math.sin(yaw)
         local = (xy - [0.1, -0.1]) @ np.array([[c, -s], [s, c]])
         assert np.max(np.abs(local[:, 0])) <= mapper.initialize_patch_length / 2 + 1e-6
         assert np.max(np.abs(local[:, 1])) <= mapper.initialize_patch_width / 2 + 1e-6
+        # 비정방형 패치가 회전된 몸통의 앞뒤·좌우 범위를 모두 채워야 한다.
+        for axis, size in enumerate((mapper.initialize_patch_length, mapper.initialize_patch_width)):
+            assert np.min(local[:, axis]) < -size / 2 + 2 * m.resolution
+            assert np.max(local[:, axis]) > size / 2 - 2 * m.resolution
         saved = m.elevation_map.copy()
         mapper.last_initializer_attempt = -math.inf
         mapper.try_initialize_from_ground(cloud)

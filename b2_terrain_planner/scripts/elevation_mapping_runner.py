@@ -78,8 +78,10 @@ class StrictElevationMappingNode(ElevationMappingNode):
             with self._map.map_lock:
                 seeds = cp.asarray(np.column_stack((xy, np.full(4, height))),
                                    dtype=self._map.data_type)
-                seeds[:, :2] = ((seeds[:, :2] - self._map.center[:2]) / self._map.resolution
-                                + self._map.cell_n / 2)
+                indices_xy = ((seeds[:, :2] - self._map.center[:2]) / self._map.resolution
+                              + self._map.cell_n / 2)
+                # native 초기화기는 월드 X/Y가 아닌 배열 행(Y)/열(X) 순서를 받는다.
+                seeds[:, :2] = indices_xy[:, [1, 0]]
                 seeds[:, 2] -= self._map.center[2]
                 initialized = cp.zeros_like(self._map.elevation_map)
                 # native linear 초기화기의 볼록껍질을 로봇 크기 사각형으로 제한한다.
