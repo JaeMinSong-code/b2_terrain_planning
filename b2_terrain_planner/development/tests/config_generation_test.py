@@ -29,6 +29,16 @@ class ConfigGenerationTest(unittest.TestCase):
             self.assertEqual(params['step_swing.height_threshold'], 0.05)
             self.assertEqual(params['step_swing.retract_distance'], 0.05)
 
+    def test_foot_separation_parameters(self):
+        configs = load_configs(self.source)
+        for mode in ('wbc', 'flat'):
+            params = configs[f'terrain_planner_{mode}.yaml'][
+                'terrain_planner_node']['ros__parameters']
+            self.assertEqual(params['terrain.foot_separation_weight'], 0.1)
+            self.assertEqual(params['terrain.foot_separation_distance_x'], 0.08)
+            self.assertEqual(params['terrain.foot_separation_distance_y'], 0.10)
+            self.assertEqual(params['terrain.foot_separation_scale'], 0.01)
+
     def test_runtime_modes(self):
         configs = load_configs(self.source)
         self.assertEqual(len(configs), 7)

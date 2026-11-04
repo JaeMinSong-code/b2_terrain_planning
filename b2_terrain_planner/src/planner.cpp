@@ -1,9 +1,9 @@
 /**
  * @file planner.cpp
  * @brief 접촉 조합별 생성 Jacobian과 지형 비용의 Gauss–Newton QP로 trot을 최적화한다.
- * @version 0.0.44
+ * @version 0.0.45
+ * @update 2026-11-04: 발 주변 셀·착지점의 방향별 지수 거리 비용을 연결함.
  * @update 2026-10-30: 지지발 3×3 셀 제외를 초기 후보·재사용에 연결하고 후보 소진 시 현재 발로 초기화함.
- * @update 2026-10-30: 처리 지도를 공유하고 가상 바닥 정렬·후보 보정·시간 제한 초기화를 연결함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -396,7 +396,8 @@ class Problem {
         try {
           terrain_initial_.row(leg) = terrain_->FindFoothold(
               nominal, nominal.array() - limit, nominal.array() + limit,
-              direction_, backward_weight_, {}, terrain_layer_, occupied_supports_[leg]).transpose();
+              direction_, backward_weight_, {}, terrain_layer_, occupied_supports_[leg],
+              input_.position[3]).transpose();
         } catch (const OccupiedFootholdError&) {
           // 후보 제외만으로 계산을 중단하지 않는다. 자기 발의 현재 XYZ에서 SQP를 계속한다.
           terrain_initial_.row(leg) = input_.feet.row(leg);
@@ -592,7 +593,7 @@ class Problem {
           selected_terrain.row(leg) = terrain_->FindFoothold(
               nominal, nominal.array() - .30, nominal.array() + .30,
               direction_, backward_weight_, reach_accept[leg], terrain_layer_,
-              occupied_supports_[leg]).transpose();
+              occupied_supports_[leg], input_.position[3]).transpose();
           if ((selected_terrain.row(leg) - terrain_initial_.row(leg)).norm() > 1e-10) {
             ++diagnostic->reach_reselected_footholds;
           }
@@ -629,10 +630,12 @@ class Problem {
         if (old.success && backward_weight_ > 0 && direction_.squaredNorm() > 0) {
           const Eigen::Vector2d nominal = nominal_.row(leg).transpose();
           const double old_score = terrain_->FootholdCost(
-              foot.head<2>(), nominal, direction_, backward_weight_, terrain_layer_);
+              foot.head<2>(), nominal, direction_, backward_weight_, terrain_layer_,
+              occupied_supports_[leg], input_.position[3]);
           const double new_score = terrain_->FootholdCost(
               selected_terrain.row(leg).head<2>().transpose(), nominal,
-              direction_, backward_weight_, terrain_layer_);
+              direction_, backward_weight_, terrain_layer_,
+              occupied_supports_[leg], input_.position[3]);
           if (new_score + 1e-10 < old_score) continue;
         }
         x.segment<3>(feet_offset_ + 3 * leg) = foot;
@@ -886,16 +889,20 @@ class Problem {
         const Feet feet = Configuration(x, landed);
         for (int i = 0; i < 4; ++i) {
           for (int j = i + 1; j < 4; ++j) {
-            const auto residual = terrain_->Separation(
-                (feet.row(i) - feet.row(j)).head<2>().transpose());
-            if (need_cost) out.cost += residual.value * residual.value;
-            if (full) {
-              Eigen::RowVectorXd row = Eigen::RowVectorXd::Zero(size_);
-              if (landed[i]) row.segment<2>(feet_offset_ + 3 * i) += residual.gradient.transpose();
-              if (landed[j]) row.segment<2>(feet_offset_ + 3 * j) -= residual.gradient.transpose();
-              out.gradient.noalias() += 2 * residual.value * row.transpose();
-              out.hessian.noalias() += 2 * row.transpose() * row;
-            }
+            auto add_separation = [&](const CollisionResidual& residual) {
+              if (need_cost) out.cost += residual.value * residual.value;
+              if (full) {
+                Eigen::RowVectorXd row = Eigen::RowVectorXd::Zero(size_);
+                if (landed[i]) row.segment<2>(feet_offset_ + 3 * i) += residual.gradient.transpose();
+                if (landed[j]) row.segment<2>(feet_offset_ + 3 * j) -= residual.gradient.transpose();
+                out.gradient.noalias() += 2 * residual.value * row.transpose();
+                out.hessian.noalias() += 2 * row.transpose() * row;
+              }
+            };
+            const Eigen::Vector2d delta = (feet.row(i) - feet.row(j)).head<2>().transpose();
+            add_separation(terrain_->Separation(delta));
+            // 모든 현재/미래 발 쌍. 몸통 yaw의 Y 방향을 더 넓게 설정할 수 있다.
+            add_separation(terrain_->FootSeparation(delta, input_.position[3]));
           }
         }
         const std::array<int, 4> order{0, 2, 3, 1};
@@ -2497,7 +2504,8 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
           refined[leg] = prepared->FindFoothold(center, lower, upper, direction,
                                               settings.foothold_backward_weight, {},
                                               TerrainLayer::kGround,
-                                              OccupiedSupports(input, phases, leg));
+                                              OccupiedSupports(input, phases, leg),
+                                              input.position[3]);
         } catch (const TerrainDomainError&) { complete = false; break; }
       }
       if (complete) {
@@ -2557,7 +2565,7 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
         candidate.leg = leg;
         candidate.seed = prepared->FindFoothold(center, center.array() - .30,
             center.array() + .30, direction, settings.foothold_backward_weight, other_platform,
-            TerrainLayer::kGround, OccupiedSupports(input, phases, leg));
+            TerrainLayer::kGround, OccupiedSupports(input, phases, leg), input.position[3]);
         const Eigen::Vector3d hip = input.position.head<3>() +
             Rotation(input.position) * robot.hips.row(leg).transpose();
         double priority = (hip - initial.row(leg).transpose()).norm() / robot.reach_max[leg];

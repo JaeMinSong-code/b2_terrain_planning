@@ -1,9 +1,9 @@
 /**
  * @file solve_main.cpp
  * @brief ROS 없이 단일 설정의 예제 또는 개별 평지·지형 입력을 읽고 몸통 계획을 YAML로 출력한다.
- * @version 0.0.30
+ * @version 0.0.31
+ * @update 2026-11-04: 발 주변 셀·착지점의 방향별 지수 거리 비용을 연결함.
  * @update 2026-11-03: 은퇴한 IK·지형 검증 직렬화를 제거하고 DefaultModelPath를 공용 함수로 대체함.
- * @update 2026-10-30: TAMOLS 지형 처리·초기화 설정과 단계별 계산 시간을 CLI에 연결함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -152,7 +152,11 @@ void ReadInput(const std::string& path, b2_terrain_planner::Robot* robot,
              {"contact_tolerance", &t.contact_tolerance},
              {"ground_weight", &t.ground_weight}, {"edge_weight", &t.edge_weight},
              {"collision_weight", &t.collision_weight},
-             {"collision_distance", &t.collision_distance}}) {
+             {"collision_distance", &t.collision_distance},
+             {"foot_separation_weight", &t.foot_separation_weight},
+             {"foot_separation_distance_x", &t.foot_separation_distance_x},
+             {"foot_separation_distance_y", &t.foot_separation_distance_y},
+             {"foot_separation_scale", &t.foot_separation_scale}}) {
       if (config[item.first]) *item.second = config[item.first].as<double>();
     }
   }

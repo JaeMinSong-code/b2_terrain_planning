@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.44
+ * @version 0.0.45
+ * @update 2026-11-04: 발 주변 셀·착지점의 방향별 지수 거리 비용을 연결함.
  * @update 2026-11-04: 이륙 전 지형 기반 회피 스윙 선택과 package-local 설정을 연결함.
- * @update 2026-11-03: 은퇴한 IK 진단 필드 제거·공용 DefaultModelPath 적용·TAMOLS 진단 로그를 DEBUG로 낮춤.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -524,6 +524,10 @@ class TerrainPlannerNode : public rclcpp::Node {
     terrain.curvature_weight = declare_parameter<double>("terrain.curvature_weight", 0.001);
     terrain.virtual_height_weight = declare_parameter<double>("terrain.virtual_height_weight", 100.0);
     terrain.body_alignment_weight = declare_parameter<double>("terrain.body_alignment_weight", 100.0);
+    terrain.foot_separation_weight = declare_parameter<double>("terrain.foot_separation_weight", 0.0);
+    terrain.foot_separation_distance_x = declare_parameter<double>("terrain.foot_separation_distance_x", 0.08);
+    terrain.foot_separation_distance_y = declare_parameter<double>("terrain.foot_separation_distance_y", 0.10);
+    terrain.foot_separation_scale = declare_parameter<double>("terrain.foot_separation_scale", 0.01);
 
   }
 

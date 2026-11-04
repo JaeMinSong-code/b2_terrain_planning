@@ -116,6 +116,11 @@ planner:
     terrain.curvature_weight: 0.001
     terrain.virtual_height_weight: 100.0
     terrain.body_alignment_weight: 100.0
+    # 발 주변 셀·최종 착지점의 거리 비용. 몸통 기준 X 8cm/Y 10cm 안쪽에서 급증한다.
+    terrain.foot_separation_weight: 0.1
+    terrain.foot_separation_distance_x: 0.08
+    terrain.foot_separation_distance_y: 0.10
+    terrain.foot_separation_scale: 0.01
     terrain.graduated_initialization: true
     # 새 착지 슬롯의 준비 단계는 전체 예산의 25% 이내. 실패하면 직접 초기화한다.
     terrain.graduated_budget_fraction: 0.25
