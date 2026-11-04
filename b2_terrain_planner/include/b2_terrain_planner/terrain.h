@@ -1,9 +1,9 @@
 /**
  * @file terrain.h
  * @brief 정적 높이맵의 보간·유효성·착지 비용과 후보 검색 계약.
- * @version 0.0.13
+ * @version 0.0.14
+ * @update 2026-11-04: 앞/뒤 좌우 발 쌍의 Y 간격에만 근접 지수 비용을 적용함.
  * @update 2026-11-04: 발 주변 셀·착지점의 방향별 지수 거리 비용을 연결함.
- * @update 2026-10-30: 초기 후보의 점유 셀·주변 1칸 제외와 후보 소진 계약을 추가함.
  */
 #ifndef B2_TERRAIN_PLANNER_TERRAIN_H_
 #define B2_TERRAIN_PLANNER_TERRAIN_H_
@@ -59,10 +59,9 @@ struct TerrainSettings {
   double ground_weight = 1e4;
   double edge_weight = 3.0;
   double collision_weight = 0.001;  // TAMOLS Table I.
-  // 발 주변 후보 셀과 연속 착지점에 공통으로 적용하는 타원형 거리 비용.
+  // 발 주변 후보 셀과 연속 착지점에 공통으로 적용하는 좌우 발 쌍의 Y 간격 비용.
   double foot_separation_weight = 0.0;
-  double foot_separation_distance_x = 0.08;
-  double foot_separation_distance_y = 0.10;
+  double foot_separation_distance_y = 0.08;
   double foot_separation_scale = 0.01;
   double collision_distance = 0.20;  // 비용이 활성화되는 발 사이 거리, m.
 };
@@ -110,6 +109,7 @@ class TerrainModel {
   TerrainResidual Residual(const Eigen::Vector3d& foot,
                            TerrainLayer layer = TerrainLayer::kGround) const;
   CollisionResidual Separation(const Eigen::Vector2d& delta) const;
+  // delta의 몸통 Y 투영만 사용한다. 호출자가 FL/FR 또는 RL/RR 쌍을 지정한다.
   CollisionResidual FootSeparation(const Eigen::Vector2d& delta,
                                   double heading) const;
   bool IsQueryable(const Eigen::Vector2d& xy) const;
@@ -120,7 +120,7 @@ class TerrainModel {
   double FootholdCost(const Eigen::Vector2d& xy, const Eigen::Vector2d& nominal,
                       const Eigen::Vector2d& direction, double backward_weight,
                       TerrainLayer layer = TerrainLayer::kGround,
-                      const SupportPositions& occupied = {}, double heading = 0.0) const;
+                      const SupportPositions& separation_supports = {}, double heading = 0.0) const;
   Eigen::Vector3d FindFoothold(const Eigen::Vector2d& nominal,
                              const Eigen::Vector2d& lower,
                              const Eigen::Vector2d& upper,
@@ -128,7 +128,8 @@ class TerrainModel {
                              double backward_weight = 0.0,
                              const std::function<bool(const Eigen::Vector3d&)>& admissible = {},
                              TerrainLayer layer = TerrainLayer::kGround,
-                             const SupportPositions& occupied = {}, double heading = 0.0) const;
+                             const SupportPositions& occupied = {}, double heading = 0.0,
+                             const SupportPositions& separation_supports = {}) const;
   const HeightMap& map() const { return map_; }
   const HeightMap& processed_map() const { return processed_; }
   const Eigen::MatrixXd& smooth_heights() const { return smooth_; }

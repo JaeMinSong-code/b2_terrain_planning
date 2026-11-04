@@ -1,9 +1,9 @@
 /**
  * @file terrain.cpp
  * @brief 유효성 보존 높이맵 필터와 일관된 보간 미분·착지 후보 검색.
- * @version 0.0.13
+ * @version 0.0.14
+ * @update 2026-11-04: 앞/뒤 좌우 발 쌍의 Y 간격에만 근접 지수 비용을 적용함.
  * @update 2026-11-04: 발 주변 셀·착지점의 방향별 지수 거리 비용을 연결함.
- * @update 2026-10-30: 후보 점수 계산 전에 지지발 점유 셀과 주변 1칸을 제외함.
  */
 #include "b2_terrain_planner/terrain.h"
 
@@ -153,8 +153,7 @@ TerrainModel::TerrainModel(const HeightMap& map,
   for (double value : {settings.smoothing_sigma,
                        settings.contact_tolerance,
                        settings.ground_weight, settings.collision_distance,
-                       settings.foot_separation_distance_x, settings.foot_separation_distance_y,
-                       settings.foot_separation_scale}) {
+                       settings.foot_separation_distance_y, settings.foot_separation_scale}) {
     if (!std::isfinite(value) || value <= 0) {
       throw std::invalid_argument("invalid terrain settings");
     }
@@ -350,16 +349,13 @@ CollisionResidual TerrainModel::FootSeparation(
   if (settings_.foot_separation_weight == 0.0) return result;
   const Eigen::Vector2d forward(std::cos(heading), std::sin(heading));
   const Eigen::Vector2d lateral(-forward.y(), forward.x());
-  const double x = forward.dot(delta);
   const double y = lateral.dot(delta);
-  const double ratio = settings_.foot_separation_distance_x /
-                       settings_.foot_separation_distance_y;
   // 지도 셀 중심과 연속 SQP 좌표에서 같은 거리장을 평가한다.
   // 중심에서 미분이 유한하도록 1µm만 정규화한다.
-  const double distance = std::sqrt(x * x + ratio * ratio * y * y + 1e-12);
-  const double exponent = (settings_.foot_separation_distance_x - distance) /
+  const double distance = std::sqrt(y * y + 1e-12);
+  const double exponent = (settings_.foot_separation_distance_y - distance) /
                           (2.0 * settings_.foot_separation_scale);
-  // r² = weight * exp((distance_x - elliptical_distance) / scale).
+  // r² = weight * exp((distance_y - abs_y) / scale).
   // 매우 가파른 설정도 overflow 없이 밀어내도록 큰 지수는 접선으로 연장한다.
   constexpr double kTail = 10.0;
   double value = 0.0;
@@ -375,7 +371,7 @@ CollisionResidual TerrainModel::FootSeparation(
   result.value = root_weight * value;
   result.gradient = -root_weight * derivative /
       (2.0 * settings_.foot_separation_scale * distance) *
-      (x * forward + ratio * ratio * y * lateral);
+      (y * lateral);
   return result;
 }
 
@@ -392,7 +388,7 @@ double TerrainModel::FootholdCost(const Eigen::Vector2d& xy,
                                   const Eigen::Vector2d& nominal,
                                   const Eigen::Vector2d& direction,
                                   double backward_weight, TerrainLayer layer,
-                                  const SupportPositions& occupied, double heading) const {
+                                  const SupportPositions& separation_supports, double heading) const {
   const auto sample = Sample(xy, layer);
   const Eigen::Vector2d offset = xy - nominal;
   const double behind = std::min(0.0, direction.dot(offset));
@@ -403,7 +399,7 @@ double TerrainModel::FootholdCost(const Eigen::Vector2d& xy,
         settings_.curvature_weight * sample.curvature_cost +
         settings_.virtual_height_weight * std::pow(sample.height - sample.virtual_height, 2);
   }
-  for (const auto& support : occupied) {
+  for (const auto& support : separation_supports) {
     const auto residual = FootSeparation(xy - support, heading);
     cost += residual.value * residual.value;
   }
@@ -428,7 +424,8 @@ Eigen::Vector3d TerrainModel::FindFoothold(const Eigen::Vector2d& nominal,
                                          double backward_weight,
                                          const std::function<bool(const Eigen::Vector3d&)>& admissible,
                                          TerrainLayer layer,
-                                         const SupportPositions& occupied, double heading) const {
+                                         const SupportPositions& occupied, double heading,
+                                         const SupportPositions& separation_supports) const {
   double best = std::numeric_limits<double>::infinity();
   Eigen::Vector3d result = Eigen::Vector3d::Zero();
   bool occupied_candidate = false;
@@ -444,7 +441,7 @@ Eigen::Vector3d TerrainModel::FindFoothold(const Eigen::Vector2d& nominal,
       return;
     }
     const double cost = FootholdCost(xy, nominal, direction, backward_weight, layer,
-                                    occupied, heading);
+                                    separation_supports, heading);
     if (cost < best) {
       best = cost;
       result = foot;

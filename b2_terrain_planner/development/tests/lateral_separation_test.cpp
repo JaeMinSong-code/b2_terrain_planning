@@ -1,7 +1,8 @@
 /**
  * @file lateral_separation_test.cpp
  * @brief 발 주변 셀·연속 착지점의 지수 거리 비용과 회전 불변성을 검증한다.
- * @version 0.0.1
+ * @version 0.0.2
+ * @update 2026-11-04: 앞/뒤 좌우 발 쌍의 Y 간격에만 근접 지수 비용을 적용함.
  * @update 2026-11-04: 타원 거리장의 미분·후보 셀 선택·회전 중 근접 착지 회피를 추가함.
  */
 #include "b2_terrain_planner/planner.h"
@@ -51,19 +52,21 @@ void CheckResidual() {
       }
     }
   }
-  const auto x_edge = terrain.FootSeparation({0.08, 0.0}, 0);
-  const auto y_edge = terrain.FootSeparation({0.0, 0.10}, 0);
-  Check(std::abs(x_edge.value - y_edge.value) < 1e-10, "ellipse boundary mismatch");
-  const auto close = terrain.FootSeparation({0.07, 0.0}, 0);
-  Check(std::abs(std::pow(close.value / x_edge.value, 2) - std::exp(1.0)) < 1e-7,
+  const auto edge = terrain.FootSeparation({0.0, 0.08}, 0);
+  const auto shifted = terrain.FootSeparation({0.8, 0.08}, 0);
+  Check(std::abs(edge.value * edge.value - 0.1) < 1e-9, "Y boundary mismatch");
+  Check(edge.value == shifted.value && shifted.gradient.x() == 0.0,
+        "X separation changed the Y-only cost");
+  const auto close = terrain.FootSeparation({0.0, 0.07}, 0);
+  Check(std::abs(std::pow(close.value / edge.value, 2) - std::exp(1.0)) < 1e-7,
         "one scale inward did not multiply cost by e");
   const auto center = terrain.FootSeparation({0, 0}, 0);
   Check(std::isfinite(center.value) && center.gradient.allFinite(), "center is not finite");
   const auto far = terrain.FootSeparation({0.0, 0.40}, 0);
   Check(far.value * far.value < 1e-10, "ordinary stance is still being widened");
   settings.foot_separation_scale = 0.001;
-  const auto tail = TerrainModel(FlatMap(), settings).FootSeparation({0.001, 0}, 0);
-  Check(std::isfinite(tail.value) && tail.gradient.allFinite() && tail.gradient.x() < 0,
+  const auto tail = TerrainModel(FlatMap(), settings).FootSeparation({0, 0.001}, 0);
+  Check(std::isfinite(tail.value) && tail.gradient.allFinite() && tail.gradient.y() < 0,
         "steep exponential tail lost a finite repulsive gradient");
   settings.foot_separation_weight = 0.0;
   const auto disabled = TerrainModel(FlatMap(), settings).FootSeparation({0, 0}, 0);
@@ -73,12 +76,16 @@ void CheckCandidateCells() {
   TerrainSettings settings;
   const SupportPositions supports{Eigen::Vector2d::Zero()};
   const auto off = TerrainModel(FlatMap(), settings).FindFoothold(
-      {0, 0.1}, {-0.001, 0.1}, {0.001, 0.25}, {}, 0, {}, TerrainLayer::kGround, supports);
+      {0, 0.08}, {-0.001, 0.08}, {0.001, 0.25}, {}, 0, {}, TerrainLayer::kGround, supports, 0.0, supports);
   settings.foot_separation_weight = 0.1;
   const TerrainModel terrain(FlatMap(), settings);
   const auto on = terrain.FindFoothold(
-      {0, 0.1}, {-0.001, 0.1}, {0.001, 0.25}, {}, 0, {}, TerrainLayer::kGround, supports);
+      {0, 0.08}, {-0.001, 0.08}, {0.001, 0.25}, {}, 0, {}, TerrainLayer::kGround, supports, 0.0, supports);
   Check(on.y() > off.y() + 0.02, "nearby candidate cells ignored the foot distance field");
+  const auto unpaired = terrain.FindFoothold(
+      {0, 0.08}, {-0.001, 0.08}, {0.001, 0.25}, {}, 0, {}, TerrainLayer::kGround, supports);
+  Check((unpaired - off).norm() < 1e-10,
+        "occupancy-only support unexpectedly added lateral cost");
   const Eigen::Vector2d cell(0, 0.15);
   const auto residual = terrain.FootSeparation(cell, 0);
   const double score = terrain.FootholdCost(cell, cell, {}, 0, TerrainLayer::kGround, supports);

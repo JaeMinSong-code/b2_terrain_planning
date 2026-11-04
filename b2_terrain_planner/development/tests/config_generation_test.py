@@ -35,8 +35,7 @@ class ConfigGenerationTest(unittest.TestCase):
             params = configs[f'terrain_planner_{mode}.yaml'][
                 'terrain_planner_node']['ros__parameters']
             self.assertEqual(params['terrain.foot_separation_weight'], 0.1)
-            self.assertEqual(params['terrain.foot_separation_distance_x'], 0.08)
-            self.assertEqual(params['terrain.foot_separation_distance_y'], 0.10)
+            self.assertEqual(params['terrain.foot_separation_distance_y'], 0.08)
             self.assertEqual(params['terrain.foot_separation_scale'], 0.01)
 
     def test_runtime_modes(self):
