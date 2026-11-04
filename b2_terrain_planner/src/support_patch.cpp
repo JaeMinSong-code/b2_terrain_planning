@@ -1,9 +1,9 @@
 /**
  * @file support_patch.cpp
  * @brief 좁은 접촉 영역의 높이를 로컬 지도에 기억하고 입력 복사본에 적용한다.
- * @version 0.0.4
+ * @version 0.0.5
+ * @update 2026-11-04: 접촉 셀의 최초 지도 좌표를 보존해 반복 재배치의 누적 이동을 방지함.
  * @update 2026-11-03: 호출자 없는 SupportPatchHalfWidth shim을 제거함.
- * @update 2026-10-29: 지도 지면과 발 중심의 높이 계약 및 반경 변환을 통일함.
  */
 #include "b2_terrain_planner/support_patch.h"
 
@@ -14,10 +14,12 @@
 #include <utility>
 
 namespace b2_terrain_planner {
-int ApplySupportPatches(HeightMap* map,
+namespace {
+int ApplySupportPatchesImpl(HeightMap* map,
                         const std::array<Eigen::Vector3d, 4>& feet,
                         const std::array<bool, 4>& contacts, double half_width,
-                        Eigen::MatrixXd* stamps, double stamp_sec, double foot_radius) {
+                        Eigen::MatrixXd* stamps, double stamp_sec, double foot_radius,
+                        Eigen::MatrixXd* observed_x, Eigen::MatrixXd* observed_y) {
   if (map == nullptr || !std::isfinite(half_width) || half_width <= 0 ||
       !std::isfinite(map->resolution) || map->resolution <= 0 ||
       !map->origin.allFinite() || map->heights.rows() != map->valid.rows() ||
@@ -66,11 +68,25 @@ int ApplySupportPatches(HeightMap* map,
         map->valid(row, col) = 1;
         map->variance(row, col) = 0.0;
         if (stamps != nullptr) (*stamps)(row, col) = stamp_sec;
+        if (observed_x != nullptr && observed_y != nullptr) {
+          (*observed_x)(row, col) = xy.x();
+          (*observed_y)(row, col) = xy.y();
+        }
         ++patched;
       }
     }
   }
   return patched;
+}
+
+}  // namespace
+
+int ApplySupportPatches(HeightMap* map,
+                        const std::array<Eigen::Vector3d, 4>& feet,
+                        const std::array<bool, 4>& contacts, double half_width,
+                        Eigen::MatrixXd* stamps, double stamp_sec, double foot_radius) {
+  return ApplySupportPatchesImpl(map, feet, contacts, half_width, stamps, stamp_sec,
+                                 foot_radius, nullptr, nullptr);
 }
 
 void SupportPatchMemory::Reset() { memory_.reset(); }
@@ -90,17 +106,24 @@ void SupportPatchMemory::SyncLayout(const HeightMap& layout) {
   next.valid = Eigen::ArrayXXi::Zero(layout.heights.rows(), layout.heights.cols());
   Eigen::MatrixXd next_stamps =
       Eigen::MatrixXd::Zero(layout.heights.rows(), layout.heights.cols());
+  Eigen::MatrixXd next_observed_x = next_stamps;
+  Eigen::MatrixXd next_observed_y = next_stamps;
   if (memory_ && memory_->frame == layout.frame && memory_->resolution == layout.resolution) {
     for (int row = 0; row < memory_->heights.rows(); ++row) {
       for (int col = 0; col < memory_->heights.cols(); ++col) {
         if (!memory_->valid(row, col)) continue;
-        const Eigen::Vector2d xy = memory_->origin + memory_->resolution * Eigen::Vector2d(col, row);
+        const Eigen::Vector2d xy(observed_x_(row, col), observed_y_(row, col));
         const Eigen::Vector2d index = (xy - next.origin) / next.resolution;
         if (index.x() <= -0.5 || index.y() <= -0.5 ||
             index.x() >= next.heights.cols() - 0.5 ||
             index.y() >= next.heights.rows() - 0.5) continue;
         const int next_col = static_cast<int>(std::lround(index.x()));
         const int next_row = static_cast<int>(std::lround(index.y()));
+        // 서로 다른 격자 위상에서 기록된 셀이 겹치면 최신 관측을 유지한다.
+        if (next.valid(next_row, next_col) &&
+            next_stamps(next_row, next_col) > stamps_(row, col)) continue;
+        next_observed_x(next_row, next_col) = xy.x();
+        next_observed_y(next_row, next_col) = xy.y();
         next.heights(next_row, next_col) = memory_->heights(row, col);
         next.valid(next_row, next_col) = 1;
         next_stamps(next_row, next_col) = stamps_(row, col);
@@ -109,14 +132,16 @@ void SupportPatchMemory::SyncLayout(const HeightMap& layout) {
   }
   memory_ = std::move(next);
   stamps_ = std::move(next_stamps);
+  observed_x_ = std::move(next_observed_x);
+  observed_y_ = std::move(next_observed_y);
 }
 
 void SupportPatchMemory::Observe(const std::array<Eigen::Vector3d, 4>& feet,
                                  const std::array<bool, 4>& contacts, double half_width,
                                  double stamp_sec, double foot_radius) {
   if (memory_) {
-    ApplySupportPatches(&*memory_, feet, contacts, half_width, &stamps_, stamp_sec,
-                        foot_radius);
+    ApplySupportPatchesImpl(&*memory_, feet, contacts, half_width, &stamps_, stamp_sec,
+                            foot_radius, &observed_x_, &observed_y_);
   }
 }
 

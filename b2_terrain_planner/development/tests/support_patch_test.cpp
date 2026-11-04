@@ -1,9 +1,9 @@
 /**
  * @file support_patch_test.cpp
  * @brief 접촉 지도 보정의 조회 가능성·높이·범위·접촉 마스크를 검증한다.
- * @version 0.0.5
+ * @version 0.0.6
+ * @update 2026-11-04: 접촉 셀의 최초 지도 좌표를 보존해 반복 재배치의 누적 이동을 방지함.
  * @update 2026-11-03: 제거한 SupportPatchHalfWidth 대신 반폭 상수를 직접 사용하도록 조정함.
- * @update 2026-10-30: 보간 높이 조회와 원본 관측 마스크를 구분해 스윙·접촉 계약을 검증함.
  */
 #include "b2_terrain_planner/support_patch.h"
 #include "b2_terrain_planner/map_datum.h"
@@ -147,6 +147,55 @@ void RunMemory(double resolution) {
   memory.Reset();
   Check(memory.ApplyTo(&returned) == 0, "explicit reset retained contacts");
 }
+// 셀보다 작은 이동을 계속해도 최초 관측 좌표에서 한 번만 양자화해야 한다.
+void RunFractionalMemory(double resolution) {
+  HeightMap raw;
+  raw.resolution = resolution;
+  raw.origin = Eigen::Vector2d::Constant(-0.975);
+  raw.heights = Eigen::MatrixXd::Zero(100, 100);
+  raw.valid = Eigen::ArrayXXi::Zero(100, 100);
+  raw.variance = Eigen::MatrixXd::Ones(100, 100);
+  std::array<Eigen::Vector3d, 4> feet{};
+  feet[0] << 0.013, 0.021, 0.12;
+  SupportPatchMemory memory;
+  memory.SyncLayout(raw);
+  memory.Observe(feet, {true, false, false, false}, 0.025, 10.0);
+  auto observed = raw;
+  const int count = memory.ApplyTo(&observed, 10.0, 2.0);
+  Check(count > 0, "fractional test recorded no cells");
+  for (int step = 1; step <= 80; ++step) {
+    int offset = step;
+    if (step > 40) offset = 80 - step;
+    auto shifted = raw;
+    shifted.origin += resolution * Eigen::Vector2d(0.23 * offset, -0.17 * offset);
+    memory.SyncLayout(shifted);
+    // 이륙한 발과 지도 이동은 좌표·높이·관측 시각을 갱신하지 않는다.
+    memory.Observe(feet, {false, false, false, false}, 0.025, 11.0);
+    Check(memory.ApplyTo(&shifted, 11.0, 2.0) == count,
+          "fractional translation lost contact cells");
+    for (int row = 0; row < observed.heights.rows(); ++row) {
+      for (int col = 0; col < observed.heights.cols(); ++col) {
+        if (!observed.valid(row, col)) continue;
+        const Eigen::Vector2d xy = raw.origin + resolution * Eigen::Vector2d(col, row);
+        const Eigen::Vector2d index = (xy - shifted.origin) / resolution;
+        const int target_col = static_cast<int>(std::lround(index.x()));
+        const int target_row = static_cast<int>(std::lround(index.y()));
+        Check(shifted.valid(target_row, target_col) &&
+              std::abs(shifted.heights(target_row, target_col) - 0.088) < 1e-12,
+              "repeated fractional map shifts moved the original contact");
+      }
+    }
+    auto expired = raw;
+    expired.origin = shifted.origin;
+    Check(memory.ApplyTo(&expired, 12.001, 2.0) == 0,
+          "layout change refreshed contact lifetime");
+  }
+  auto changed_resolution = raw;
+  changed_resolution.resolution *= 2.0;
+  memory.SyncLayout(changed_resolution);
+  Check(memory.ApplyTo(&changed_resolution) == 0,
+        "resolution change retained old contacts");
+}
 // datum → 접촉 기억 → 실제 착지 후보/비용을 함께 거친다. 원점과 반경이 달라도
 // 평지는 평지로 남고 발 목표만 지면 위 한 반경에 있어야 한다.
 void RunHeightContract() {
@@ -191,6 +240,9 @@ void RunHeightContract() {
 
 int main() {
   try {
+    RunFractionalMemory(0.02);
+    RunFractionalMemory(0.05);
+    RunFractionalMemory(0.10);
     RunHeightContract();
     Run(0.05);
     Run(0.10);

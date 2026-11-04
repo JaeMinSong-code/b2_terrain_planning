@@ -1,9 +1,9 @@
 /**
  * @file support_patch.h
  * @brief 작은 접촉 발 영역을 로컬 지도 안에 기억하고 계획 입력에 반영한다.
- * @version 0.0.4
+ * @version 0.0.5
+ * @update 2026-11-04: 접촉 셀의 최초 지도 좌표를 보존해 반복 재배치의 누적 이동을 방지함.
  * @update 2026-11-03: 호출자 없는 SupportPatchHalfWidth shim을 제거함.
- * @update 2026-10-29: 지도 지면과 발 중심의 높이 계약 및 반경 변환을 통일함.
  */
 #pragma once
 
@@ -39,5 +39,8 @@ class SupportPatchMemory {
  private:
   std::optional<HeightMap> memory_;
   Eigen::MatrixXd stamps_;
+  // 재배치된 셀 중심이 아니라 접촉을 기록한 당시의 지도 좌표를 유지한다.
+  Eigen::MatrixXd observed_x_;
+  Eigen::MatrixXd observed_y_;
 };
 }  // namespace b2_terrain_planner
