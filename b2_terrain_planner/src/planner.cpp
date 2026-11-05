@@ -1,9 +1,9 @@
 /**
  * @file planner.cpp
  * @brief 접촉 조합별 생성 Jacobian과 지형 비용의 Gauss–Newton QP로 trot을 최적화한다.
- * @version 0.0.49
+ * @version 0.0.50
+ * @update 2026-11-05: 물리 모델·후보 탐색을 유지하고 SQP 도달거리 상한에만 여유를 적용함.
  * @update 2026-11-05: 시간 제한 해제와 성공해 전용 재계획을 지원하고 실패 페널티 전달을 제거함.
- * @update 2026-11-05: 측정 발만으로 된 상수 면적 제약을 제외해 해소 불가능한 QP 실패를 막음.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -291,7 +291,7 @@ class Problem {
           Profile* profile, bool full_evaluation, const TerrainModel* terrain,
           bool block_assembly, bool polynomial_tail,
           double pitch_weight, double nominal_kinematics_weight, double orientation_limit,
-          double backward_weight, double vz_weight,
+          double backward_weight, double vz_weight, double max_reach_margin,
           TerrainLayer terrain_layer = TerrainLayer::kGround)
       : robot_(robot), input_(input), intervals_(intervals),
         phases_(MakeHorizon(input.gait_time, robot.period, robot.duty,
@@ -363,7 +363,7 @@ class Problem {
     parameters_[22] = robot.height;
     parameters_[23] = robot.friction;
     parameters_[24] = robot.leg_min;
-    parameters_[25] = robot.leg_max;
+    parameters_[25] = robot.leg_max - max_reach_margin;
     parameters_.segment<3>(26) = input.command;
     parameters_.segment<12>(29) = Eigen::Map<const Vector>(robot.reference_legs.data(), 12);
     if (robot.use_reference_legs) parameters_[41] = 1;
@@ -377,7 +377,7 @@ class Problem {
     nominal_kinematics_weight_ = nominal_kinematics_weight;
     parameters_[44] = orientation_limit;
     parameters_.segment<4>(45) = robot.reach_min;
-    parameters_.segment<4>(49) = robot.reach_max;
+    parameters_.segment<4>(49) = robot.reach_max.array() - max_reach_margin;
     parameters_[53] = std::sqrt(vz_weight);
     backward_weight_ = backward_weight;
     Eigen::Vector3d world_command(input.command.x(), input.command.y(), 0.0);
@@ -2049,6 +2049,12 @@ Vector ProjectConstraints(const Problem& problem, Vector x, Profile* profile,
 }
 
 void Validate(const Robot& r, const Input& input, const Settings& settings) {
+  if (!std::isfinite(settings.max_reach_margin) || settings.max_reach_margin < 0 ||
+      r.leg_max - settings.max_reach_margin <= r.leg_min ||
+      (r.use_reference_legs &&
+       (r.reach_max.array() - settings.max_reach_margin <= r.reach_min.array()).any())) {
+    throw std::invalid_argument("invalid maximum reach margin");
+  }
   if (!std::isfinite(settings.foothold_backward_weight) || settings.foothold_backward_weight < 0) {
     throw std::invalid_argument("invalid foothold backward weight");
   }
@@ -2350,7 +2356,8 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
                     &result.profile, settings.full_evaluation, terrain_pointer,
                     settings.block_assembly, settings.polynomial_tail,
                     settings.pitch_weight, settings.nominal_kinematics_weight, settings.orientation_limit,
-                    settings.foothold_backward_weight, settings.vz_weight, layer);
+                    settings.foothold_backward_weight, settings.vz_weight,
+                    settings.max_reach_margin, layer);
     result.stage = "initialization";
     int replaced_leg = -1;
     if (alternative != nullptr) replaced_leg = alternative->leg;

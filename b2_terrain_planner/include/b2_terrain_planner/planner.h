@@ -1,9 +1,9 @@
 /**
  * @file planner.h
  * @brief 평지·지형 trot의 SQP 입력·출력 및 시간 구간 계획 계약.
- * @version 0.0.37
+ * @version 0.0.38
+ * @update 2026-11-05: SQP 최대 도달거리 축소 여유 설정을 추가함.
  * @update 2026-11-05: 시간 제한 0의 해제 의미와 동일 계산 내부 초기화 전용 중간값을 명시함.
- * @update 2026-11-05: 착지점 단계·지도 관측·비용 진단을 추가하고 제어 계산과 분리함.
  */
 #ifndef B2_TERRAIN_PLANNER_PLANNER_H_
 #define B2_TERRAIN_PLANNER_PLANNER_H_
@@ -101,6 +101,7 @@ struct Settings {
   int max_iterations = 60;
   int realtime_iterations = 0;  // 0: 기존 수렴. 양수: feasible 개선 후 다음 호출에서 계속.
   double orientation_limit = 0.35;  // pitch/roll 절댓값 상한 [rad], 0 < limit < pi/2.
+  double max_reach_margin = 0.0;  // SQP 최대 다리 길이에서 뺄 거리 [m]. 모델·후보 탐색은 유지.
   double pitch_weight = 30.0;  // 수평 pitch 선호 비용. 각도 제한과 별개다.
   double nominal_kinematics_weight = 7.0;  // 지지 중간 시각의 식 (33) 비용.
   double vz_weight = 0.0;  // 월드 수직속도 제곱 비용(0=비활성). 지형-인지 기준 도입 전까지 꺼 둔다.

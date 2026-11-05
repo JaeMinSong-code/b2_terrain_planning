@@ -554,6 +554,14 @@ RViz의 Fixed Frame과 연결되는 TF도 같은 좌표 계약에 맞춰야 한�
 - TF 변환은 수행하지 않는다. `frame`과 `state_frame`의 이름이 달라도 수치 원점·축은 같아야 한다.
   gait 시간은 유효한 WBC 보행 시계를 우선 사용한다. 새 WBC 세션으로 KF 원점이 초기화되면
   계획기와 지도도 재시작해 기존 좌표·계획을 비워야 한다.
+- `planner.common.max_reach_margin: 0.02`는 SQP 최대 도달거리에서만 2cm를 뺀다.
+  B2의 상한은 약 0.6943m에서 0.6743m가 되며 최소 거리·제약 표본·비용은 유지한다.
+  물리 URDF·관절 한계·스윙 생성·WBC와 초기 후보의 기존 2cm 탐색 여유는 바꾸지 않는다.
+  API/ROS 파라미터 기본값 0은 기존 상한이며 실행 YAML이 0.02를 선택한다.
+  지지 구간의 여유이므로 스윙 전체 도달성을 보장하지 않는다. 제약 개수는 그대로지만
+  실행 가능 영역이 줄어 수렴 시간·실패율·계획 공급 영향은 실제 보행에서 확인해야 한다.
+  ROS Release 빌드와 support_combination/config_generation/committed_swing/
+  planner_retry/swing_reference 5개 회귀 시험을 통과했다. 실제 지형 보행은 미검증이다.
 - GIAC는 계획 시작 자세의 관성을 고정하는 SRBD 근사다. SQP 도달 길이 제약은
   실제 관절별 IK 검사와 같지 않으며, 이번 변경으로 별도 최종 IK 검사는 수행하지 않는다.
 

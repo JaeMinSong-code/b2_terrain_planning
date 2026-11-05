@@ -1,9 +1,9 @@
 /**
  * @file support_combination_test.cpp
  * @brief 세 지지의 실제 발 조합·미분·몸통 계획과 trot 재개를 검증한다.
- * @version 0.0.5
+ * @version 0.0.6
+ * @update 2026-11-05: 2cm 도달거리 여유에서 지지 조합별 계획과 반경 상한을 검증함.
  * @update 2026-11-03: 제거한 IK 검증 결과 필드 검사를 정리함.
- * @update 2026-10-29: nominal 전용 중립 다리 기준점과 높이로 B2 옆방향 링크를 반영함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -216,6 +216,7 @@ void CheckPlanner() {
   nominal.command.x() = .1;
   Settings settings;
   settings.time_limit = 3;
+  settings.max_reach_margin = .02;
   settings.sample_intervals = 4;
   settings.structured_equalities = true;
   settings.lapack_svd = true;
@@ -242,6 +243,18 @@ void CheckPlanner() {
     const auto dense = Solve(robot, input, settings);
     Check(dense.success, "dense three-support solve: " + dense.status);
     for (double time : {0.0, .2, .4, .6, .8}) {
+      const Vector6 pose = Evaluate(result, time);
+      const Eigen::Matrix3d rotation =
+          (Eigen::AngleAxisd(pose[3], Eigen::Vector3d::UnitZ()) *
+           Eigen::AngleAxisd(pose[4], Eigen::Vector3d::UnitY()) *
+           Eigen::AngleAxisd(pose[5], Eigen::Vector3d::UnitX())).toRotationMatrix();
+      for (int leg = 0; leg < 4; ++leg) {
+        if (!contacts[leg]) continue;
+        const Eigen::Vector3d hip = pose.head<3>() + rotation * robot.hips.row(leg).transpose();
+        Check((hip - input.feet.row(leg).transpose()).norm() <=
+                  robot.reach_max[leg] - settings.max_reach_margin + 1e-4,
+              "support exceeds reduced reach limit");
+      }
       Check((Evaluate(result, time) - Evaluate(independent, time)).norm() < 2e-5,
             "non-supporting foot changed the body plan");
       Check((Evaluate(result, time) - Evaluate(dense, time)).norm() < 2e-5,

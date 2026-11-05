@@ -128,6 +128,8 @@ planner:
     previous_foothold_weight: 0.01  # TAMOLS Table I.
     # 논문 식 (33): 지지 중간 시각의 월드 엉덩이–발 벡터 비용.
     nominal_kinematics_weight: 7.0
+    # SQP 지지발 도달거리 상한만 2cm 축소. 스윙·WBC·후보 탐색 여유는 유지.
+    max_reach_margin: 0.02
     # 명령 0 유지 중 CoM 앵커 위치 유지: 이탈 × gain을 ±max_velocity로 잘라
     # 속도 명령에 더한다. 최적화에 위치 추종 항이 없어 생기는 random walk 억제.
     station_keeping.enabled: false
