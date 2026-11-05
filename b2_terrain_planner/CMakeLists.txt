@@ -19,6 +19,7 @@ if(NOT B2_CONFIG_RESULT STREQUAL "0")
 endif()
 find_package(Eigen3 3.3 REQUIRED NO_MODULE)
 find_package(yaml-cpp REQUIRED)
+find_package(Threads REQUIRED)
 set(BLA_SIZEOF_INTEGER 4)
 find_package(LAPACK REQUIRED)
 find_package(RBDL REQUIRED COMPONENTS URDFREADER)
@@ -49,11 +50,11 @@ target_include_directories(tamols_kernels PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/development/generated>)
 target_link_libraries(tamols_kernels PRIVATE m)
 add_library(tamols_sqp SHARED src/planner.cpp src/terrain.cpp src/robot_model.cpp src/dense_svd.cpp
-    src/support_patch.cpp src/map_datum.cpp)
+    src/support_patch.cpp src/map_datum.cpp src/solver_diagnostics.cpp)
 target_include_directories(tamols_sqp PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include/${PROJECT_NAME}> PRIVATE ${OSQP_INCLUDE_DIR} ${RBDL_INCLUDE_DIR})
-target_link_libraries(tamols_sqp PUBLIC Eigen3::Eigen PRIVATE tamols_kernels ${OSQP_LIBRARY} ${LAPACK_LIBRARIES}
+target_link_libraries(tamols_sqp PUBLIC Eigen3::Eigen PRIVATE yaml-cpp Threads::Threads tamols_kernels ${OSQP_LIBRARY} ${LAPACK_LIBRARIES}
     ${RBDL_LIBRARY} ${RBDL_URDFREADER_LIBRARY} PkgConfig::TINYXML2)
 add_executable(tamols_solve src/solve_main.cpp)
 target_link_libraries(tamols_solve PRIVATE tamols_sqp yaml-cpp)
@@ -78,6 +79,13 @@ install(FILES scripts/elevation_common.py DESTINATION lib/${PROJECT_NAME})
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(solver_diagnostics_test development/tests/solver_diagnostics_test.cpp)
+    target_compile_definitions(solver_diagnostics_test PRIVATE
+        B2_BUILD_MODEL_PATH="${CMAKE_CURRENT_SOURCE_DIR}/model/unitree_b2/b2.urdf")
+    target_link_libraries(solver_diagnostics_test PRIVATE tamols_sqp)
+    add_test(NAME solver_diagnostics_test COMMAND solver_diagnostics_test)
+    set_tests_properties(solver_diagnostics_test PROPERTIES
+        ENVIRONMENT "OPENBLAS_NUM_THREADS=1;OMP_NUM_THREADS=1;LD_LIBRARY_PATH=$<TARGET_FILE_DIR:tamols_sqp>:$ENV{LD_LIBRARY_PATH}")
     add_executable(foothold_diagnostics_test development/tests/foothold_diagnostics_test.cpp)
     target_link_libraries(foothold_diagnostics_test PRIVATE tamols_sqp)
     add_test(NAME foothold_diagnostics_test COMMAND foothold_diagnostics_test)

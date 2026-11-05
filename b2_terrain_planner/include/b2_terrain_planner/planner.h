@@ -1,9 +1,9 @@
 /**
  * @file planner.h
  * @brief 평지·지형 trot의 SQP 입력·출력 및 시간 구간 계획 계약.
- * @version 0.0.38
+ * @version 0.0.39
+ * @update 2026-11-05: 후보별 solver 계측과 오프라인 line-search 진단을 추가함.
  * @update 2026-11-05: SQP 최대 도달거리 축소 여유 설정을 추가함.
- * @update 2026-11-05: 시간 제한 0의 해제 의미와 동일 계산 내부 초기화 전용 중간값을 명시함.
  */
 #ifndef B2_TERRAIN_PLANNER_PLANNER_H_
 #define B2_TERRAIN_PLANNER_PLANNER_H_
@@ -87,6 +87,7 @@ std::string QpReuseModeName(QpReuseMode mode);
 struct Settings {
   QpReuseMode qp_reuse = QpReuseMode::kNone;
   bool full_evaluation = false;
+  bool line_search_diagnostics = false;  // 오프라인 전용: 보정 전 후보를 추가 평가한다.
   bool foothold_diagnostics = false;  // 진단 전용. ROS 기본값은 true.
   bool qp_working_set = false;
   bool structured_equalities = false;
@@ -201,6 +202,43 @@ struct Profile {
 };
 
 // 동일한 모델·좌표계의 재계획 초기 추정값. 갱신 지형에서 다시 검증하며 실패한 계획은 재사용하지 않는다.
+// 후보 수락 조건을 바꾸지 않는 기록. before 값은 상세 진단에서만 채운다.
+struct LineSearchDiagnostic {
+  int iteration = 0;
+  int search = 0;
+  double alpha = 0;
+  double penalty = 0;
+  double current_cost = 0;
+  double current_violation = 0;
+  double current_scaled_violation = 0;
+  double slope = 0;
+  double predicted_change = 0;
+  double acceptance_bound = 0;
+  double step_norm = 0;
+  std::optional<double> before_cost;
+  std::optional<double> before_violation;
+  std::optional<double> before_scaled_violation;
+  std::optional<double> after_cost;
+  std::optional<double> after_violation;
+  std::optional<double> after_scaled_violation;
+  std::optional<double> correction_norm;
+  double projection_seconds = 0;
+  double diagnostic_seconds = 0;
+  bool accepted = false;
+  bool terrain_domain_error = false;
+};
+
+struct SolveAttemptDiagnostic {
+  std::string layer;
+  int leg = -1;
+  std::string status;
+  bool success = false;
+  int iterations = 0;
+  double elapsed = 0;
+  Profile profile;
+  std::vector<LineSearchDiagnostic> line_search;
+};
+
 struct SeedContext {
   double gait_time = 0.0;
   double period = 0.0;
@@ -292,6 +330,8 @@ struct Result {
   double cost = 0.0;
   double violation = 0.0;
   Profile profile;
+  std::vector<LineSearchDiagnostic> line_search;
+  std::vector<SolveAttemptDiagnostic> solver_attempts;
   Feet footholds = Feet::Zero();
   std::vector<Phase> phases;
   std::vector<Eigen::Matrix<double, 6, 5>> coefficients;  // Physical seconds.

@@ -64,6 +64,24 @@ ctest --test-dir build/b2_terrain_planner --output-on-failure
 /tmp/b2-terrain-cpu-build/tamols_solve --help
 ```
 
+실패하거나 100ms 이상 걸린 계산의 입력은 다음 실행부터
+`/tmp/b2_sqp_diagnostics/<실행 시각>/solve_*.yaml`에 최대 32개 순환 저장된다.
+100ms는 **저장 기준**이며 계산 제한이 아니다. 파일의 `solve_start_ns`로 사건을 선택한다.
+
+```bash
+source ~/ros2_ws/install/setup.bash
+# 진단 파일의 실제 경로로 바꾼다.
+SQP_SNAPSHOT="/tmp/b2_sqp_diagnostics/<실행시각>/solve_0.yaml"
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 ros2 run b2_terrain_planner tamols_solve \
+  --replay "$SQP_SNAPSHOT" > /tmp/sqp_baseline.yaml
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 ros2 run b2_terrain_planner tamols_solve \
+  --replay "$SQP_SNAPSHOT" --trace-line-search > /tmp/sqp_trace.yaml
+```
+
+재생은 모터·ROS 명령을 발행하지 않는다. 해를 못 찾은 재생의 종료 코드는 2이며,
+진단 YAML은 출력된다. 상세 계측에는 추가 평가 시간이 포함되므로 소요 시간은 기준 재생으로
+판단한다. 원본과 같은 빌드·URDF·BLAS 스레드 설정을 사용한다.
+
 ### 2. elevation map 실행
 
 맵 실행기는 환경변수로 설정하는 단일 스크립트다. 입력 어댑터·맵·선택적 RViz를 실행하며

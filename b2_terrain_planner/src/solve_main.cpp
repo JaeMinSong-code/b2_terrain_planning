@@ -1,11 +1,12 @@
 /**
  * @file solve_main.cpp
  * @brief ROS 없이 단일 설정의 예제 또는 개별 평지·지형 입력을 읽고 몸통 계획을 YAML로 출력한다.
- * @version 0.0.32
+ * @version 0.0.33
+ * @update 2026-11-05: 입력 snapshot의 기준 재생과 상세 line-search 계측 옵션을 추가함.
  * @update 2026-11-04: 앞/뒤 좌우 발 쌍의 Y 간격에만 근접 지수 비용을 적용함.
- * @update 2026-11-04: 발 주변 셀·착지점의 방향별 지수 거리 비용을 연결함.
  */
 #include "b2_terrain_planner/planner.h"
+#include "b2_terrain_planner/solver_diagnostics.h"
 #include "b2_terrain_planner/robot_model.h"
 
 #include <filesystem>
@@ -474,11 +475,26 @@ int main(int argc, char** argv) {
   bool show_profile = false;
   std::string warm_path;
   try {
+    if (argc >= 3 && std::string(argv[1]) == "--replay") {
+      if (argc > 4 || (argc == 4 && std::string(argv[3]) != "--trace-line-search")) {
+        throw std::invalid_argument("usage: tamols_solve --replay SNAPSHOT [--trace-line-search]");
+      }
+      auto snapshot = b2_terrain_planner::LoadSolverSnapshot(argv[2]);
+      if (argc == 4) snapshot.settings.line_search_diagnostics = true;
+      const b2_terrain_planner::Result* seed = nullptr;
+      if (snapshot.previous) seed = &*snapshot.previous;
+      auto result = b2_terrain_planner::Solve(snapshot.robot, snapshot.input, snapshot.settings, seed);
+      Print(result, true, snapshot.settings, snapshot.robot, snapshot.input);
+      std::cout << "\n" << b2_terrain_planner::SolverDiagnosticsYaml(result.solver_attempts) << "\n";
+      if (result.success) return 0;
+      return 2;
+    }
     InitializeB2(&robot, &input);
     for (int i = 1; i < argc; ++i) {
       std::string option = argv[i];
       if (option == "--help") {
-        std::cout << "tamols_solve [--input YAML] [--speed M/S] [--gait-time S] "
+        std::cout << "tamols_solve --replay SNAPSHOT [--trace-line-search]\n"
+                     "tamols_solve [--input YAML] [--speed M/S] [--gait-time S] "
                      "[--time-limit S] [--iterations N] [--fixed-feet] "
                      "[--profile] [--full-evaluation] "
                      "[--warm-start PLAN.yaml] "

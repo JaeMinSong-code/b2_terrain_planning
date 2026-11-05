@@ -407,7 +407,8 @@ RBDL로 FK·CoM·질량·CoM 기준 관성을 계산한다. 관절 순서는 FL/
 `--fast-replanning`은 QP 재사용·구조 등식·LAPACK 등을 묶은 CLI 프리셋이다.
 ROS 노드의 QP 정규화·반복 수·허용 오차와는 값이 다르다.
 
-합성 모델, 제약 해제, 상세 line-search 추적, 이상 추종 재생 CLI는 제공하지 않는다.
+합성 모델·제약 해제 CLI는 제공하지 않는다. solver snapshot은 `--replay`로 독립 재계산하고,
+`--trace-line-search`를 함께 주면 보정 전 후보를 추가 평가한다. WBC 추종 재생은 아니다.
 이전 출력의 제약 해제 표시가 참이면 warm start 입력을 거부한다.
 
 ### 맵과 ROS 계획 실행
@@ -665,6 +666,50 @@ QP 행렬을 매 반복 복사하지 않고 단계 기록을 모은 뒤 ROS 스�
 미관측 띠로 넘어가는 채택 단계의 전후 merit 기록을 검증한다.
 라이브러리 `Settings` 기본값은 OFF이며 ROS 비교 실행에서는 `foothold_diagnostics:=false`로
 끈다. 평지 시뮬 JSON 발행 검증은 기존 parkour 추락의 재현·원인 확정을 대신하지 않는다.
+
+### SQP 실패 시간 분리와 입력 재생
+
+`solve_status.solver_attempts`는 기본 계산·가상 바닥 초기화·실패한 대체 후보를 모두
+포함한다. 각 시도의 QP 호출/반복 수, QP 준비·setup·solve 시간, 행렬 분해 시간,
+line search와 제약 보정 시간을 구분한다. `line_search_seconds_inclusive`에는
+`projection_seconds_inclusive`가 포함되며, 보정에는 미분 평가와 행렬 분해가 포함된다.
+겹치는 시간을 합산하지 않는다. 기존 `result.profile`은 반환된 시도 하나의 계측이다.
+
+각 line-search 후보는 반복/검색 번호, alpha, penalty, 현재 비용·최대 제약 위반,
+예상 QP 목적 변화량, merit 기울기(slope), 실제 수락 경계, 보정 후 비용·제약 위반,
+보정량 무한대 노름과 수락 여부를 기록한다. 수락 조건과 solver 계산 경로는 유지한다.
+온라인에서는 `before_*`가 비어 있으며, 상세 재생만 `x + alpha * step`을 추가 평가한다.
+`after_cost + penalty * after_scaled_violation <= acceptance_bound`가 실제 수락 판정이다.
+`predicted_change`는 alpha를 적용하기 전 QP 목적의 예측 변화량이며, 수락 경계에는
+별도의 `slope`가 사용된다. `terrain_domain_error`는 보정/후보 평가가 지도 도메인에서
+벗어난 경우이며, 이때 after 값은 미측정일 수 있다.
+
+ROS의 `solver_diagnostic_directory` 기본값은 `/tmp/b2_sqp_diagnostics`이며 빈 문자열이면
+파일 저장을 끈다. 실행 시각 하위 디렉터리에서 실패 또는 100ms 이상 계산을 최대 32파일로
+순환 저장한다. 100ms는 진단 선별값으로 계산·계획 채택 제한을 복원하지 않는다.
+기록 대상은 실제 Solve 입력(높이 datum·접촉 기억 반영 후 지도 포함), Robot 파라미터,
+모든 Settings, 이전 성공해의 다항식·위상·margin·SeedContext, reference-prefix와 확정
+스윙 착지점, 각 시도의 상세 계측이다. ns는 정수, double은 17자리로 저장하며 URDF 내용도
+기록하여 변경된 URDF로의 재생을 거부한다. 파일은 계산 완료 알림 이후 별도 스레드에서
+직렬화·기록하고 완료 파일만 rename으로 공개한다. 대기 작업은 한 개만 유지하며 밀리면
+오래된 대기 작업을 교체한다. `diagnostic_jobs_dropped`·`diagnostic_write_errors`로 누락을
+확인한다. 큰 진단 배열은 실행 계획 이력과 다음 warm start에 복제하지 않는다.
+
+`tamols_solve --replay SNAPSHOT`은 저장된 설정과 성공해로 기준 재생한다. 뒤에
+`--trace-line-search`를 붙이면 보정 전후 비용·위반을 비교한다. 추가 평가 시간이 있으므로
+상세 모드의 시간은 원 실행 시간으로 해석하지 않는다. 시간 제한이 양수인 별도 입력은
+계측 부하로 종료 시점이 달라질 수도 있다. 빌드·URDF·BLAS 스레드 설정을 맞추고 기준
+재생의 상태·반복 수·비용·위반을 원 기록과 먼저 대조한다. 다른 스케줄링 환경의 벽시계
+시간까지 동일하다고 보장하지 않는다. solver 재생은 시뮬 보행 재현이 아니다.
+
+2026-11-05 16:53:38 실행의 4.67초 실패는 기본 계산과 대체 후보 네 번의 합이었다.
+당시 rosbag에는 상세 계측과 이전 성공해 전체가 없어서, QP/반복 보정별 실제 시간은
+소급 확정할 수 없다. 이 변경은 해당 사건의 원인 수정이 아니라 이후 실패의 측정 준비다.
+진단 시험은 snapshot 왕복 정밀도, 기준 재생·상세 계측 간 계획 일치, 실패한 대체 후보의
+기록 보존, 비동기 파일 저장을 검증한다. solver/foothold diagnostics·planner retry·
+committed swing·config generation 5개 시험이 통과했다. 변경 전후 solver의 같은 B2
+시험 입력 20회 비교에서는 결과가 같고 중앙값이 모두 약 5.8ms였다. 이는 단일 입력의
+오프라인 비교이며, 파일 기록 동시 실행과 실제 지형 보행의 부하·성공률은 별도 확인한다.
 
 ### 계산 완료 알림과 계획 전달
 

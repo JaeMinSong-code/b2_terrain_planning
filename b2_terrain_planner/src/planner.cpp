@@ -1,9 +1,9 @@
 /**
  * @file planner.cpp
  * @brief 접촉 조합별 생성 Jacobian과 지형 비용의 Gauss–Newton QP로 trot을 최적화한다.
- * @version 0.0.50
+ * @version 0.0.51
+ * @update 2026-11-05: 계산 판단을 유지하며 모든 시도의 QP·보정·탐색 진단을 보존함.
  * @update 2026-11-05: 물리 모델·후보 탐색을 유지하고 SQP 도달거리 상한에만 여유를 적용함.
- * @update 2026-11-05: 시간 제한 해제와 성공해 전용 재계획을 지원하고 실패 페널티 전달을 제거함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -2519,15 +2519,50 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
         if (elapsed() >= time_limit) break;
         Vector trial_x;
         Evaluation candidate;
+        LineSearchDiagnostic diagnostic;
+        diagnostic.iteration = iteration + 1;
+        diagnostic.search = search + 1;
+        diagnostic.alpha = alpha;
+        diagnostic.penalty = penalty;
+        diagnostic.current_cost = eval.cost;
+        diagnostic.current_violation = violation;
+        diagnostic.current_scaled_violation = current_violation;
+        diagnostic.slope = slope;
+        diagnostic.predicted_change = predicted_change;
+        diagnostic.acceptance_bound = current_merit + 1e-4 * alpha * std::min(-1e-12, slope);
+        diagnostic.step_norm = (alpha * step).lpNorm<Eigen::Infinity>();
+        // 추가 평가는 재생 전용이며 탐색의 입력·기울기·수락 조건을 변경하지 않는다.
+        if (settings.line_search_diagnostics) {
+          const auto diagnostic_start = Clock::now();
+          try {
+            const Evaluation raw = problem.EvaluateAt(x + alpha * step, EvaluationMode::kValues);
+            diagnostic.before_cost = raw.cost;
+            diagnostic.before_violation = Violation(raw, Vector::Ones(raw.values.size()));
+            diagnostic.before_scaled_violation = Violation(raw, scaling);
+          } catch (const TerrainDomainError&) {}
+          diagnostic.diagnostic_seconds =
+              std::chrono::duration<double>(Clock::now() - diagnostic_start).count();
+        }
+        const double projection_before = result.profile.projection_seconds;
         try {
           trial_x = ProjectConstraints(problem, x + alpha * step, &result.profile, settings,
                                        &structure_cache, 0, projection_linearization, &chord_cache);
+          diagnostic.projection_seconds = result.profile.projection_seconds - projection_before;
+          diagnostic.correction_norm = (trial_x - (x + alpha * step)).lpNorm<Eigen::Infinity>();
           candidate = problem.EvaluateAt(trial_x, EvaluationMode::kValues);
         } catch (const TerrainDomainError&) {
+          diagnostic.projection_seconds = result.profile.projection_seconds - projection_before;
+          diagnostic.terrain_domain_error = true;
+          result.line_search.push_back(std::move(diagnostic));
           alpha *= 0.5;
           continue;
         }
+        diagnostic.after_cost = candidate.cost;
+        diagnostic.after_violation = Violation(candidate, Vector::Ones(candidate.values.size()));
+        diagnostic.after_scaled_violation = Violation(candidate, scaling);
         const double merit = candidate.cost + penalty * Violation(candidate, scaling);
+        diagnostic.accepted = merit <= diagnostic.acceptance_bound;
+        result.line_search.push_back(std::move(diagnostic));
         if (merit <= current_merit + 1e-4 * alpha * std::min(-1e-12, slope)) {
           const double improvement = eval.cost - candidate.cost;
           const double candidate_violation = Violation(candidate, Vector::Ones(candidate.values.size()));
@@ -2626,6 +2661,17 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
     result.status = error.what();
   }
   result.elapsed = elapsed();
+  SolveAttemptDiagnostic diagnostic;
+  diagnostic.layer = "ground";
+  if (layer == TerrainLayer::kVirtualFloor) diagnostic.layer = "virtual_floor";
+  if (alternative != nullptr) diagnostic.leg = alternative->leg;
+  diagnostic.status = result.status;
+  diagnostic.success = result.success;
+  diagnostic.iterations = result.iterations;
+  diagnostic.elapsed = result.elapsed;
+  diagnostic.profile = result.profile;
+  diagnostic.line_search = std::move(result.line_search);
+  result.solver_attempts.push_back(std::move(diagnostic));
   return result;
 }
 
@@ -2638,6 +2684,11 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
   // 외부 계산의 실패값은 초기값·착지 anchor·새 슬롯 판정에 사용하지 않는다.
   if (previous && !previous->success) previous = nullptr;
   Feet initial = input.feet;
+  std::vector<SolveAttemptDiagnostic> solver_attempts;
+  const auto collect = [&](Result& attempt) {
+    for (auto& diagnostic : attempt.solver_attempts) solver_attempts.push_back(std::move(diagnostic));
+    attempt.solver_attempts.clear();
+  };
   try {
     Validate(robot, input, settings);
   } catch (const std::exception&) {
@@ -2687,6 +2738,7 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
     if (std::isfinite(preparation_end)) warm.time_limit = preparation_end - elapsed();
     Result candidate = SolveAttempt(robot, input, warm, previous, nullptr, nullptr,
                                     prepared, TerrainLayer::kVirtualFloor);
+    collect(candidate);
     preparation_diagnostics = candidate.foothold_diagnostic_seconds;
     preparation_trace = std::move(candidate.foothold_trace);
     initialization_status = "coarse_fallback:" + candidate.status;
@@ -2760,7 +2812,9 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
   if (coarse) { initializer = &*coarse; refined_ptr = &refined; }
   Result result = SolveAttempt(robot, input, final_settings, previous, nullptr, &initial,
                               prepared, TerrainLayer::kGround, initializer, refined_ptr);
+  collect(result);
   auto finish = [&]() {
+    result.solver_attempts = std::move(solver_attempts);
     result.foothold_trace.insert(result.foothold_trace.begin(),
         std::make_move_iterator(preparation_trace.begin()),
         std::make_move_iterator(preparation_trace.end()));
@@ -2823,6 +2877,7 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
       // 지지면을 바꾸면 선형화도 크게 바뀌므로 5회 RTI 조기 종료를 기다리지 않는다.
       if (retry.realtime_iterations > 0) retry.realtime_iterations = std::max(20, retry.realtime_iterations);
       auto trial = SolveAttempt(robot, input, retry, previous, &entry.second, nullptr, prepared);
+      collect(trial);
       entry.second.status = trial.status;
       entry.second.elapsed = trial.elapsed;
       entry.second.success = trial.success;

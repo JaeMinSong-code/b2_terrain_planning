@@ -1,14 +1,15 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.52
+ * @version 0.0.53
+ * @update 2026-11-05: 실패·장시간 계산의 재생 입력을 별도 스레드로 저장하고 계측을 발행함.
  * @update 2026-11-05: package 설정의 최대 도달거리 여유를 SQP로 전달함.
- * @update 2026-11-05: 계산 시작 snapshot 나이와 prefix 인계 마감에 따른 완료 결과 거부를 제거함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
  */
 #include "b2_terrain_planner/planner.h"
+#include "b2_terrain_planner/solver_diagnostics.h"
 #include "b2_terrain_planner/robot_model.h"
 #include "b2_terrain_planner/support_patch.h"
 #include "b2_terrain_planner/map_datum.h"
@@ -20,6 +21,7 @@
 #include <array>
 #include <deque>
 #include <cmath>
+#include <chrono>
 #include <filesystem>
 #include <functional>
 #include <future>
@@ -472,7 +474,31 @@ class TerrainPlannerNode : public rclcpp::Node {
       out << "{\"leg\":" << attempt.leg << ",\"status\":" << std::quoted(attempt.status)
           << ",\"success\":" << attempt.success << ",\"elapsed\":" << number(attempt.elapsed) << '}';
     }
-    out << "],\"foothold_diagnostics\":{\"schema_version\":1,\"enabled\":"
+    out << "],\"solver_attempts\":[";
+    for (std::size_t i = 0; i < result.solver_attempts.size(); ++i) {
+      if (i > 0) out << ',';
+      const auto& attempt = result.solver_attempts[i];
+      const auto& profile = attempt.profile;
+      out << "{\"layer\":" << std::quoted(attempt.layer)
+          << ",\"leg\":" << attempt.leg << ",\"status\":" << std::quoted(attempt.status)
+          << ",\"elapsed\":" << number(attempt.elapsed)
+          << ",\"iterations\":" << attempt.iterations
+          << ",\"qp_solve_seconds\":" << number(profile.qp_solve_seconds)
+          << ",\"qp_prepare_seconds\":" << number(profile.qp_prepare_seconds)
+          << ",\"qp_setup_seconds\":" << number(profile.qp_setup_seconds)
+          << ",\"projection_seconds_inclusive\":" << number(profile.projection_seconds)
+          << ",\"line_search_seconds_inclusive\":" << number(profile.line_search_seconds)
+          << ",\"svd_seconds\":" << number(profile.svd_seconds)
+          << ",\"qp_calls\":" << profile.qp_calls
+          << ",\"qp_iterations\":" << profile.qp_iterations
+          << ",\"line_search_trials\":" << attempt.line_search.size() << '}';
+    }
+    out << "],\"solver_diagnostic_directory\":" << std::quoted(diagnostic_directory_);
+    if (snapshot_writer_) {
+      out << ",\"diagnostic_jobs_dropped\":" << snapshot_writer_->dropped()
+          << ",\"diagnostic_write_errors\":" << snapshot_writer_->errors();
+    }
+    out << ",\"foothold_diagnostics\":{\"schema_version\":1,\"enabled\":"
         << settings_.foothold_diagnostics << ",\"frame\":" << std::quoted(input.frame)
         << ",\"map_stamp_ns\":" << rclcpp::Time(pending.map_stamp).nanoseconds()
         << ",\"datum_offset\":" << number(pending.diagnostic_datum_offset)
@@ -637,6 +663,15 @@ class TerrainPlannerNode : public rclcpp::Node {
     settings_.qp_eps_rel = 1e-3;
     settings_.qp_max_iterations = 4000;
     settings_.time_limit = declare_parameter<double>("time_limit", 0.0);
+    const auto diagnostic_root = declare_parameter<std::string>(
+        "solver_diagnostic_directory", "/tmp/b2_sqp_diagnostics");
+    if (!diagnostic_root.empty()) {
+      const auto run_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch()).count();
+      diagnostic_directory_ = (std::filesystem::path(diagnostic_root) /
+          std::to_string(run_ns)).string();
+      snapshot_writer_ = std::make_shared<SolverSnapshotWriter>(diagnostic_directory_);
+    }
     settings_.foothold_diagnostics = declare_parameter<bool>("foothold_diagnostics", true);
     settings_.orientation_limit =
         declare_parameter<double>("orientation_limit_deg", 60.0) * M_PI / 180.0;
@@ -1179,6 +1214,8 @@ class TerrainPlannerNode : public rclcpp::Node {
     solve_worker_ = std::async(std::launch::async,
         [robot = robot_, input = std::move(input), settings = settings_,
          previous = std::move(seed), solver = solver_, clock = get_clock(),
+         writer = snapshot_writer_, start_ns = solve_start_ns_, state_ns = stamp_ns,
+         map_ns = rclcpp::Time(map_stamp_).nanoseconds(),
          completed = std::move(completed), completion = completion_]() mutable {
           Result result;
           try {
@@ -1188,9 +1225,26 @@ class TerrainPlannerNode : public rclcpp::Node {
           } catch (const std::exception& error) {
             result.status = std::string("solve_exception: ") + error.what();
           }
-          // future를 먼저 ready로 만든 뒤 알린다. 알림 이후 future가 준비되는 경합을 막는다.
-          completed.set_value(std::make_pair(std::move(result), clock->now().nanoseconds()));
+          const auto end_ns = clock->now().nanoseconds();
+          std::optional<SolverSnapshot> snapshot;
+          // 100ms는 저장 선별값이다. 계산·발행·채택 마감이 아니다.
+          if (writer && (!result.success || result.elapsed >= 0.1)) {
+            snapshot.emplace();
+            snapshot->solve_start_ns = start_ns;
+            snapshot->state_stamp_ns = state_ns;
+            snapshot->map_stamp_ns = map_ns;
+            snapshot->robot = std::move(robot);
+            snapshot->input = std::move(input);
+            snapshot->settings = settings;
+            snapshot->previous = std::move(previous);
+            snapshot->status = result.status;
+            snapshot->elapsed = result.elapsed;
+            snapshot->attempts = result.solver_attempts;
+          }
+          // 파일 직렬화·쓰기 전에 완료를 알린다. 진단 오류로 계획을 취소하지 않는다.
+          completed.set_value(std::make_pair(std::move(result), end_ns));
           completion->Notify();
+          if (snapshot) writer->Submit(std::move(*snapshot));
         });
   }
 
@@ -1257,7 +1311,10 @@ class TerrainPlannerNode : public rclcpp::Node {
       if (pending.swing_terrain) {
         swing_terrain = &*pending.swing_terrain;
       }
+      // 큰 진단 배열이 실행 계획 이력과 다음 warm start에 복제되지 않게 분리한다.
+      auto diagnostics = std::move(result.solver_attempts);
       Publish(result, input, state, swing_terrain);
+      result.solver_attempts = std::move(diagnostics);
       // 실제 발행한 몸통 곡선을 다음 계산의 초기값으로 보관한다.
       previous_ = published_plans_.back().body;
       PublishSolveStatus(result, pending, true, "published");
@@ -1460,6 +1517,8 @@ class TerrainPlannerNode : public rclcpp::Node {
   std::optional<Result> previous_;
   std::function<Result(const Robot&, const Input&, const Settings&, const Result*)> solver_ = Solve;
   std::future<std::pair<Result, std::int64_t>> solve_future_;
+  std::shared_ptr<SolverSnapshotWriter> snapshot_writer_;
+  std::string diagnostic_directory_;
   std::future<void> solve_worker_;
   std::shared_ptr<SolveCompletion> completion_;
   std::int64_t completion_dispatch_ns_ = 0;
