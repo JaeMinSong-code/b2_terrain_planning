@@ -1,9 +1,9 @@
 /**
  * @file solve_main.cpp
  * @brief ROS 없이 단일 설정의 예제 또는 개별 평지·지형 입력을 읽고 몸통 계획을 YAML로 출력한다.
- * @version 0.0.34
+ * @version 0.0.35
+ * @update 2026-11-05: 재생에서 지형 대체 재시도를 끄는 옵션과 적용값 출력을 추가함.
  * @update 2026-11-05: 재생 전용 보정 생략 옵션과 실제 적용 모드 출력을 추가함.
- * @update 2026-11-05: 입력 snapshot의 기준 재생과 상세 line-search 계측 옵션을 추가함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/solver_diagnostics.h"
@@ -483,10 +483,12 @@ int main(int argc, char** argv) {
           snapshot.settings.line_search_diagnostics = true;
         } else if (option == "--no-line-search-projection") {
           snapshot.settings.skip_line_search_projection = true;
+        } else if (option == "--no-terrain-candidate-retries") {
+          snapshot.settings.terrain_candidate_retries = false;
         } else {
           throw std::invalid_argument(
               "usage: tamols_solve --replay SNAPSHOT [--trace-line-search] "
-              "[--no-line-search-projection]");
+              "[--no-line-search-projection] [--no-terrain-candidate-retries]");
         }
       }
       const b2_terrain_planner::Result* seed = nullptr;
@@ -495,6 +497,8 @@ int main(int argc, char** argv) {
       Print(result, true, snapshot.settings, snapshot.robot, snapshot.input);
       std::cout << "replay_skip_line_search_projection: " << std::boolalpha
                 << snapshot.settings.skip_line_search_projection << '\n';
+      std::cout << "replay_terrain_candidate_retries: "
+                << snapshot.settings.terrain_candidate_retries << '\n';
       std::cout << "\n" << b2_terrain_planner::SolverDiagnosticsYaml(result.solver_attempts) << "\n";
       if (result.success) return 0;
       return 2;
@@ -504,7 +508,7 @@ int main(int argc, char** argv) {
       std::string option = argv[i];
       if (option == "--help") {
         std::cout << "tamols_solve --replay SNAPSHOT [--trace-line-search] "
-                     "[--no-line-search-projection]\n"
+                     "[--no-line-search-projection] [--no-terrain-candidate-retries]\n"
                      "tamols_solve [--input YAML] [--speed M/S] [--gait-time S] "
                      "[--time-limit S] [--iterations N] [--fixed-feet] "
                      "[--profile] [--full-evaluation] "

@@ -1,9 +1,9 @@
 /**
  * @file solver_diagnostics_test.cpp
  * @brief snapshot 왕복 재생·상세 진단 불변성·비동기 저장을 검증한다.
- * @version 0.0.2
+ * @version 0.0.3
+ * @update 2026-11-05: 재시도 OFF의 기본 시도 보존과 보정 OFF 조합·snapshot 호환을 검증함.
  * @update 2026-11-05: 보정 생략 재생·상세 진단 일치와 이전 snapshot 호환을 검증함.
- * @update 2026-11-05: 성공해·확정 착지·지도·ns 정밀도와 실패 후보 계측을 확인함.
  */
 #include "b2_terrain_planner/solver_diagnostics.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -96,10 +96,15 @@ void Run(const std::filesystem::path& directory) {
   const auto field = legacy.find("    skip_line_search_projection: false\n");
   Check(field != std::string::npos, "projection setting missing from snapshot");
   legacy.erase(field, std::string("    skip_line_search_projection: false\n").size());
+  const std::string retry_field = "    terrain_candidate_retries: true\n";
+  const auto retry_offset = legacy.find(retry_field);
+  Check(retry_offset != std::string::npos, "retry setting missing from snapshot");
+  legacy.erase(retry_offset, retry_field.size());
   const auto legacy_path = (directory / "legacy.yaml").string();
   { std::ofstream stream(legacy_path); stream << legacy; }
-  Check(!LoadSolverSnapshot(legacy_path).settings.skip_line_search_projection,
-        "legacy snapshot disabled projection");
+  const auto legacy_settings = LoadSolverSnapshot(legacy_path).settings;
+  Check(!legacy_settings.skip_line_search_projection && legacy_settings.terrain_candidate_retries,
+        "legacy snapshot changed solver defaults");
   const auto replay = Solve(loaded.robot, loaded.input, loaded.settings, &*loaded.previous);
   SamePlan(baseline, replay);
   loaded.settings.line_search_diagnostics = true;
@@ -190,6 +195,24 @@ void Run(const std::filesystem::path& directory) {
   for (const auto& attempt : failed.solver_attempts) if (attempt.layer == "ground") ++ground;
   Check(ground == failed.terrain_attempts.size(), "discarded retry profiles lost");
   Check(ground > 1, "fixture did not exercise alternative retry");
+  loaded.settings.terrain_candidate_retries = false;
+  SaveSolverSnapshot(path, loaded);
+  loaded = LoadSolverSnapshot(path);
+  Check(!loaded.settings.terrain_candidate_retries, "retry setting lost");
+  const auto single = Solve(loaded.robot, loaded.input, loaded.settings, &*loaded.previous);
+  Check(!single.success && single.terrain_attempts.size() == 1,
+        "disabled retries changed failure or retried");
+  Check(single.status == failed.status && single.cost == failed.cost &&
+        single.violation == failed.violation && single.iterations == failed.iterations,
+        "disabling retries changed primary failed solve");
+  loaded.settings.skip_line_search_projection = true;
+  const auto direct = Solve(loaded.robot, loaded.input, loaded.settings, &*loaded.previous);
+  Check(!direct.success && direct.terrain_attempts.size() == 1,
+        "combined experiment retried or accepted infeasible input");
+  for (const auto& attempt : direct.solver_attempts) {
+    Check(attempt.leg == -1 && attempt.profile.projection_seconds == 0.0,
+          "combined experiment still projects or retries");
+  }
   std::cout << "line_search_records=" << records << " failed_ground_attempts=" << ground << '\n';
 }
 }  // namespace

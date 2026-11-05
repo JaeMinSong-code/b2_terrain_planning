@@ -713,13 +713,14 @@ committed swing·config generation 5개 시험이 통과했다. 변경 전후 so
 
 ### Line search 반복 보정 생략 비교
 
-재생 전용 `--no-line-search-projection`은 `Settings::skip_line_search_projection`을
-켜서 각 SQP line-search 후보를 `x + alpha * step` 그대로 평가한다. 기본값은 false이며
-ROS 파라미터와 실행 YAML에는 노출하지 않는다. 이전 schema 1 snapshot에 설정이 없으면
-false로 읽고, 새 snapshot에는 설정을 저장한다. 재생 출력에도 실제 적용값을 기록한다.
+재생 옵션 `--no-line-search-projection` 또는 시작 시 ROS 파라미터
+`line_search_projection: false`는 `Settings::skip_line_search_projection`을 켜서 각
+SQP line-search 후보를 `x + alpha * step` 그대로 평가한다. Settings 기본값은 false,
+ROS 파라미터 기본값은 true이며 기존 보정을 유지한다. 이전 schema 1 snapshot에 설정이
+없으면 기존값으로 읽고, 새 snapshot에는 설정을 저장한다. 재생 출력에도 적용값을 기록한다.
 
 생략 대상은 line search 내부의 `ProjectConstraints` 호출뿐이다. QP 계산·merit 수락식·
-alpha 축소·반복 한도·페널티 갱신·최종 성공 판정·대체 후보 재시도는 유지한다.
+alpha 축소·반복 한도·페널티 갱신·최종 성공 판정은 유지한다. 대체 후보 재시도는 별도 옵션으로 선택한다.
 가상 바닥 초기화와 착지점 정제도 유지하며, 가상 바닥 SQP 내부의 line search에는 같은
 비교 설정을 적용한다. 보정 생략 시 상세 진단의 before/after는 같은 후보를 나타내며,
 correction_norm과 projection_seconds는 0이다. 제약 자체를 제거하는 옵션이 아니다.
@@ -755,6 +756,43 @@ solve_4는 종료 상태가 QP 실패에서 line_search_failed로 바뀌어 기�
 committed swing·config generation 6개 CTest를 통과했다. ROS 환경의 설치 라이브러리를
 잘못 읽은 초기 측정은 제외했으며 비교 빌드 경로를 LD_LIBRARY_PATH 앞에 명시했다.
 설치본·온라인 설정은 변경하지 않았고 실제 보행은 미검증이다.
+
+### 시뮬 비교용 보정·대체 후보 재시도 선택
+
+`terrain.candidate_retries`는 시작 시 ROS bool 파라미터로 기본 true이다.
+false이면 `Settings::terrain_candidate_retries`를 꺼서 기본 실제 지형 시도 뒤의
+다른 높이 후보 탐색·SQP 재실행을 생략한다. 재생 CLI는
+`--no-terrain-candidate-retries`로 같은 설정을 선택한다. 이전 snapshot에서 필드가
+없으면 true를 사용하고, 신규 snapshot과 재생 출력에는 실제 설정을 보존한다.
+
+`line_search_projection: false`와 함께 쓰는 모드는 두 기능을 모두 생략하는 시뮬
+비교용이다. 가상 바닥 최적화·착지점 정제·기본 실제 지형 최적화는 유지한다.
+기본 시도가 실패하면 실패를 그대로 반환하고 기존 worker가 최신 입력으로 재계획한다.
+실패 중간값이나 페널티를 재사용하지 않으며 직전 발행 성공해만 기존대로 사용한다.
+실패 계산이 빨리 끝나더라도 실행할 계획 공급이 늘어난다는 보장은 없다.
+
+QP 계산·비용·제약·성공 판정과 발행·채택 판정은 변경하지 않는다. 시간 제한·80ms 채택
+기한·계산 시작 snapshot 나이 검사를 복원하지 않는다. 두 파라미터는 노드 시작 시만
+settings로 읽으며, 변경하려면 노드를 재시작한다. 시작 INFO와 TAMOLS_SOLVE JSON의
+`line_search_projection`·`terrain_candidate_retries`로 실제 적용 모드를 확인한다.
+기본 실행 YAML과 WBC는 변경하지 않으며 사용자 실행 명령은 README를 따른다.
+이 모드는 논문에 기술되지 않은 두 경로를 끄는 비교이며 저자 solver의 완전한 복제가 아니다.
+
+Release ROS 빌드와 관련 CTest 7개(solver/foothold diagnostics, terrain pipeline/reuse,
+committed swing, config generation, planner retry)를 통과했다. ROS 옵션의 worker 전달,
+실패 뒤 최신 입력으로 재계획, 구 snapshot 기본값과 두 설정의 저장·재생을 확인했다.
+같은 실제 실행의 여섯 snapshot에서 기본 경로의 최종 결과·탐색·QP 반복 수는 기존
+기준 재생과 정확히 일치했고, 두 옵션 OFF의 기본 시도는 이전 보정 OFF 재생의 기본
+시도와 일치했다. 모든 입력에서 projection 시간 0, 대체 후보 재시도 0을 확인했다.
+
+두 옵션 OFF의 경로 확인용 1회 재생 시간은 solve_0~5 순서로 약
+36/151/84/296/409/303ms였고 여섯 입력 모두 실패했다. 특히 기존 보정 OFF에서
+대체 후보로 성공했던 solve_2도 기본 시도 실패를 반환한다. 시간 단축을 성공해 공급
+개선으로 해석하지 않는다. 이는 폐루프 시작부터의 시뮬 보행 결과가 아니며 사용자
+보행 실험은 아직 미확인이다. 기본 설정은 유지하고 명시적인 실험 옵션으로만 선택한다.
+설치된 ROS 노드를 격리 domain 188에서 실행해 두 옵션 false, time_limit 0,
+graduated_initialization true를 parameter service와 시작 로그로 확인하고 정상 종료했다.
+이 확인에서는 상태 입력이나 보행 명령을 보내지 않았다.
 
 ### 계산 완료 알림과 계획 전달
 

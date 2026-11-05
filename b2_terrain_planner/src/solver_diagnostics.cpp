@@ -1,9 +1,9 @@
 /**
  * @file solver_diagnostics.cpp
  * @brief solver 입력의 명시적 YAML 직렬화와 한 슬롯 비동기 파일 기록.
- * @version 0.0.2
+ * @version 0.0.3
+ * @update 2026-11-05: 대체 후보 재시도 설정을 직렬화하고 이전 snapshot 기본값을 유지함.
  * @update 2026-11-05: 보정 생략 설정을 저장하고 이전 snapshot의 기본 보정 동작을 유지함.
- * @update 2026-11-05: 모든 후보의 계측·입력·초기 성공해를 보존하는 재생 자료를 추가함.
  */
 #include "b2_terrain_planner/solver_diagnostics.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -200,6 +200,9 @@ template <> void Visit(Archive& a, Settings& v) {
   // 기존 schema 1 snapshot에는 이 설정이 없으며 기본 보정을 유지한다.
   if (!a.reading || a.node["skip_line_search_projection"]) {
     a.Field("skip_line_search_projection", v.skip_line_search_projection);
+  }
+  if (!a.reading || a.node["terrain_candidate_retries"]) {
+    a.Field("terrain_candidate_retries", v.terrain_candidate_retries);
   }
   a.Field("line_search_diagnostics", v.line_search_diagnostics);
   a.Field("foothold_diagnostics", v.foothold_diagnostics);

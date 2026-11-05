@@ -1,9 +1,9 @@
 /**
  * @file planner.cpp
  * @brief 접촉 조합별 생성 Jacobian과 지형 비용의 Gauss–Newton QP로 trot을 최적화한다.
- * @version 0.0.52
+ * @version 0.0.53
+ * @update 2026-11-05: 초기화와 성공 판정을 유지하며 같은 입력의 대체 후보 재시도만 끌 수 있게 함.
  * @update 2026-11-05: 재생 비교용으로 line-search 후보의 반복 제약 보정을 생략할 수 있게 함.
- * @update 2026-11-05: 계산 판단을 유지하며 모든 시도의 QP·보정·탐색 진단을 보존함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -2835,7 +2835,8 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
                                       result.elapsed, result.success}};
   const bool retryable = result.status == "line_search_failed" ||
       result.status == "iteration_limit";
-  if (!result.success && retryable && elapsed() < time_limit) {
+  if (settings.terrain_candidate_retries && !result.success && retryable &&
+      elapsed() < time_limit) {
     // 같은 nominal과 목적함수를 유지하고, 각 다리의 다른 높이 지지면에서 시작한다.
     // 후보별로 남은 시간 안에서 몸통 SQP를 다시 수행한다.
     const auto phases = MakeHorizon(input.gait_time, robot.period, robot.duty,

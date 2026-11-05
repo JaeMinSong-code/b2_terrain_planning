@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.53
+ * @version 0.0.54
+ * @update 2026-11-05: 시뮬 비교용 보정·대체 재시도 ROS 옵션과 실제 적용값 진단을 연결함.
  * @update 2026-11-05: 실패·장시간 계산의 재생 입력을 별도 스레드로 저장하고 계측을 발행함.
- * @update 2026-11-05: package 설정의 최대 도달거리 여유를 SQP로 전달함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -97,7 +97,8 @@ Eigen::Quaterniond ZyxToQuat(double yaw, double pitch, double roll) {
 
 class TerrainPlannerNode : public rclcpp::Node {
  public:
-  TerrainPlannerNode() : rclcpp::Node("terrain_planner_node") {
+  explicit TerrainPlannerNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions())
+      : rclcpp::Node("terrain_planner_node", options) {
     state_topic_ = declare_parameter<std::string>("state_topic", "/robot/locomotion_state");
     state_frame_ = declare_parameter<std::string>("state_frame", "odom");
     state_max_age_ = declare_parameter<double>("state_max_age", 0.25);
@@ -225,6 +226,9 @@ class TerrainPlannerNode : public rclcpp::Node {
     get_node_waitables_interface()->add_waitable(completion_, nullptr);
     RCLCPP_INFO(get_logger(), "terrain_planner_node: state=%s map=%s plan=%s asynchronous, fallback=%.1fHz",
                 state_topic_.c_str(), map_topic_.c_str(), plan_topic_.c_str(), plan_rate_hz_);
+    RCLCPP_INFO(get_logger(), "SQP line_search_projection=%d terrain.candidate_retries=%d",
+                static_cast<int>(!settings_.skip_line_search_projection),
+                static_cast<int>(settings_.terrain_candidate_retries));
   }
 
   ~TerrainPlannerNode() override {
@@ -493,7 +497,9 @@ class TerrainPlannerNode : public rclcpp::Node {
           << ",\"qp_iterations\":" << profile.qp_iterations
           << ",\"line_search_trials\":" << attempt.line_search.size() << '}';
     }
-    out << "],\"solver_diagnostic_directory\":" << std::quoted(diagnostic_directory_);
+    out << "],\"line_search_projection\":" << !settings_.skip_line_search_projection
+        << ",\"terrain_candidate_retries\":" << settings_.terrain_candidate_retries
+        << ",\"solver_diagnostic_directory\":" << std::quoted(diagnostic_directory_);
     if (snapshot_writer_) {
       out << ",\"diagnostic_jobs_dropped\":" << snapshot_writer_->dropped()
           << ",\"diagnostic_write_errors\":" << snapshot_writer_->errors();
@@ -663,6 +669,10 @@ class TerrainPlannerNode : public rclcpp::Node {
     settings_.qp_eps_rel = 1e-3;
     settings_.qp_max_iterations = 4000;
     settings_.time_limit = declare_parameter<double>("time_limit", 0.0);
+    settings_.skip_line_search_projection =
+        !declare_parameter<bool>("line_search_projection", true);
+    settings_.terrain_candidate_retries =
+        declare_parameter<bool>("terrain.candidate_retries", true);
     const auto diagnostic_root = declare_parameter<std::string>(
         "solver_diagnostic_directory", "/tmp/b2_sqp_diagnostics");
     if (!diagnostic_root.empty()) {
