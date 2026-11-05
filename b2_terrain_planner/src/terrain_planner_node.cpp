@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.48
+ * @version 0.0.49
+ * @update 2026-11-05: 최신 상태로 성공·실패 후 즉시 재계획하고 동일 상태 재시도를 제거함.
  * @update 2026-11-05: 계산 완료 이벤트로 executor를 깨우고 진단 지도보다 계획을 먼저 발행함.
- * @update 2026-11-05: 원본·보정 지도와 단계별 착지점 진단을 solve_status로 발행함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -109,6 +109,7 @@ class TerrainPlannerNode : public rclcpp::Node {
     elevation_layer_ = declare_parameter<std::string>("elevation_layer", "elevation");
     plan_topic_ = declare_parameter<std::string>("plan_topic", "/terrain_planner/plan");
     frame_ = declare_parameter<std::string>("frame", "odom");
+    // 상태 수신·계산 완료가 재계획을 시작한다. 이 주기는 입력 대기 재확인용이다.
     plan_rate_hz_ = declare_parameter<double>("plan_rate_hz", 10.0);
     sample_dt_ = declare_parameter<double>("sample_dt", 0.02);
     // 핸드오버 마감시각·착지 대기 재개 유예. 계획이 상태 스냅샷 후 이 시간 안에
@@ -221,7 +222,7 @@ class TerrainPlannerNode : public rclcpp::Node {
     completion_ = std::make_shared<SolveCompletion>(
         get_node_base_interface()->get_context(), [this] { CompleteSolve(); });
     get_node_waitables_interface()->add_waitable(completion_, nullptr);
-    RCLCPP_INFO(get_logger(), "terrain_planner_node: state=%s map=%s plan=%s rate=%.1fHz",
+    RCLCPP_INFO(get_logger(), "terrain_planner_node: state=%s map=%s plan=%s asynchronous, fallback=%.1fHz",
                 state_topic_.c_str(), map_topic_.c_str(), plan_topic_.c_str(), plan_rate_hz_);
   }
 
@@ -993,7 +994,8 @@ class TerrainPlannerNode : public rclcpp::Node {
     if (const auto* active = ActivePlan()) swing_references_ = active->swings;
     // 위상을 멈추기 전에 착지해도 즉시 재계획한다. 미확인 지지는 OnTimer가 계획에서 제외한다.
     if (replan) retry_requested_ = true;
-    if (retry_requested_) OnTimer();
+    // 계산 중에는 최신 상태만 보관하고, 유휴 상태이면 주기 타이머를 기다리지 않는다.
+    if (retry_requested_ || !solve_future_.valid()) OnTimer();
   }
 
   void OnTimer() {
@@ -1002,7 +1004,6 @@ class TerrainPlannerNode : public rclcpp::Node {
       PublishPipelineStatus("reset", "clock_reversed");
       ++generation_;
       retry_requested_ = false;
-      same_state_retry_used_ = false;
       swing_references_ = {};
       state_.reset();
       terrain_.reset();
@@ -1057,8 +1058,7 @@ class TerrainPlannerNode : public rclcpp::Node {
     // 일괄 pause 차단은 하지 않는다. 아래에서 미확인 예정 지지를 차단하되,
     // 몸통 시각을 제공하는 경우 현재 지지를 유지하는 유한 horizon을 다시 계산한다.
     const auto stamp_ns = rclcpp::Time(state.header.stamp).nanoseconds();
-    if (stamp_ns < last_planned_ns_ ||
-        (stamp_ns == last_planned_ns_ && (!retry_requested_ || same_state_retry_used_))) {
+    if (stamp_ns <= last_planned_ns_) {
       PublishPipelineStatus("deferred", "state_already_planned");
       return;
     }
@@ -1169,8 +1169,7 @@ class TerrainPlannerNode : public rclcpp::Node {
                           "waiting: no matching committed reference for active swing");
       return;
     }
-    // 같은 입력은 실패 후 한 번만 즉시 재시도한다. 새 상태가 오면 다시 시도할 수 있다.
-    same_state_retry_used_ = stamp_ns == last_planned_ns_;
+    // 성공·실패와 관계없이 같은 상태는 한 번만 계산한다.
     last_planned_ns_ = stamp_ns;
     retry_requested_ = false;
     pending_solve_ = PendingSolve{input, state, map_stamp_, generation_,
@@ -1318,8 +1317,8 @@ class TerrainPlannerNode : public rclcpp::Node {
       PublishCorrectedMap(*input.terrain, pending.map_stamp, result.terrain_snapshot.get());
     }
     // 실패해도 마지막 성공해는 보존한다. Solve 내부가 시간·모델·지형 호환성을 재검사한다.
-    // 계산 중 수신한 최신 상태 또는 같은 상태의 제한된 재시도를 즉시 시작한다.
-    if (retry_requested_) OnTimer();
+    // 성공·실패 모두 최신 상태가 있으면 즉시 이어서 계산한다. 없으면 새 상태를 기다린다.
+    OnTimer();
   }
 
   void Publish(const Result& solved, const Input& input,
@@ -1520,7 +1519,7 @@ class TerrainPlannerNode : public rclcpp::Node {
   std::int64_t completion_dispatch_ns_ = 0;
   std::optional<PendingSolve> pending_solve_;
   std::uint64_t generation_ = 0;
-  bool retry_requested_ = false, same_state_retry_used_ = false;
+  bool retry_requested_ = false;
   std::int64_t solve_state_stamp_ns_ = 0;
 
   // 파라미터.

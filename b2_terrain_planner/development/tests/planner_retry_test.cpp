@@ -1,9 +1,9 @@
 /**
  * @file planner_retry_test.cpp
  * @brief 지연·실패를 주입해 비동기 재계획과 성공해 보존 및 발행 차단을 검증한다.
- * @version 0.0.20
+ * @version 0.0.21
+ * @update 2026-11-05: 성공 후 최신 상태 즉시 계산·상태 병합·동일 상태 재시도 제거를 검증함.
  * @update 2026-11-05: 완료 타이머 없이 비동기 완료를 전달하는 경로를 검증함.
- * @update 2026-11-04: 단차 회피 스윙의 이륙 전 선택과 이륙 후 지도·설정 변경에도 곡선 보존을 검증함.
  */
 #define B2_TERRAIN_PLANNER_NO_MAIN
 #include "../../src/terrain_planner_node.cpp"
@@ -115,7 +115,7 @@ struct TerrainPlannerRetryTest {
           "XY vector or yaw ramp rate is incorrect");
     node.UpdateCommandRamp(state);
     Check(node.PlanningCommand().isApprox(Eigen::Vector3d(.03, .04, .1), 1e-10),
-          "same-state retry advanced ramp");
+          "repeated state advanced ramp");
     node.command_ << -.3, -.4, -1.0;
     state.body_time += .1;
     node.UpdateCommandRamp(state);
@@ -182,7 +182,7 @@ struct TerrainPlannerRetryTest {
           "paused gait did not ramp linear and yaw commands toward zero");
     node.UpdateCommandRamp(state);
     Check(node.PlanningCommand().isApprox(Eigen::Vector3d(.45, 0, .4), 1e-10),
-          "same-state retry advanced paused ramp");
+          "repeated state advanced paused ramp");
     state.body_time += 1.0;
     node.UpdateCommandRamp(state);
     Check(node.PlanningCommand().isZero(1e-10), "paused ramp overshot zero");
@@ -264,19 +264,21 @@ struct TerrainPlannerRetryTest {
     auto fail2 = Install(node, false);
     fail2->export_seed = true;
     fail2->violation = .15;  // 2배 미만 증가는 발산이 아니다.
+    update(.02);
     Finish(node, fail1);
     Started(fail2);
     Check(fail2->had_retry_seed, "first failure did not seed the retry");
     auto fail3 = Install(node, false);
     fail3->export_seed = true;
     fail3->violation = .12;
-    update(.02);
+    update(.03);
     Finish(node, fail2);
     Started(fail3);
     Check(fail3->had_retry_seed, "non-diverging chain was discarded early");
     auto exhausted = Install(node, false);
     exhausted->export_seed = true;
     exhausted->violation = .10;
+    update(.04);
     Finish(node, fail3);
     Started(exhausted);
     Check(!exhausted->had_retry_seed && exhausted->had_previous,
@@ -287,11 +289,12 @@ struct TerrainPlannerRetryTest {
     auto diverged = Install(node, false);
     diverged->export_seed = true;
     diverged->violation = .25;
-    update(.03);
+    update(.05);
     Started(diverged);
     Check(diverged->had_retry_seed, "new chain after discard was not seeded");
     auto recovered = Install(node, false);
     recovered->export_seed = true;
+    update(.06);
     Finish(node, diverged);
     Started(recovered);
     Check(!recovered->had_retry_seed && recovered->had_previous,
@@ -451,6 +454,30 @@ struct TerrainPlannerRetryTest {
           node.last_publish_ns_ >= node.completion_dispatch_ns_,
           "completion timestamps do not separate dispatch and publication");
 
+    // 성공 후에도 타이머 없이 이어서 계산하고, 계산 중 받은 상태는 최신 하나만 사용한다.
+    auto success = Install(node);
+    update(.001);
+    Started(success);
+    const auto before_updates = node.attempt_seq_;
+    update(.002);
+    update(.003);
+    node.OnTimer();
+    Check(node.attempt_seq_ == before_updates && success->gait_time == .001,
+          "incoming states started overlapping solves or changed the running snapshot");
+    auto latest = Install(node);
+    const auto success_stamp = node.solve_state_stamp_ns_;
+    Finish(node, success);
+    Started(latest);
+    Check(node.last_published_stamp_ns_ == success_stamp &&
+          node.attempt_seq_ == before_updates + 1 && latest->gait_time == .003 &&
+          latest->had_previous,
+          "successful solve did not publish and immediately start the latest state");
+    Finish(node, latest);
+    node.OnTimer();
+    node.OnState(state);
+    Check(!node.solve_future_.valid() && node.attempt_seq_ == before_updates + 1,
+          "successful state was solved again without new input");
+
     auto failed = Install(node, false);
     update(.01);
     node.OnTimer();
@@ -470,15 +497,13 @@ struct TerrainPlannerRetryTest {
     update(.03);
     node.OnTimer();
     Started(same);
-    auto same_retry = Install(node, false);
     const auto before_same = node.attempt_seq_;
     Finish(node, same);
-    Started(same_retry);
-    Check(same_retry->had_previous, "failure erased successful seed");
-    Finish(node, same_retry);
     node.OnTimer();
-    Check(!node.solve_future_.valid() && node.attempt_seq_ == before_same + 1,
-          "identical failed input retried without bound");
+    node.OnState(state);
+    Check(!node.solve_future_.valid() && node.attempt_seq_ == before_same &&
+          node.previous_.has_value(),
+          "identical failed input was retried or successful seed was erased");
     auto recovered = Install(node);
     update(.04);
     Started(recovered);
@@ -547,10 +572,11 @@ struct TerrainPlannerRetryTest {
     const auto before_partial = node.last_published_stamp_ns_;
     const auto successful_seed_gait = node.previous_->seed_context.gait_time;
     auto continued = Install(node);
+    update(.406);
     Finish(node, partial);
     Started(continued);
     Check(continued->had_retry_seed && !continued->had_previous,
-          "partial iterate was not used for the bounded retry");
+          "partial iterate was not used for the next state");
     Check(node.last_published_stamp_ns_ == before_partial &&
           node.previous_->seed_context.gait_time == successful_seed_gait,
           "failed iterate overwrote or published a successful plan");
@@ -581,6 +607,7 @@ struct TerrainPlannerRetryTest {
     const auto hold_estimated = state.contact_estimated;
     state.contact_estimated.fill(true);
     update(.4);
+    auto hold_refresh = Install(node);
     Finish(node, hold);
     Check(hold->command.isZero(), "hold did not request zero velocity");
     Check(hold->hold_duration == node.robot_.period && hold->body_time == .4 &&
@@ -588,6 +615,8 @@ struct TerrainPlannerRetryTest {
     Check(hold->contact_estimated == hold_estimated, "stance overwrote measured terrain contacts");
     Check(node.last_published_stamp_ns_ > before_hold,
           "estimated contact change rejected two-stance hold plan");
+    Started(hold_refresh);
+    Finish(node, hold_refresh);
     state.active_plan_stamp_ns = node.last_published_stamp_ns_;
     auto tripod = Install(node);
     state.contact_confirmed[1] = true;
@@ -614,10 +643,13 @@ struct TerrainPlannerRetryTest {
     const auto before_release = node.last_published_stamp_ns_;
     state.contact_estimated.fill(true);
     update(.4);
+    auto release_refresh = Install(node);
     Finish(node, release);
     Check(release->hold_duration > 0 && release->hold_duration < .8, "resume prefix missing");
     Check(node.last_published_stamp_ns_ > before_release,
           "estimated contact change rejected stance resume plan");
+    Started(release_refresh);
+    Finish(node, release_refresh);
     state.active_plan_stamp_ns = node.last_published_stamp_ns_;
     auto refresh = Install(node);
     state.contact_estimated.fill(false);
@@ -646,7 +678,7 @@ struct TerrainPlannerRetryTest {
     model_settings.time_limit = 3;
     const auto held_result = Solve(node.robot_, held_model, model_settings);
     Check(held_result.success, "real-model two-support hold solve failed");
-    std::cout << "PASS seed preservation, nonblocking state, immediate/bounded retries, "
+    std::cout << "PASS seed preservation, nonblocking state, immediate latest-state replanning without duplicate solves, "
                  "epoch/pause/command/clock publication guards, latched stance support, "
                  "command ramp, touchdown stop, retry-seed discard, "
                  "epoch reset, and measured pre-liftoff origins\n";
