@@ -1,9 +1,9 @@
 /**
  * @file planner.h
  * @brief 평지·지형 trot의 SQP 입력·출력 및 시간 구간 계획 계약.
- * @version 0.0.41
+ * @version 0.0.42
+ * @update 2026-11-05: 같은 후보의 QP 방향·선택 제약 재사용 비교 설정과 계측을 추가함.
  * @update 2026-11-05: 후보 보정과 같은 입력의 지형 대체 재시도를 개별 설정으로 관리함.
- * @update 2026-11-05: 기본 동작을 유지하는 오프라인 후보 보정 생략 설정을 추가함.
  */
 #ifndef B2_TERRAIN_PLANNER_PLANNER_H_
 #define B2_TERRAIN_PLANNER_PLANNER_H_
@@ -92,6 +92,8 @@ struct Settings {
   bool line_search_diagnostics = false;  // 오프라인 전용: 보정 전 후보를 추가 평가한다.
   bool foothold_diagnostics = false;  // 진단 전용. ROS 기본값은 true.
   bool qp_working_set = false;
+  bool reuse_qp_direction = false;  // 같은 후보에서 페널티만 바뀐 일반 QP 방향 재사용.
+  bool reuse_qp_working_set = false;  // 같은 SolveAttempt 안에서 직전 선택 행을 유지.
   bool structured_equalities = false;
   bool block_assembly = false;
   bool polynomial_tail = false;
@@ -195,6 +197,8 @@ struct Profile {
   int constraint_jacobian_evaluations = 0;
   int svd_calls = 0;
   int qp_calls = 0;
+  int qp_working_set_reuses = 0;
+  std::vector<int> qp_direction_reuse_iterations;
   int qp_setups = 0;
   int qp_updates = 0;
   int qp_warm_starts = 0;
@@ -215,6 +219,10 @@ struct LineSearchDiagnostic {
   double current_scaled_violation = 0;
   double slope = 0;
   double predicted_change = 0;
+  // 상세 재생에서만 계산하는 보정 전 QP 방향의 국소 미분과 선형 제약 위반.
+  std::optional<double> cost_directional_derivative;
+  std::optional<double> violation_directional_derivative;
+  std::optional<double> linearized_scaled_violation;
   double acceptance_bound = 0;
   double step_norm = 0;
   std::optional<double> before_cost;

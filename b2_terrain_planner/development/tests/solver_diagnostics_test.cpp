@@ -1,9 +1,9 @@
 /**
  * @file solver_diagnostics_test.cpp
  * @brief snapshot 왕복 재생·상세 진단 불변성·비동기 저장을 검증한다.
- * @version 0.0.4
+ * @version 0.0.5
+ * @update 2026-11-05: 동일 QP 방향 재사용 경계·선택 목록 재사용·방향 미분 진단의 불변성을 검증함.
  * @update 2026-11-05: 전체 제약 QP의 실행 가능 해·재생 일치와 외부 제약 확장 생략을 검증함.
- * @update 2026-11-05: 재시도 OFF의 기본 시도 보존과 보정 OFF 조합·snapshot 호환을 검증함.
  */
 #include "b2_terrain_planner/solver_diagnostics.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -100,11 +100,30 @@ void Run(const std::filesystem::path& directory) {
   const auto retry_offset = legacy.find(retry_field);
   Check(retry_offset != std::string::npos, "retry setting missing from snapshot");
   legacy.erase(retry_offset, retry_field.size());
+  for (const std::string key : {"reuse_qp_direction", "reuse_qp_working_set",
+                                "qp_working_set_reuses", "qp_direction_reuse_iterations"}) {
+    while (true) {
+      const auto position = legacy.find(key + ":");
+      if (position == std::string::npos) break;
+      const auto begin = legacy.rfind('\n', position) + 1;
+      auto end = legacy.find('\n', position);
+      if (key == "qp_direction_reuse_iterations" &&
+          legacy.substr(position, end - position).find("[]") == std::string::npos) {
+        const auto sequence_end = legacy.find('\n', end + 1);
+        Check(legacy.substr(end + 1, sequence_end - end - 1).find("[]") != std::string::npos,
+              "legacy fixture unexpectedly contains reused directions");
+        end = sequence_end;
+      }
+      legacy.erase(begin, end - begin + 1);
+    }
+  }
   const auto legacy_path = (directory / "legacy.yaml").string();
   { std::ofstream stream(legacy_path); stream << legacy; }
   const auto legacy_settings = LoadSolverSnapshot(legacy_path).settings;
   Check(!legacy_settings.skip_line_search_projection && legacy_settings.terrain_candidate_retries,
         "legacy snapshot changed solver defaults");
+  Check(!legacy_settings.reuse_qp_direction && !legacy_settings.reuse_qp_working_set,
+        "legacy snapshot unexpectedly enabled QP reuse experiments");
   const auto replay = Solve(loaded.robot, loaded.input, loaded.settings, &*loaded.previous);
   SamePlan(baseline, replay);
   loaded.settings.line_search_diagnostics = true;
@@ -118,6 +137,10 @@ void Run(const std::filesystem::path& directory) {
           "nested timing reported incorrectly");
     for (const auto& trial : attempt.line_search) {
       ++records;
+      Check(trial.cost_directional_derivative && trial.violation_directional_derivative &&
+            trial.linearized_scaled_violation &&
+            std::isfinite(*trial.violation_directional_derivative),
+            "detailed QP direction model missing");
       Check(trial.before_cost.has_value() && trial.before_violation.has_value(), "raw candidate missing");
       if (trial.after_cost && trial.after_scaled_violation) {
         const double merit = *trial.after_cost + trial.penalty * *trial.after_scaled_violation;
@@ -176,6 +199,73 @@ void Run(const std::filesystem::path& directory) {
             "full constraint QP still expanded external working set");
     }
   }
+  auto selection = loaded;
+  selection.settings.reuse_qp_working_set = true;
+  selection.settings.skip_line_search_projection = true;
+  selection.settings.line_search_diagnostics = false;
+  const auto selected = Solve(selection.robot, selection.input, selection.settings,
+                              &*selection.previous);
+  Check(selected.success && selected.violation <= selection.settings.feasibility_tolerance &&
+        selected.profile.qp_working_set_reuses > 0,
+        "selected constraints were not reused for a feasible plan");
+  SamePlan(selected, Solve(selection.robot, selection.input, selection.settings,
+                           &*selection.previous));
+  // 도달 가능한 초기 자세에서 큰 명령을 주어 같은 x의 페널티 재탐색을 유발한다.
+  auto retry = loaded;
+  retry.input.command.x() = 1.5;
+  retry.settings.skip_line_search_projection = true;
+  retry.settings.terrain_candidate_retries = false;
+  retry.settings.line_search_diagnostics = true;
+  retry.settings.qp_eps_abs = 1e-3;
+  retry.settings.qp_eps_rel = 1e-3;
+  retry.settings.qp_max_iterations = 4000;
+  retry.settings.max_iterations = 12;
+  const auto original_retry = Solve(retry.robot, retry.input, retry.settings, &*retry.previous);
+  retry.settings.reuse_qp_direction = true;
+  const auto reused = Solve(retry.robot, retry.input, retry.settings, &*retry.previous);
+  Check(!original_retry.success && !reused.success &&
+        !reused.profile.qp_direction_reuse_iterations.empty() &&
+        reused.profile.qp_calls < original_retry.profile.qp_calls,
+        "penalty-only retry did not remove QP work or accepted infeasible input");
+  Check(reused.solver_attempts.size() == 1, "retry fixture unexpectedly has multiple layers");
+  for (int iteration : reused.profile.qp_direction_reuse_iterations) {
+    const LineSearchDiagnostic* before = nullptr;
+    const LineSearchDiagnostic* after = nullptr;
+    bool previous_accepted = false;
+    for (const auto& trial : reused.solver_attempts[0].line_search) {
+      if (trial.iteration == iteration - 1) {
+        previous_accepted = previous_accepted || trial.accepted;
+        if (trial.search == 1) before = &trial;
+      }
+      if (trial.iteration == iteration && trial.search == 1) after = &trial;
+    }
+    Check(before && after && !previous_accepted && before->current_cost == after->current_cost &&
+          before->current_violation == after->current_violation &&
+          before->step_norm == after->step_norm && before->after_cost == after->after_cost &&
+          before->after_violation == after->after_violation && after->penalty > before->penalty,
+          "direction reused after candidate change or changed the cached trial");
+    for (const auto& qp : reused.profile.qp_diagnostics) {
+      Check(qp.sqp_iteration != iteration, "reused direction still called QP");
+      if (qp.sqp_iteration == iteration - 1 && qp.accepted) {
+        Check(qp.kind == "reduced", "penalty-dependent elastic direction was reused");
+      }
+    }
+  }
+  // 재사용 상태가 Solve 사이에 남지 않고 snapshot은 명시 설정과 결과만 저장한다.
+  SamePlan(reused, Solve(retry.robot, retry.input, retry.settings, &*retry.previous));
+  retry.attempts = reused.solver_attempts;
+  SaveSolverSnapshot(path, retry);
+  const auto replay_retry = LoadSolverSnapshot(path);
+  Check(replay_retry.settings.reuse_qp_direction &&
+        replay_retry.attempts[0].profile.qp_direction_reuse_iterations ==
+            reused.solver_attempts[0].profile.qp_direction_reuse_iterations,
+        "direction reuse settings or accounting lost in snapshot");
+  retry.settings.line_search_diagnostics = false;
+  SamePlan(reused, Solve(retry.robot, retry.input, retry.settings, &*retry.previous));
+  selection.attempts = selected.solver_attempts;
+  SaveSolverSnapshot(path, selection);
+  Check(LoadSolverSnapshot(path).settings.reuse_qp_working_set,
+        "working set reuse setting lost in snapshot");
   // prefix·hold·nominal 등 선택 입력도 손실 없이 보존한다. 여기서는 solver 실행과 분리한다.
   loaded.input.reference_prefix = std::make_shared<Result>(*loaded.previous);
   loaded.input.prefix_duration = .08;

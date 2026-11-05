@@ -1,9 +1,9 @@
 /**
  * @file solve_main.cpp
  * @brief ROS 없이 단일 설정의 예제 또는 개별 평지·지형 입력을 읽고 몸통 계획을 YAML로 출력한다.
- * @version 0.0.36
+ * @version 0.0.37
+ * @update 2026-11-05: 같은 입력에서 QP 방향·선택 제약 재사용을 각각 비교하는 재생 옵션을 추가함.
  * @update 2026-11-05: 동일 입력에 전체 QP 제약을 전달하는 재생 옵션과 적용값 출력을 추가함.
- * @update 2026-11-05: 재생에서 지형 대체 재시도를 끄는 옵션과 적용값 출력을 추가함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/solver_diagnostics.h"
@@ -363,10 +363,15 @@ void Print(const b2_terrain_planner::Result& result, bool show_profile,
              {"values_evaluations", p.values_evaluations},
              {"constraint_jacobian_evaluations", p.constraint_jacobian_evaluations},
              {"svd_calls", p.svd_calls}, {"qp_calls", p.qp_calls},
+             {"qp_working_set_reuses", p.qp_working_set_reuses},
              {"qp_setups", p.qp_setups}, {"qp_updates", p.qp_updates},
              {"qp_warm_starts", p.qp_warm_starts}}) {
       output << YAML::Key << item.first << YAML::Value << item.second;
     }
+    output << YAML::Key << "qp_direction_reuse_iterations" << YAML::Value << YAML::Flow
+           << YAML::BeginSeq;
+    for (int iteration : p.qp_direction_reuse_iterations) output << iteration;
+    output << YAML::EndSeq;
     output << YAML::Key << "qp_iterations" << YAML::Value << p.qp_iterations
            << YAML::Key << "qp_iterations_per_solve" << YAML::Value << YAML::Flow
            << YAML::BeginSeq;
@@ -383,6 +388,8 @@ void Print(const b2_terrain_planner::Result& result, bool show_profile,
     output << YAML::Key << "projection_rank_tolerance" << YAML::Value << settings.projection_rank_tolerance;
     output << YAML::Key << "equality_rank_tolerance" << YAML::Value << settings.equality_rank_tolerance;
     output << YAML::Key << "qp_working_set" << YAML::Value << settings.qp_working_set;
+    output << YAML::Key << "reuse_qp_direction" << YAML::Value << settings.reuse_qp_direction;
+    output << YAML::Key << "reuse_qp_working_set" << YAML::Value << settings.reuse_qp_working_set;
     output << YAML::Key << "lapack_svd" << YAML::Value << settings.lapack_svd;
     output << YAML::Key << "qp_settings" << YAML::Value << YAML::BeginMap
            << YAML::Key << "reuse_mode" << YAML::Value << b2_terrain_planner::QpReuseModeName(settings.qp_reuse)
@@ -483,6 +490,10 @@ int main(int argc, char** argv) {
           snapshot.settings.line_search_diagnostics = true;
         } else if (option == "--no-line-search-projection") {
           snapshot.settings.skip_line_search_projection = true;
+        } else if (option == "--reuse-qp-direction") {
+          snapshot.settings.reuse_qp_direction = true;
+        } else if (option == "--reuse-qp-working-set") {
+          snapshot.settings.reuse_qp_working_set = true;
         } else if (option == "--full-qp-constraints") {
           snapshot.settings.qp_working_set = false;
         } else if (option == "--no-terrain-candidate-retries") {
@@ -490,7 +501,7 @@ int main(int argc, char** argv) {
         } else {
           throw std::invalid_argument(
               "usage: tamols_solve --replay SNAPSHOT [--trace-line-search] "
-              "[--no-line-search-projection] [--no-terrain-candidate-retries] [--full-qp-constraints]");
+              "[--no-line-search-projection] [--no-terrain-candidate-retries] [--full-qp-constraints] [--reuse-qp-direction] [--reuse-qp-working-set]");
         }
       }
       const b2_terrain_planner::Result* seed = nullptr;
@@ -499,6 +510,8 @@ int main(int argc, char** argv) {
       Print(result, true, snapshot.settings, snapshot.robot, snapshot.input);
       std::cout << "replay_skip_line_search_projection: " << std::boolalpha
                 << snapshot.settings.skip_line_search_projection << '\n';
+      std::cout << "replay_reuse_qp_direction: " << snapshot.settings.reuse_qp_direction << '\n';
+      std::cout << "replay_reuse_qp_working_set: " << snapshot.settings.reuse_qp_working_set << '\n';
       std::cout << "replay_qp_working_set: " << snapshot.settings.qp_working_set << '\n';
       std::cout << "replay_terrain_candidate_retries: "
                 << snapshot.settings.terrain_candidate_retries << '\n';
@@ -511,7 +524,7 @@ int main(int argc, char** argv) {
       std::string option = argv[i];
       if (option == "--help") {
         std::cout << "tamols_solve --replay SNAPSHOT [--trace-line-search] "
-                     "[--no-line-search-projection] [--no-terrain-candidate-retries] [--full-qp-constraints]\n"
+                     "[--no-line-search-projection] [--no-terrain-candidate-retries] [--full-qp-constraints] [--reuse-qp-direction] [--reuse-qp-working-set]\n"
                      "tamols_solve [--input YAML] [--speed M/S] [--gait-time S] "
                      "[--time-limit S] [--iterations N] [--fixed-feet] "
                      "[--profile] [--full-evaluation] "

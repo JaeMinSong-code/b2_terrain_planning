@@ -1,9 +1,9 @@
 /**
  * @file solver_diagnostics.cpp
  * @brief solver 입력의 명시적 YAML 직렬화와 한 슬롯 비동기 파일 기록.
- * @version 0.0.3
+ * @version 0.0.4
+ * @update 2026-11-05: QP 방향·선택 제약 재사용 설정과 계측을 구 snapshot 호환 형태로 저장함.
  * @update 2026-11-05: 대체 후보 재시도 설정을 직렬화하고 이전 snapshot 기본값을 유지함.
- * @update 2026-11-05: 보정 생략 설정을 저장하고 이전 snapshot의 기본 보정 동작을 유지함.
  */
 #include "b2_terrain_planner/solver_diagnostics.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -207,6 +207,12 @@ template <> void Visit(Archive& a, Settings& v) {
   a.Field("line_search_diagnostics", v.line_search_diagnostics);
   a.Field("foothold_diagnostics", v.foothold_diagnostics);
   a.Field("qp_working_set", v.qp_working_set);
+  if (!a.reading || a.node["reuse_qp_direction"]) {
+    a.Field("reuse_qp_direction", v.reuse_qp_direction);
+  }
+  if (!a.reading || a.node["reuse_qp_working_set"]) {
+    a.Field("reuse_qp_working_set", v.reuse_qp_working_set);
+  }
   a.Field("structured_equalities", v.structured_equalities);
   a.Field("block_assembly", v.block_assembly);
   a.Field("polynomial_tail", v.polynomial_tail);
@@ -305,6 +311,12 @@ template <> void Visit(Archive& a, Profile& v) {
   a.Field("constraint_jacobian_evaluations", v.constraint_jacobian_evaluations);
   a.Field("svd_calls", v.svd_calls);
   a.Field("qp_calls", v.qp_calls);
+  if (!a.reading || a.node["qp_working_set_reuses"]) {
+    a.Field("qp_working_set_reuses", v.qp_working_set_reuses);
+  }
+  if (!a.reading || a.node["qp_direction_reuse_iterations"]) {
+    a.Field("qp_direction_reuse_iterations", v.qp_direction_reuse_iterations);
+  }
   a.Field("qp_setups", v.qp_setups);
   a.Field("qp_updates", v.qp_updates);
   a.Field("qp_warm_starts", v.qp_warm_starts);
@@ -322,6 +334,15 @@ template <> void Visit(Archive& a, LineSearchDiagnostic& v) {
   a.Field("current_scaled_violation", v.current_scaled_violation);
   a.Field("slope", v.slope);
   a.Field("predicted_change", v.predicted_change);
+  if (!a.reading || a.node["cost_directional_derivative"]) {
+    a.Field("cost_directional_derivative", v.cost_directional_derivative);
+  }
+  if (!a.reading || a.node["violation_directional_derivative"]) {
+    a.Field("violation_directional_derivative", v.violation_directional_derivative);
+  }
+  if (!a.reading || a.node["linearized_scaled_violation"]) {
+    a.Field("linearized_scaled_violation", v.linearized_scaled_violation);
+  }
   a.Field("acceptance_bound", v.acceptance_bound);
   a.Field("step_norm", v.step_norm);
   a.Field("before_cost", v.before_cost);

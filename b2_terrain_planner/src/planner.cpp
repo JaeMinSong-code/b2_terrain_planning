@@ -1,9 +1,9 @@
 /**
  * @file planner.cpp
  * @brief 접촉 조합별 생성 Jacobian과 지형 비용의 Gauss–Newton QP로 trot을 최적화한다.
- * @version 0.0.53
+ * @version 0.0.54
+ * @update 2026-11-05: 동일 후보의 일반 QP 방향과 직전 선택 제약을 개별 비교 옵션으로 재사용함.
  * @update 2026-11-05: 초기화와 성공 판정을 유지하며 같은 입력의 대체 후보 재시도만 끌 수 있게 함.
- * @update 2026-11-05: 재생 비교용으로 line-search 후보의 반복 제약 보정을 생략할 수 있게 함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -1489,6 +1489,7 @@ struct QpCache {
   double slack = 0;
   std::map<int, double> duals;  // 원래 제약 행 단위의 multiplier.
   bool has_solution = false;
+  std::set<int> selected_rows;  // 이 SolveAttempt에서 마지막으로 풀린 선택 제약.
 };
 
 struct QpCoordinates {
@@ -1815,6 +1816,12 @@ bool WorkingSetQpStep(const Evaluation& eval, const Vector& scaling, double pena
                                      eval.upper[row] - eval.values[row]) / scaling[row];
     selected[row] = distance <= 1e-4;
   }
+  if (settings.reuse_qp_working_set && !cache->selected_rows.empty()) {
+    ++profile->qp_working_set_reuses;
+    for (int row = 0; row < count; ++row) {
+      if (cache->selected_rows.count(coordinates.RowId(row)) > 0) selected[row] = true;
+    }
+  }
   for (int pass = 0; pass < 9; ++pass) {
     if (pass == 8) std::fill(selected.begin(), selected.end(), true);
     const int active = std::count(selected.begin(), selected.end(), true);
@@ -1868,7 +1875,15 @@ bool WorkingSetQpStep(const Evaluation& eval, const Vector& scaling, double pena
     }
     diagnostic.working_set_omitted_violation = omitted_violation;
     diagnostic.working_set_full_violation = full_violation;
-    if (added == 0) return true;
+    if (added == 0) {
+      if (settings.reuse_qp_working_set) {
+        cache->selected_rows.clear();
+        for (int row = 0; row < count; ++row) {
+          if (selected[row]) cache->selected_rows.insert(coordinates.RowId(row));
+        }
+      }
+      return true;
+    }
     diagnostic.accepted = false;
     diagnostic.acceptance_reason = "working_set_expanded";
   }
@@ -2449,6 +2464,9 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
       result.foothold_diagnostic_seconds +=
           std::chrono::duration<double>(Clock::now() - diagnostic_begin).count();
     };
+    // 일반 QP에는 merit 페널티가 들어가지 않는다. x가 바뀌지 않은 재탐색만 재사용한다.
+    // elastic QP·다른 후보·다음 Solve로는 이 방향을 전달하지 않는다.
+    std::optional<Vector> penalty_retry_step;
     int small_improvements = 0;
     result.stage = "optimization";
     result.status = "iteration_limit";
@@ -2482,9 +2500,19 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
       Vector step;
       double slack = 0.0;
       std::string qp_status;
-      bool qp_ok = ReducedQpStep(
-          eval, scaling, penalty, time_limit - elapsed(), &step,
-          &slack, &qp_status, &result.profile, settings, iteration + 1, &reduced_cache, x, &structure_cache);
+      bool qp_ok = false;
+      if (penalty_retry_step) {
+        step = *penalty_retry_step;
+        qp_ok = true;
+        result.profile.qp_direction_reuse_iterations.push_back(iteration + 1);
+      } else {
+        qp_ok = ReducedQpStep(
+            eval, scaling, penalty, time_limit - elapsed(), &step,
+            &slack, &qp_status, &result.profile, settings, iteration + 1,
+            &reduced_cache, x, &structure_cache);
+      }
+      penalty_retry_step.reset();
+      const bool reduced_direction = qp_ok;
       if (!qp_ok && elapsed() < time_limit) {
         qp_ok = QpStep(eval, scaling, penalty, time_limit - elapsed(),
                        &step, &slack, &qp_status, &result.profile, settings, iteration + 1,
@@ -2508,6 +2536,29 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
       const double current_violation = Violation(eval, scaling);
       const double current_merit = eval.cost + penalty * current_violation;
       const double slope = eval.gradient.dot(step) + penalty * (slack - current_violation);
+      std::optional<double> cost_derivative, violation_derivative, linearized_violation;
+      double model_diagnostic_seconds = 0.0;
+      if (settings.line_search_diagnostics) {
+        const auto diagnostic_start = Clock::now();
+        const Vector linear_change = eval.LinearChange(step);
+        cost_derivative = eval.gradient.dot(step);
+        double derivative = -std::numeric_limits<double>::infinity();
+        if (current_violation == 0.0) derivative = 0.0;
+        double predicted_violation = 0.0;
+        for (int row = 0; row < eval.values.size(); ++row) {
+          const double lower = (eval.lower[row] - eval.values[row]) / scaling[row];
+          const double upper = (eval.values[row] - eval.upper[row]) / scaling[row];
+          const double change = linear_change[row] / scaling[row];
+          // 최대 위반을 주는 항의 우방향 미분. 현재 위반과 같은 연산 결과로 비교한다.
+          if (lower == current_violation) derivative = std::max(derivative, -change);
+          if (upper == current_violation) derivative = std::max(derivative, change);
+          predicted_violation = std::max({predicted_violation, lower - change, upper + change});
+        }
+        violation_derivative = derivative;
+        linearized_violation = predicted_violation;
+        model_diagnostic_seconds =
+            std::chrono::duration<double>(Clock::now() - diagnostic_start).count();
+      }
       bool accepted = false;
       double accepted_violation = std::numeric_limits<double>::infinity();
       double alpha = 1.0;
@@ -2529,6 +2580,9 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
         diagnostic.current_scaled_violation = current_violation;
         diagnostic.slope = slope;
         diagnostic.predicted_change = predicted_change;
+        diagnostic.cost_directional_derivative = cost_derivative;
+        diagnostic.violation_directional_derivative = violation_derivative;
+        diagnostic.linearized_scaled_violation = linearized_violation;
         diagnostic.acceptance_bound = current_merit + 1e-4 * alpha * std::min(-1e-12, slope);
         diagnostic.step_norm = (alpha * step).lpNorm<Eigen::Infinity>();
         // 추가 평가는 재생 전용이며 탐색의 입력·기울기·수락 조건을 변경하지 않는다.
@@ -2542,6 +2596,7 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
           } catch (const TerrainDomainError&) {}
           diagnostic.diagnostic_seconds =
               std::chrono::duration<double>(Clock::now() - diagnostic_start).count();
+          if (search == 0) diagnostic.diagnostic_seconds += model_diagnostic_seconds;
         }
         const double projection_before = result.profile.projection_seconds;
         try {
@@ -2627,6 +2682,9 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
         result.success = true;
         result.status = "feasible_stalled";
         break;
+      }
+      if (!accepted && reduced_direction && settings.reuse_qp_direction) {
+        penalty_retry_step = step;
       }
       if (!accepted || slack > 1e-4 ||
           (step.lpNorm<Eigen::Infinity>() < 1e-3 && violation > settings.feasibility_tolerance)) {

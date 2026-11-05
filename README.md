@@ -98,6 +98,18 @@ ROS 환경의 설치 라이브러리와 섞이지 않도록 위 `LD_LIBRARY_PATH
 `--trace-line-search`를 함께 지정할 수 있다. 보정 생략은 중간 후보 생성만 바꾸며,
 최종 성공 여부와 전체 시간을 기준 재생과 비교한다.
 
+동일 후보의 QP 방향 재사용과 직전 SQP의 제약 목록 재사용은 각각 따로 재생한다.
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 ros2 run b2_terrain_planner tamols_solve \
+  --replay "$SQP_SNAPSHOT" --reuse-qp-direction > /tmp/sqp_reuse_direction.yaml
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 ros2 run b2_terrain_planner tamols_solve \
+  --replay "$SQP_SNAPSHOT" --reuse-qp-working-set > /tmp/sqp_reuse_working_set.yaml
+```
+
+두 옵션을 함께 지정한 결과도 별도로 비교한다. 상세 원인 분석에는
+`--trace-line-search`를 추가한다. 현재 두 기능은 재생 비교용이며 온라인 기본값은 OFF다.
+
 ### 2. elevation map 실행
 
 맵 실행기는 환경변수로 설정하는 단일 스크립트다. 입력 어댑터·맵·선택적 RViz를 실행하며
