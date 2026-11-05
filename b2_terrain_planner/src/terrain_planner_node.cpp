@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.49
+ * @version 0.0.50
+ * @update 2026-11-05: package 설정의 최대 도달거리 여유를 SQP로 전달함.
  * @update 2026-11-05: 최신 상태로 성공·실패 후 즉시 재계획하고 동일 상태 재시도를 제거함.
- * @update 2026-11-05: 계산 완료 이벤트로 executor를 깨우고 진단 지도보다 계획을 먼저 발행함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -647,6 +647,7 @@ class TerrainPlannerNode : public rclcpp::Node {
     settings_.foothold_diagnostics = declare_parameter<bool>("foothold_diagnostics", true);
     settings_.orientation_limit =
         declare_parameter<double>("orientation_limit_deg", 60.0) * M_PI / 180.0;
+    settings_.max_reach_margin = declare_parameter<double>("max_reach_margin", 0.0);
     settings_.pitch_weight = declare_parameter<double>("pitch_weight", 10.0);
     settings_.nominal_kinematics_weight =
         declare_parameter<double>("nominal_kinematics_weight", 7.0);

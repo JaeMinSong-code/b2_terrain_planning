@@ -65,6 +65,8 @@ class ConfigGenerationTest(unittest.TestCase):
         self.assertEqual(
             flat['map_topic'], '/terrain_planner/elevation_map_flat')
         self.assertEqual(wbc['command_topic'], flat['command_topic'])
+        self.assertEqual(wbc['max_reach_margin'], 0.02)
+        self.assertEqual(flat['max_reach_margin'], 0.02)
         self.assertEqual(wbc['foot_radius'], 0.032)
         self.assertEqual(flat['foot_radius'], wbc['foot_radius'])
         self.assertEqual(configs['terrain_planner_flat.yaml'][
