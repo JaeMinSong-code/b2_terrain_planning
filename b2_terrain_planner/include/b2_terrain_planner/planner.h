@@ -1,9 +1,9 @@
 /**
  * @file planner.h
  * @brief 평지·지형 trot의 SQP 입력·출력 및 시간 구간 계획 계약.
- * @version 0.0.36
+ * @version 0.0.37
+ * @update 2026-11-05: 시간 제한 0의 해제 의미와 동일 계산 내부 초기화 전용 중간값을 명시함.
  * @update 2026-11-05: 착지점 단계·지도 관측·비용 진단을 추가하고 제어 계산과 분리함.
- * @update 2026-11-03: 은퇴한 IK·지형 검증 결과 필드와 TerrainValidation 구조체를 제거함.
  */
 #ifndef B2_TERRAIN_PLANNER_PLANNER_H_
 #define B2_TERRAIN_PLANNER_PLANNER_H_
@@ -116,9 +116,9 @@ struct Settings {
   double feasibility_tolerance = 1e-5;
   double step_tolerance = 1e-5;
   bool graduated_initialization = true;
-  double graduated_budget_fraction = 0.25;  // 준비 단계 상한; 나머지는 실제 지형 SQP에 남긴다.
+  double graduated_budget_fraction = 0.25;  // 유한 시간 예산의 준비 단계 비율. 시간 제한이 없으면 적용하지 않는다.
   TerrainSettings terrain;
-  double time_limit = 20.0;  // Offline baseline; not a real-time guarantee.
+  double time_limit = 20.0;  // 초 단위. 0은 시간 제한 없음, 양수는 전체 Solve 예산.
 };
 
 // 잔차는 변환된 OSQP 문제의 값이며 비선형/물리 제약 오차가 아니다.
@@ -268,9 +268,8 @@ struct FootholdTrace {
 struct Result {
   std::vector<FootholdTrace> foothold_trace;
   double foothold_diagnostic_seconds = 0.0;
-  // 수치 반복의 초기값으로만 사용 가능. success가 아니면 제어 계획으로 발행할 수 없다.
-  bool seed_available = false;
-  double seed_penalty = 10.0;
+  // 동일 Solve의 가상 바닥 초기화 전용. 외부 Solve의 previous로는 재사용하지 않는다.
+  bool initialization_available = false;
   SeedContext seed_context;
   WarmStartDiagnostic warm_start;
   std::vector<TerrainAttempt> terrain_attempts;

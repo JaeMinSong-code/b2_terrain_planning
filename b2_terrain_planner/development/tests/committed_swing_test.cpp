@@ -1,9 +1,9 @@
 /**
  * @file committed_swing_test.cpp
  * @brief 명령·지도 변경 시 진행 중 착지점의 최적화 고정과 착지 후 해제를 검증한다.
- * @version 0.0.7
+ * @version 0.0.8
+ * @update 2026-11-05: 시간 제한 해제와 실패 초기값 거부·성공해 재사용을 검증함.
  * @update 2026-11-05: 좁은 현재 발 배치의 계획 생성과 미래 착지점 면적 제약을 검증함.
- * @update 2026-10-30: 보간 높이 조회와 원본 관측 마스크를 구분해 스윙·접촉 계약을 검증함.
  */
 #include "b2_terrain_planner/committed_swing.h"
 #include <cmath>
@@ -201,11 +201,31 @@ int main() {
     Settings interrupted_settings = settings;
     interrupted_settings.time_limit = 1e-6;
     const auto interrupted = Solve(robot, handover, interrupted_settings, &stitched);
-    Check(!interrupted.success && interrupted.seed_available && !interrupted.coefficients.empty(),
-          "interrupted iterate was not retained separately from success");
-    const auto continued = Solve(robot, handover, settings, &interrupted);
-    Check(continued.success && continued.warm_start.used,
-          "failed iterate could not resume with full validation: " + continued.status);
+    Check(!interrupted.success && !interrupted.initialization_available &&
+          interrupted.coefficients.empty(), "failed iterate was exported for reuse");
+    Settings unlimited_settings = settings;
+    unlimited_settings.time_limit = 0;
+    // 가상 바닥 초기화도 warm_start.used를 설정한다. 외부 실패값을 주지 않은 계산과 비교한다.
+    auto failed_seed = stitched;
+    failed_seed.success = false;
+    failed_seed.initialization_available = true;
+    failed_seed.footholds.array() += .123;
+    failed_seed.coefficients.front().col(0).array() += .4;
+    const auto continued = Solve(robot, handover, unlimited_settings, &failed_seed);
+    const auto cold = Solve(robot, handover, unlimited_settings);
+    Check(continued.success && cold.success &&
+          continued.footholds.isApprox(cold.footholds, 1e-10) &&
+          continued.warm_start.reason == cold.warm_start.reason &&
+          continued.terrain_initialization_status == cold.terrain_initialization_status &&
+          continued.coefficients.size() == cold.coefficients.size(),
+          "unlimited solve reused an external failed iterate: " + continued.status);
+    for (std::size_t i = 0; i < continued.coefficients.size(); ++i) {
+      Check(continued.coefficients[i].isApprox(cold.coefficients[i], 1e-10),
+            "failed seed changed the unlimited trajectory");
+    }
+    const auto warm = Solve(robot, handover, unlimited_settings, &stitched);
+    Check(warm.success && warm.warm_start.used,
+          "unlimited solve lost the successful warm start: " + warm.status);
     input.gait_time = .078;
     Check(CommitActiveSwingFootholds(robot, references, &input), "pre-liftoff");
     Check(!input.committed_footholds[1], "locked before liftoff");

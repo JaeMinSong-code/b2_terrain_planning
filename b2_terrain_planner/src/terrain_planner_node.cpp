@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.49
+ * @version 0.0.50
+ * @update 2026-11-05: 기본 계산 시간 제한과 실패 중간값·페널티 재사용 경로를 제거함.
  * @update 2026-11-05: 최신 상태로 성공·실패 후 즉시 재계획하고 동일 상태 재시도를 제거함.
- * @update 2026-11-05: 계산 완료 이벤트로 executor를 깨우고 진단 지도보다 계획을 먼저 발행함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -112,12 +112,11 @@ class TerrainPlannerNode : public rclcpp::Node {
     // 상태 수신·계산 완료가 재계획을 시작한다. 이 주기는 입력 대기 재확인용이다.
     plan_rate_hz_ = declare_parameter<double>("plan_rate_hz", 10.0);
     sample_dt_ = declare_parameter<double>("sample_dt", 0.02);
-    // 핸드오버 마감시각·착지 대기 재개 유예. 계획이 상태 스냅샷 후 이 시간 안에
-    // 도착한다고 약속하는 값으로, 실측 전달 시간(~20-75ms)보다 커야 한다.
-    // 0 이하이면 기존 보수 공식(time_limit + 2*sample_dt)을 쓴다.
-    handover_grace_ = declare_parameter<double>("handover_grace", -1.0);
-    if (std::isnan(handover_grace_)) {
-      throw std::invalid_argument("handover_grace must not be NaN");
+    // 착지 확인 후 보행 재개 유예. WBC의 계획 채택 기한으로 사용하지 않는다.
+    // 0 이하이면 기존 기본 재개 유예(0.1 + 2*sample_dt)를 쓴다.
+    touchdown_resume_delay_ = declare_parameter<double>("touchdown_resume_delay", -1.0);
+    if (std::isnan(touchdown_resume_delay_)) {
+      throw std::invalid_argument("touchdown_resume_delay must not be NaN");
     }
     swing_height_ = declare_parameter<double>("swing_height", 0.10);
     step_swing_.enabled = declare_parameter<bool>("step_swing.enabled", true);
@@ -331,12 +330,6 @@ class TerrainPlannerNode : public rclcpp::Node {
                                state_->base_orientation.y, state_->base_orientation.z);
     const double yaw = QuatToZyx(q.normalized())[0];
     return Eigen::Rotation2Dd(-yaw) * correction;
-  }
-
-  void DiscardRetrySeed() {
-    retry_seed_.reset();
-    retry_seed_failures_ = 0;
-    retry_seed_violation_ = std::numeric_limits<double>::infinity();
   }
 
   // 단일 executor에서 관찰한 원래 판정 결과만 기록한다. 진단은 재계획을 유발하지 않는다.
@@ -643,7 +636,7 @@ class TerrainPlannerNode : public rclcpp::Node {
     settings_.qp_eps_abs = 1e-3;
     settings_.qp_eps_rel = 1e-3;
     settings_.qp_max_iterations = 4000;
-    settings_.time_limit = declare_parameter<double>("time_limit", 0.1);
+    settings_.time_limit = declare_parameter<double>("time_limit", 0.0);
     settings_.foothold_diagnostics = declare_parameter<bool>("foothold_diagnostics", true);
     settings_.orientation_limit =
         declare_parameter<double>("orientation_limit_deg", 60.0) * M_PI / 180.0;
@@ -964,7 +957,6 @@ class TerrainPlannerNode : public rclcpp::Node {
       ++generation_;
       retry_requested_ = true;
       previous_.reset();
-      DiscardRetrySeed();
       published_plans_.clear();
       command_ramp_time_.reset();
       applied_command_.setZero();
@@ -1009,7 +1001,6 @@ class TerrainPlannerNode : public rclcpp::Node {
       terrain_.reset();
       support_patch_memory_.Reset();
       previous_.reset();
-      DiscardRetrySeed();
       published_plans_.clear();
       command_ramp_time_.reset();
       applied_command_.setZero();
@@ -1107,9 +1098,9 @@ class TerrainPlannerNode : public rclcpp::Node {
       }
       // 몸통 궤적은 측정 상태에서 다시 시작한다(폐루프). 이전 계획에 하드 고정하던
       // reference_prefix는 추적 오차를 영원히 누적시켜 제거했다. prefix_duration은
-      // 이제 핸드오버 마감시각과 착지 대기 재개 유예로만 쓰인다.
-      input.prefix_duration = settings_.time_limit + 2 * sample_dt_;
-      if (handover_grace_ > 0) input.prefix_duration = handover_grace_;
+      // 착지 재개 시각을 계산한다. WBC의 계획 채택 마감으로 사용하지 않는다.
+      input.prefix_duration = 0.1 + 2 * sample_dt_;
+      if (touchdown_resume_delay_ > 0) input.prefix_duration = touchdown_resume_delay_;
       // legacy는 정지한 기준점에 연결한다. 별도 몸통 시각은 계산 중에도 진행한다.
       if (state.gait_paused && !state.body_clock_valid) input.prefix_duration = 0;
       if (state.body_clock_valid && state.gait_paused &&
@@ -1182,7 +1173,6 @@ class TerrainPlannerNode : public rclcpp::Node {
     completion_dispatch_ns_ = 0;
     PublishPipelineStatus("solve_started", "none");
     std::optional<Result> seed = previous_;
-    if (retry_seed_ && retry_seed_parent_ns_ == state.active_plan_stamp_ns) seed = retry_seed_;
     std::promise<std::pair<Result, std::int64_t>> completed;
     solve_future_ = completed.get_future();
     solve_worker_ = std::async(std::launch::async,
@@ -1258,39 +1248,7 @@ class TerrainPlannerNode : public rclcpp::Node {
     }
     // 명령은 계산 입력의 snapshot이다. 새 명령 수신은 성공해 발행을 취소하지 않는다.
     if (!result.success) {
-      // 실패 반복값은 성공 계획과 별도 보관한다. 부모/세션이 같은 계산에서만 재사용한다.
-      // 시드 체인이 발산하거나 소진되면 폐기해 다음 계산을 마지막 발행 계획에서 시작한다.
-      // 발행 정체 중에는 부모가 바뀌지 않아 오염된 시드가 영원히 유효 판정을 받기 때문이다.
-      bool store_seed = result.seed_available && !result.phases.empty() &&
-          result.coefficients.size() == result.phases.size() &&
-          result.margins.size() == result.phases.size() &&
-          pending.generation == generation_ && state_ &&
-          state.active_plan_stamp_ns == state_->active_plan_stamp_ns;
-      const bool used_retry_seed =
-          result.warm_start.reason.rfind("shifted_retry_iterate", 0) == 0;
-      if (used_retry_seed) {
-        const bool diverged =
-            result.violation > 2.0 * retry_seed_violation_ + 1e-9;
-        if (++retry_seed_failures_ >= 3 || diverged) {
-          store_seed = false;
-          const char* reason = "chain_exhausted";
-          if (diverged) reason = "violation_diverged";
-          PublishPipelineStatus("retry_seed_discarded", reason);
-        }
-      }
-      if (store_seed) {
-        retry_seed_ = result;
-        if (input.reference_prefix) {
-          retry_seed_ = SpliceBody(*input.reference_prefix,
-              BodyTime(input) - BodyTime(input.reference_prefix->seed_context),
-              result, input.prefix_duration);
-        }
-        retry_seed_parent_ns_ = state.active_plan_stamp_ns;
-        if (!used_retry_seed) retry_seed_failures_ = 1;
-        retry_seed_violation_ = result.violation;
-      } else {
-        DiscardRetrySeed();
-      }
+      // 실패 결과는 보관하지 않는다. 다음 상태에서는 마지막 발행 성공해를 사용한다.
       PublishSolveStatus(result, pending, false, "solve_failed");
       PublishPipelineStatus("solve_failed", result.status.c_str());
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
@@ -1309,7 +1267,6 @@ class TerrainPlannerNode : public rclcpp::Node {
       Publish(result, input, state, swing_terrain);
       // 실제 발행한 몸통 곡선을 다음 계산의 초기값으로 보관한다.
       previous_ = published_plans_.back().body;
-      DiscardRetrySeed();
       PublishSolveStatus(result, pending, true, "published");
     }
     // 진단 지도는 계획 전송 뒤 발행한다. 실패한 계산의 지도 진단도 보존한다.
@@ -1508,10 +1465,6 @@ class TerrainPlannerNode : public rclcpp::Node {
   std::optional<int64_t> epoch_ns_;
   int64_t last_clock_ns_ = 0, last_planned_ns_ = -1;
   std::optional<Result> previous_;
-  std::optional<Result> retry_seed_;
-  std::int64_t retry_seed_parent_ns_ = 0;
-  int retry_seed_failures_ = 0;
-  double retry_seed_violation_ = std::numeric_limits<double>::infinity();
   std::function<Result(const Robot&, const Input&, const Settings&, const Result*)> solver_ = Solve;
   std::future<std::pair<Result, std::int64_t>> solve_future_;
   std::future<void> solve_worker_;
@@ -1529,7 +1482,7 @@ class TerrainPlannerNode : public rclcpp::Node {
   double swing_terrain_clearance_ = 0.03;
   double foot_radius_ = kDefaultFootRadius;
   double plan_rate_hz_ = 10.0, sample_dt_ = 0.02, swing_height_ = 0.10;
-  double handover_grace_ = -1.0;
+  double touchdown_resume_delay_ = -1.0;
   bool require_map_ = true;
   bool support_patch_enabled_ = false;
   double support_patch_half_width_ = 0.025;

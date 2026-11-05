@@ -1,9 +1,9 @@
 /**
  * @file swing_terrain_test.cpp
  * @brief 스윙·지지발의 높이 불일치 허용과 다음 착지점의 지형 검사를 검증한다.
- * @version 0.0.8
+ * @version 0.0.9
+ * @update 2026-11-05: 시간 제한 0을 허용하고 음수 설정 거부와 기존 유한 예산 진단을 검증함.
  * @update 2026-11-03: 제거한 terrain_validation 결과 필드 검사를 정리함.
- * @update 2026-10-30: 보간 높이 조회와 원본 관측 마스크를 구분해 스윙·접촉 계약을 검증함.
  */
 #include "b2_terrain_planner/planner.h"
 
@@ -80,7 +80,7 @@ void Run(double gait_time) {
   std::cout << "PASS unobserved current feet reached SQP, gait_time=" << gait_time
             << " status=" << replanned.status << '\n';
   auto invalid_settings = settings;
-  invalid_settings.time_limit = 0;
+  invalid_settings.time_limit = -1;
   const auto invalid = Solve(robot, input, invalid_settings);
   Check(!invalid.optimization_started && invalid.stage == "input_validation",
         "invalid settings did not preserve input validation stage");

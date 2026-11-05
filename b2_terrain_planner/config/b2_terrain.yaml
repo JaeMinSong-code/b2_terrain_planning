@@ -100,11 +100,10 @@ planner:
     command_topic: /robot/locomotion_command
     command_timeout: 0.25
     plan_rate_hz: 10.0
-    time_limit: 0.1
-    # 핸드오버 마감·착지 대기 재개 유예. 실측 계획 전달 시간(p99 ~55ms, 최대 ~75ms,
-    # 2026-10-28 23:39 로그)보다 크게. 기존 공식(time_limit+2·sample_dt=0.14)은 과잉으로
-    # 착지마다 ~120ms 불필요 대기(gait_paused 27%)를 만들었다. 0 이하 = 기존 공식.
-    handover_grace: 0.08
+    # 0은 SQP·QP 계산 시간 제한 없음. 수렴·실패·반복 횟수 종료 조건은 유지한다.
+    time_limit: 0.0
+    # 착지 확인 후 보행 재개 유예. WBC의 계획 채택 기한으로 사용하지 않는다.
+    touchdown_resume_delay: 0.08
     # TAMOLS IV/V: 처리 지도와 후보 보정. 원본 지도·관측 마스크는 보존한다.
     terrain.pipeline_enabled: true
     terrain.median_iterations: 1

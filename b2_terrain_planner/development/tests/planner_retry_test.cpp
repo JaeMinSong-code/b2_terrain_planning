@@ -1,9 +1,9 @@
 /**
  * @file planner_retry_test.cpp
  * @brief 지연·실패를 주입해 비동기 재계획과 성공해 보존 및 발행 차단을 검증한다.
- * @version 0.0.21
+ * @version 0.0.22
+ * @update 2026-11-05: 실패 중간값을 버리고 최신 상태에서 직전 성공해만 사용하는 경로를 검증함.
  * @update 2026-11-05: 성공 후 최신 상태 즉시 계산·상태 병합·동일 상태 재시도 제거를 검증함.
- * @update 2026-11-05: 완료 타이머 없이 비동기 완료를 전달하는 경로를 검증함.
  */
 #define B2_TERRAIN_PLANNER_NO_MAIN
 #include "../../src/terrain_planner_node.cpp"
@@ -16,8 +16,7 @@ struct TerrainPlannerRetryTest {
   struct Attempt {
     std::atomic<bool> started{false};
     bool had_previous = false;
-    bool had_retry_seed = false;
-    bool export_seed = false;
+    bool had_failed_seed = false;
     double gait_time = -1;
     double body_time = -1;
     double hold_duration = -1;
@@ -49,7 +48,7 @@ struct TerrainPlannerRetryTest {
     node.solver_ = [attempt](const Robot& robot, const Input& input, const Settings&,
                             const Result* previous) {
       attempt->had_previous = previous != nullptr && previous->success;
-      attempt->had_retry_seed = previous != nullptr && !previous->success && previous->seed_available;
+      attempt->had_failed_seed = previous != nullptr && !previous->success;
       attempt->gait_time = input.gait_time;
       attempt->body_time = BodyTime(input);
       attempt->hold_duration = input.gait_hold_duration;
@@ -61,13 +60,11 @@ struct TerrainPlannerRetryTest {
       release.wait();
       Result result;
       result.success = attempt->success;
-      result.seed_available = attempt->export_seed;
       result.status = "time_limit";
       if (result.success) result.status = "test_success";
       result.violation = attempt->violation;
       // 실제 Solve의 warm start 사유 규약을 흉내 내 시드 체인 판정을 검증한다.
-      if (attempt->had_retry_seed) result.warm_start.reason = "shifted_retry_iterate";
-      else if (attempt->had_previous) result.warm_start.reason = "shifted_previous_plan";
+      if (attempt->had_previous) result.warm_start.reason = "shifted_previous_plan";
       result.seed_context.gait_time = input.gait_time;
       result.seed_context.body_time = input.body_time;
       result.seed_context.gait_hold_duration = input.gait_hold_duration;
@@ -219,89 +216,6 @@ struct TerrainPlannerRetryTest {
           node.PlanningCommand().x() == .5, "confirmed landing did not restore preserved command");
   }
 
-  static void CheckRetrySeedDiscard(TerrainPlannerNode& node) {
-    node.state_.reset();
-    node.previous_.reset();
-    node.DiscardRetrySeed();
-    node.published_plans_.clear();
-    node.command_.setZero();
-    node.applied_command_.setZero();
-    TerrainPlannerNode::State state;
-    state.header.frame_id = "odom";
-    state.base_orientation.w = 1;
-    state.com_position.x = node.nominal_input_.position.x();
-    state.com_position.y = node.nominal_input_.position.y();
-    state.com_position.z = node.nominal_input_.position.z();
-    state.gait_clock_valid = true;
-    state.gait_epoch_ns = 11;
-    state.contact_estimated.fill(true);
-    state.contact_confirmed.fill(true);
-    for (int leg = 0; leg < 4; ++leg) {
-      state.foot_position[leg].x = node.nominal_input_.feet(leg, 0);
-      state.foot_position[leg].y = node.nominal_input_.feet(leg, 1);
-      state.foot_position[leg].z = node.nominal_input_.feet(leg, 2);
-    }
-    const auto update = [&](double gait_time) {
-      state.gait_time = gait_time;
-      state.header.stamp = node.now();
-      node.OnState(state);
-    };
-
-    auto baseline = Install(node);
-    update(0);
-    node.OnTimer();
-    Started(baseline);
-    Finish(node, baseline);
-    Check(node.previous_.has_value(), "retry-seed scenario missing baseline plan");
-
-    // 개선 중인 체인은 유지하다가 3회째 실패에서 소진 폐기한다.
-    auto fail1 = Install(node, false);
-    fail1->export_seed = true;
-    fail1->violation = .10;
-    update(.01);
-    node.OnTimer();
-    Started(fail1);
-    auto fail2 = Install(node, false);
-    fail2->export_seed = true;
-    fail2->violation = .15;  // 2배 미만 증가는 발산이 아니다.
-    update(.02);
-    Finish(node, fail1);
-    Started(fail2);
-    Check(fail2->had_retry_seed, "first failure did not seed the retry");
-    auto fail3 = Install(node, false);
-    fail3->export_seed = true;
-    fail3->violation = .12;
-    update(.03);
-    Finish(node, fail2);
-    Started(fail3);
-    Check(fail3->had_retry_seed, "non-diverging chain was discarded early");
-    auto exhausted = Install(node, false);
-    exhausted->export_seed = true;
-    exhausted->violation = .10;
-    update(.04);
-    Finish(node, fail3);
-    Started(exhausted);
-    Check(!exhausted->had_retry_seed && exhausted->had_previous,
-          "exhausted retry chain did not fall back to the last published plan");
-    Finish(node, exhausted);
-
-    // 위반이 2배 넘게 커지면 즉시 폐기한다. exhausted 실패가 새 체인(viol .10)을 시작했다.
-    auto diverged = Install(node, false);
-    diverged->export_seed = true;
-    diverged->violation = .25;
-    update(.05);
-    Started(diverged);
-    Check(diverged->had_retry_seed, "new chain after discard was not seeded");
-    auto recovered = Install(node, false);
-    recovered->export_seed = true;
-    update(.06);
-    Finish(node, diverged);
-    Started(recovered);
-    Check(!recovered->had_retry_seed && recovered->had_previous,
-          "diverged retry seed was not discarded");
-    Finish(node, recovered);
-  }
-
   static void CheckSwingReferenceUpdates(TerrainPlannerNode& node) {
     node.swing_references_ = {};
     TerrainPlannerNode::State state;
@@ -407,6 +321,7 @@ struct TerrainPlannerRetryTest {
   static void Run() {
     TerrainPlannerNode node;
     node.timer_->cancel();
+    Check(node.settings_.time_limit == 0, "online default still has a time limit");
     node.require_map_ = false;
     node.publish_markers_ = false;
     node.state_max_age_ = 10;
@@ -432,10 +347,15 @@ struct TerrainPlannerRetryTest {
       node.OnState(state);
     };
 
+    auto cold_failure = Install(node, false);
+    update(0);
+    Started(cold_failure);
     auto first = Install(node);
     update(0);
+    Finish(node, cold_failure);
     node.OnTimer();
     Started(first);
+    Check(!first->had_failed_seed, "initial failure was reused as a warm start");
     Check(!first->had_previous, "first solve unexpectedly had a seed");
     // 재계획 타이머를 취소한 상태에서도 worker 완료 알림만으로 발행해야 한다.
     rclcpp::executors::SingleThreadedExecutor executor;
@@ -565,7 +485,6 @@ struct TerrainPlannerRetryTest {
           "command advanced during solve without new state time");
 
     auto partial = Install(node, false);
-    partial->export_seed = true;
     update(.405);
     node.OnTimer();
     Started(partial);
@@ -575,13 +494,12 @@ struct TerrainPlannerRetryTest {
     update(.406);
     Finish(node, partial);
     Started(continued);
-    Check(continued->had_retry_seed && !continued->had_previous,
-          "partial iterate was not used for the next state");
+    Check(!continued->had_failed_seed && continued->had_previous,
+          "next state reused a failed iterate instead of the last success");
     Check(node.last_published_stamp_ns_ == before_partial &&
           node.previous_->seed_context.gait_time == successful_seed_gait,
           "failed iterate overwrote or published a successful plan");
     Finish(node, continued);
-    Check(!node.retry_seed_, "successful publication retained obsolete retry seed");
 
     auto reversed = Install(node);
     update(.41);
@@ -665,7 +583,6 @@ struct TerrainPlannerRetryTest {
           "estimated contact OFF blocked stance resume refresh");
     CheckCommandRamp();
     CheckTouchdownStop(node);
-    CheckRetrySeedDiscard(node);
     CheckSwingReferenceUpdates(node);
 
     Input held_model = node.nominal_input_;
@@ -680,7 +597,7 @@ struct TerrainPlannerRetryTest {
     Check(held_result.success, "real-model two-support hold solve failed");
     std::cout << "PASS seed preservation, nonblocking state, immediate latest-state replanning without duplicate solves, "
                  "epoch/pause/command/clock publication guards, latched stance support, "
-                 "command ramp, touchdown stop, retry-seed discard, "
+                 "command ramp, touchdown stop, failed-seed rejection, "
                  "epoch reset, and measured pre-liftoff origins\n";
   }
 };

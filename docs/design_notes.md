@@ -447,7 +447,8 @@ RViz의 Fixed Frame과 연결되는 TF도 같은 좌표 계약에 맞춰야 한�
 | `map_topic` | `/elevation_mapping_node/elevation_map_raw` |
 | `frame` | `odom` — 입력 맵은 기본 `elevation_odom`이므로 실행 시 확인 |
 | `command` | `[0.1, 0.0, 0.0]` |
-| `plan_rate_hz`, `time_limit` | 대기 입력 재확인 10 Hz, 계산 제한 0.1 s |
+| `plan_rate_hz`, `time_limit` | 대기 입력 재확인 10 Hz, 0(계산 시간 제한 없음) |
+| `touchdown_resume_delay` | 실행 YAML 0.08 s — 착지 확인 후 보행 재개 유예 |
 | `sample_dt`, `swing_height` | 0.02 s, 0.10 m |
 | `require_map`, `publish_markers` | true, true |
 | `plan_topic`, `marker_topic` | `/terrain_planner/plan`, `/terrain_planner/markers` |
@@ -626,7 +627,7 @@ TAMOLS 추종의 다음 스윙은 이륙 후에도 확인 지지발이 최소 �
   `layer=virtual/ground`는 coarse/최종 지형 계산이며, 중간 후보 보정은
   `refinement_selected` 또는 `refinement_discarded`다. `attempt_leg=-1`은 기본 시도,
   0~3은 해당 다리의 다른 높이 후보 재시도다. 실패한 시도의 기록도 보존한다.
-- 각 발의 `source`는 `candidate`, `previous_success`, `retry_iterate`, `coarse_solution`,
+- 각 발의 `source`는 `candidate`, `previous_success`, `coarse_solution`,
   `refined_candidate`, `reach_reselected`, `alternative_height`, `fixed`,
   `committed_swing`, `occupied_fallback_current`를 구분한다. 초기화 출처이며 SQP가
   좌표를 그대로 유지했다는 뜻은 아니다. 보정을 생략한 발은 `not_refined`다.
@@ -663,8 +664,7 @@ QP 행렬을 매 반복 복사하지 않고 단계 기록을 모은 뒤 ROS 스�
 기존 ROS executor를 깨운다. 2ms 완료 polling은 사용하지 않는다. 결과 채택·노드 상태
 갱신은 기존 callback group에서 직렬 실행하고, 종료 시 worker를 기다린 뒤 알림을 해제한다.
 보정 지도 진단은 계획 발행 뒤에 수행한다. 실패·보류 결과의 지도 진단도 유지한다.
-계산 제한, 기존 발행 조건 및 착지 재개 시각은 유지한다. 재계획은 아래의 최신 상태 기반
-비동기 실행 계약을 따른다.
+재계획과 시간 제한은 아래 최신 상태 기반 비동기 실행 계약을 따른다.
 
 `solve_status.completion_dispatch_ns`는 완료 callback 진입 시각이다. `solve_end_ns`와의
 차이는 완료 알림 대기, `last_publish_ns`와의 차이는 결과 처리·계획 생성·publish 비용이다.
@@ -673,11 +673,16 @@ WBC 수신 로그의 `callback_start_ns`/`submitted_ns` 및 채택 로그의
 `control_stamp_ns`를 최초 제어 판정 시각으로 해석하지 않는다.
 
 관련 회귀는 타이머 없이 최초 계산·완료 발행·성공 후 재계획, 계산 중 상태 병합,
-동일 상태 재시도 금지 및 기존 실패 초기값·epoch/clock 판정 보존을 검증한다.
+동일 상태 재시도 금지, 실패 초기값 거부 및 epoch/clock 판정 보존을 검증한다.
 분리된 완료 알림 200회 비교에서 2ms polling→이벤트 방식의 지연은 중앙값
 1.31→0.012ms, 95백분위 1.85→0.16ms, 최대 3.51→1.39ms였다. executor 스레드
 CPU 사용량은 단일 코어 기준 0.69→0.75%였다. 이는 해당 OS 부하에서의 전달 경로
 측정이며 최적화 수렴 시간이나 실제 보행 성공을 검증한 수치가 아니다.
+
+계산 제한 해제·실패 초기값 제거는 Release 전체 빌드와 `planner_retry_test`,
+`committed_swing_test`, `swing_terrain_test`, `terrain_pipeline_test`,
+`config_generation_test`를 통과했다. WBC의 `locomotion_bridge_test`는 0.8초 계획을
+0.7초 뒤 채택하고 horizon 밖은 거부하는 것을 확인했다. 실제 보행은 미검증이다.
 
 ### 계획 갱신 중단 진단
 
@@ -732,8 +737,19 @@ Solve는 입력·설정·직전 성공해의 복사본으로 별도 작업에서
 성공·실패 여부와 무관하게 한 번만 계산한다.
 `plan_rate_hz`의 10 Hz 타이머는 지도 등 입력 조건 대기 중 재확인용이며, 재계획 속도
 상한이 아니다. 실제 속도는 새 상태 수신 간격과 계산·결과 처리 시간에 의해 결정된다.
-실패한 미완성 해와 SQP 페널티의 재사용·폐기 정책은 유지한다. 계산 빈도가 높아져 CPU와
-계획·진단 발행 부하는 증가할 수 있다. 이 변경만으로 착지 품질 회복이나 보행 성공을
+실패 중간값과 SQP 페널티는 다음 상태의 계산에 넘기지 않는다. 마지막으로 발행한 성공해만
+초기값으로 사용하며, 성공해가 없으면 현재 입력으로 초기화한다. 새 계산의 페널티는 기본값
+10에서 시작한다. 같은 Solve 내부의 가상 바닥 초기화·후보 보정 단계는 유지한다.
+실행 YAML과 ROS 기본값의 `time_limit: 0`은 SQP·QP 시간 제한을 해제한다. 양수를 명시하면
+그 예산을 적용하며 음수·비유한 값은 오류다. 수렴·실패·반복 횟수 종료 조건은 유지한다.
+무제한에서는 준비 단계 시간 비율을 적용하지 않고 각 단계의 기존 종료 조건을 사용한다.
+WBC의 80ms 채택 기한은 제거했다. 실제 궤적 horizon 만료·부모·epoch 판정은 유지한다.
+`touchdown_resume_delay`는 착지 후 보행 재개 유예만 설정하며 WBC 채택 기한이 아니다.
+실행 YAML의 값은 0.08초이며, 생략·0 이하이면 기존 기본값 0.1 + 2*sample_dt를 사용한다.
+기존 `handover_grace` 설정은 이 이름으로 교체했다. 메시지 handover 시각 필드는 유지한다.
+계획기 완료 후 시작 상태·지도 freshness 재검사와 reference-prefix 인계 마감 제거는
+추가 승인 대기 중이며 현재 코드는 해당 조건을 유지한다.
+계산 빈도가 높아져 CPU와 계획·진단 발행 부하는 증가할 수 있다. 이 변경만으로 착지 품질 회복이나 보행 성공을
 보장하지 않으며, 기존 발행 조건을 통과한 결과만 실행 후보로 공급한다.
 미확인 예정 지지발·입력 freshness 조건은 재시도에도 동일하게 적용한다.
 `body_clock_valid` 상태에서는 미확인 착지발을 지지로 가정하지 않고 현재 확인된
@@ -817,11 +833,12 @@ solver는 램프 목표의 복사본으로 끝까지 계산하고, 계산 중 �
 
 `LocomotionState.active_plan_stamp_ns`는 WBC가 실제 사용한 계획이다. 최근 발행된 후보와
 구분하며, 이 확인에 맞는 몸통·스윙 참조를 사용한다. 후보에는 부모 stamp와
-`handover_body_time`이 포함된다(legacy는 `handover_gait_time`). WBC 제어 주기는 부모·epoch·시각·연속성을 검사해
+`handover_body_time`이 포함된다(legacy는 `handover_gait_time`). WBC 제어 주기는 부모·epoch와 현재 시각의 샘플 유효성을 검사해
 후보를 채택하고, 부적합 후보가 와도 기존 계획을 유지한다. 기존 계획의 실제 ROS
 만료는 그대로 적용한다. header stamp는 계산 입력 상태의 시각이다.
 
-이동 중에는 기본 설정의 몸통 연결점이 입력 body time + time_limit + 2*sample_dt, 즉 140 ms 뒤다.
+아래 연결점 설명은 이전 prefix 고정 구현의 기록이다. 현재는 측정 상태에서 다시 계산한다.
+착지 재개 유예는 `touchdown_resume_delay`로 설정하며 WBC 채택 기한은 없다.
 그 이전에는 부모 몸통 다항식을 정확히 절단해 사용한다. 이후 궤적은 연결점의 위치·속도
 등식 제약과 가속도 차이 비용을 포함해 최적화한다. 가속도 연속성을 보장하는 계약은 아니다.
 연결점을 위상 내부에 추가하더라도 접촉 일정과 현재 스윙 종료 시각은 바꾸지 않는다.
@@ -847,22 +864,23 @@ WBC는 새 이륙 후 확인 지지발 두 개 이상 조건에 더해, 마지�
 반영된 실행 계획과 새 몸통 구간의 적용 가능 여부를 요구한다. 새 계획을 받았어도
 이전 몸통을 유지하는 앞부분에 있으면 이륙을 기다린다. 계획 대기 중에도 ROS watchdog은 흐른다. 따라서 긴
 접촉 대기, 반복 solve 실패, 수신 지연은 여전히 명시적 만료로 종료될 수 있다.
-착지 대기에도 WBC는 몸통 p/v/a를 계속 추종한다. 채택 시 부모 곡선의 p/v/a 일치를 검사하며, 새 최적화 구간의 연결은 p/v 연속성을 보장한다.
+착지 대기에도 WBC는 몸통 기준 궤적을 계속 추종한다. 현재 채택 경로는 측정 상태에서
+재계획한 후보와 부모 곡선의 p/v/a 동일성을 요구하지 않는다.
 
 상태 메시지의 `candidate_plan_stamp_ns/plan_adoption_status`는 수신과 실행 채택을
-구분한다. 상태 값은 0 없음, 1 채택, 2 부모 불일치, 3 연결 시각 경과, 4 무효 샘플,
-5 epoch 불일치, 6 몸통 위치·속도 연속성 불일치다. CSV의 `plan_accepted_*`는
+구분한다. 상태 값은 0 없음, 1 채택, 2 부모 불일치, 4 무효 샘플,
+5 epoch 불일치다. 3(연결 시각 경과)·6(상태 불연속)은 은퇴 번호이며 재사용하지 않는다. CSV의 `plan_accepted_*`는
 ROS callback의 후보 수신 승인이고 실제 실행 stamp는 `plan_stamp_ns`다.
 
 연결 이후 새 몸통 구간 사이에는 기존 위치·속도 연속 조건을 유지한다. 부모 궤적과의
 연결점은 위치·속도 등식과 가속도 차이 비용을 사용한다. 초기값은 실제 이어 붙인 결과다. 고정 앞부분은 기존 계수를 정확히 유지하며,
 정지 인계에는 이전 다항식의 구간 경계를 보존한다.
 
-시간 제한으로 중단된 유한한 SQP 반복값은 `seed_available`로 표시해 별도 재시도
-초기값으로 보관한다. 마지막 성공해와 실행 계획을 덮어쓰지 않으며, 같은 부모 계획과
-세션에서만 재사용한다. 재시도도 기존 SQP 제약의 실행 가능 판정을 통과해야 발행한다.
-`solve_status.warm_start`의 `shifted_retry_iterate`는 이 경로이며 계산 중간값의 실행을
-뜻하지 않는다. 정지 인계에서는 부모 다항식의 구간 경계도 유지해 초기값을 옮긴다.
+외부 Solve에서 실패한 결과는 다음 계산의 초기값으로 사용하지 않는다. 실패 페널티 전달
+필드와 ROS 노드의 재시도 시드 저장소는 제거했다. `initialization_available`은 같은 Solve
+안의 가상 바닥 단계 중간값만 보정에 사용하는 표시이며, 외부 previous 인자로 실패 결과를
+주어도 초기값·착지 anchor·새 슬롯 판정에서 제외한다. 실패한 ground 결과는 실행 곡선을
+내보내지 않는다.
 
 보행 시간은 미확인 착지발이 생긴 명목 착지 경계에서 멈춘다. 실제 착지와 해당 상태를
 반영한 몸통 인계가 끝난 뒤 네 발 지지 구간을 진행하므로, 착지 탐색이 지지 시간을
@@ -1270,7 +1288,7 @@ WBC epoch 변경 또는 상태 시계 역행/1초 이상 공백은 오프셋을 
 지도 구조와 원본 stamp는 그대로 유지한다. 이 모드는 평지 관측을 전제로 하며,
 일반 지형의 경사·장애물 모델이나 KF 드리프트 보정기는 아니다.
 `config/b2_terrain.yaml`의 `planner.common`과 `planner.flat`은 국소 support patch를
-끄고 10 Hz/100 ms 계산 제한을 유지한다. 빌드 시 설치용 `terrain_planner_flat.yaml`을
+끄고 최신 상태 기반 비동기 재계획과 `time_limit: 0`을 사용한다. 빌드 시 설치용 `terrain_planner_flat.yaml`을
 자동 생성하므로 설정 변경 후 사용하는 ROS 설치 경로를 다시 빌드한다.
 기존 CuPy/CUDA 실행 환경이 필요하다.
 

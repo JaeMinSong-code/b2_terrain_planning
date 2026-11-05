@@ -1,9 +1,9 @@
 /**
  * @file planner.cpp
  * @brief 접촉 조합별 생성 Jacobian과 지형 비용의 Gauss–Newton QP로 trot을 최적화한다.
- * @version 0.0.48
+ * @version 0.0.49
+ * @update 2026-11-05: 시간 제한 해제와 성공해 전용 재계획을 지원하고 실패 페널티 전달을 제거함.
  * @update 2026-11-05: 측정 발만으로 된 상수 면적 제약을 제외해 해소 불가능한 QP 실패를 막음.
- * @update 2026-11-05: 착지점 단계·지도 관측·비용 진단을 추가하고 제어 계산과 분리함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -493,7 +493,7 @@ class Problem {
       diagnostic->reason = reason;
       return x;
     };
-    if (!old.success && !old.seed_available) {
+    if (!old.success && !old.initialization_available) {
       return reject("previous_plan_not_usable");
     }
     if (context.terrain != input_.terrain.has_value()) {
@@ -694,7 +694,7 @@ class Problem {
         x.segment<3>(feet_offset_ + 3 * leg) = foot;
         if (sources) {
           (*sources)[leg] = "previous_success";
-          if (!old.success) (*sources)[leg] = "retry_iterate";
+          if (!old.success) (*sources)[leg] = "coarse_initializer";
         }
         ++diagnostic->reused_footholds;
         continue;
@@ -717,8 +717,8 @@ class Problem {
     diagnostic->reason = "shifted_previous_plan";
     if (terrain_changed) diagnostic->reason = "shifted_previous_plan_updated_terrain";
     if (!old.success) {
-      diagnostic->reason = "shifted_retry_iterate";
-      if (terrain_changed) diagnostic->reason = "shifted_retry_iterate_updated_terrain";
+      diagnostic->reason = "shifted_coarse_initializer";
+      if (terrain_changed) diagnostic->reason = "shifted_coarse_initializer_updated_terrain";
     }
     diagnostic->elapsed = shift;
     return x;
@@ -1615,7 +1615,8 @@ bool QpStep(const Evaluation& eval, const Vector& scaling, double penalty,
   settings.eps_prim_inf = 1e-10;
   settings.eps_dual_inf = 1e-10;
   settings.max_iter = solver_settings.qp_max_iterations;
-  settings.time_limit = std::max(1e-5, remaining);
+  settings.time_limit = 0.0;
+  if (std::isfinite(remaining)) settings.time_limit = std::max(1e-5, remaining);
   if (reuse) settings.warm_start = 0;
   diagnostic.variables = data.n;
   diagnostic.rows = data.m;
@@ -2114,7 +2115,7 @@ void Validate(const Robot& r, const Input& input, const Settings& settings) {
       !std::isfinite(settings.qp_eps_rel) || settings.qp_eps_rel <= 0 ||
       settings.realtime_iterations < 0 || settings.realtime_iterations > settings.max_iterations ||
       settings.qp_max_iterations <= 0 || settings.max_iterations <= 0 || settings.sample_intervals < 2 || settings.sample_intervals > 100 ||
-      !std::isfinite(settings.time_limit) || settings.time_limit <= 0 ||
+      !std::isfinite(settings.time_limit) || settings.time_limit < 0 ||
       !std::isfinite(settings.projection_residual_tolerance) ||
       settings.projection_residual_tolerance <= 0 || settings.projection_residual_tolerance > 1e-5 ||
       !std::isfinite(settings.feasibility_tolerance) || settings.feasibility_tolerance <= 0 ||
@@ -2318,6 +2319,8 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
                            const std::array<std::optional<Eigen::Vector3d>, 4>* refined = nullptr) {
   const auto begin = Clock::now();
   auto elapsed = [&]() { return std::chrono::duration<double>(Clock::now() - begin).count(); };
+  double time_limit = std::numeric_limits<double>::infinity();
+  if (settings.time_limit > 0) time_limit = settings.time_limit;
   Result result;
   result.seed_context = {input.gait_time, robot.period, robot.duty, input.frame,
                          RobotSignature(robot), input.terrain.has_value(), input.feet,
@@ -2399,7 +2402,7 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
     Vector x = problem.Initial(seed, &result.warm_start, replaced_leg, &sources);
     if (initializer) {
       for (auto& source : sources) {
-        if (source == "previous_success" || source == "retry_iterate") source = "coarse_solution";
+        if (source == "previous_success" || source == "coarse_initializer") source = "coarse_solution";
       }
     }
     if (settings.foothold_diagnostics && terrain_pointer) {
@@ -2423,10 +2426,6 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
     initialization_timer.Stop();
     const bool realtime = settings.realtime_iterations > 0 && result.warm_start.used;
     double penalty = 10.0;
-    if (previous && !previous->success && result.warm_start.used &&
-        std::isfinite(previous->seed_penalty)) {
-      penalty = std::clamp(previous->seed_penalty, 10.0, 1e6);
-    }
     std::array<bool, 4> crossed{};
     std::optional<FootholdTrace> final_trace;
     auto remember_final = [&](const Evaluation& evaluation) {
@@ -2458,7 +2457,7 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
       if (iteration == 0 && settings.foothold_diagnostics && terrain_pointer) {
         trace(problem.InitialFootholds(x), "sqp_start", &eval);
       }
-      if (elapsed() >= settings.time_limit) {
+      if (elapsed() >= time_limit) {
         result.status = "time_limit";
         break;
       }
@@ -2477,10 +2476,10 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
       double slack = 0.0;
       std::string qp_status;
       bool qp_ok = ReducedQpStep(
-          eval, scaling, penalty, settings.time_limit - elapsed(), &step,
+          eval, scaling, penalty, time_limit - elapsed(), &step,
           &slack, &qp_status, &result.profile, settings, iteration + 1, &reduced_cache, x, &structure_cache);
-      if (!qp_ok && elapsed() < settings.time_limit) {
-        qp_ok = QpStep(eval, scaling, penalty, settings.time_limit - elapsed(),
+      if (!qp_ok && elapsed() < time_limit) {
+        qp_ok = QpStep(eval, scaling, penalty, time_limit - elapsed(),
                        &step, &slack, &qp_status, &result.profile, settings, iteration + 1,
                        &elastic_cache, QpCoordinates{x}, true);
       }
@@ -2510,7 +2509,7 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
       if (settings.chord_projection) projection_linearization = &eval;
       ScopedTimer search_timer(&result.profile.line_search_seconds);
       for (int search = 0; search < 10; ++search) {
-        if (elapsed() >= settings.time_limit) break;
+        if (elapsed() >= time_limit) break;
         Vector trial_x;
         Evaluation candidate;
         try {
@@ -2573,12 +2572,12 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
       }
       search_timer.Stop();
       if (realtime && accepted && iteration + 1 >= settings.realtime_iterations &&
-          accepted_violation <= settings.feasibility_tolerance && elapsed() < settings.time_limit) {
+          accepted_violation <= settings.feasibility_tolerance && elapsed() < time_limit) {
         result.success = true;
         result.status = "feasible_realtime_step";
         break;
       }
-      if (((!accepted && violation < 1e-5) || small_improvements >= 3) && elapsed() < settings.time_limit) {
+      if (((!accepted && violation < 1e-5) || small_improvements >= 3) && elapsed() < time_limit) {
         result.success = true;
         result.status = "feasible_stalled";
         break;
@@ -2602,16 +2601,17 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
     }
     const bool resumable = result.status == "time_limit" || result.status == "iteration_limit" ||
                            result.status == "line_search_failed";
-    if (result.success || (resumable && x.allFinite())) {
+    // 가상 바닥의 중간값은 같은 Solve 안의 후보 보정에만 사용한다.
+    const bool coarse_initializer = layer == TerrainLayer::kVirtualFloor && resumable && x.allFinite();
+    if (result.success || coarse_initializer) {
       if (result.success) result.stage = "export";
       problem.Export(x, &result);
-      result.seed_available = true;
-      result.seed_penalty = penalty;
+      result.initialization_available = coarse_initializer;
     }
     if (result.success) result.stage = "complete";
   } catch (const std::exception& error) {
     result.success = false;
-    result.seed_available = false;
+    result.initialization_available = false;
     result.coefficients.clear();
     result.phases.clear();
     result.margins.clear();
@@ -2626,6 +2626,10 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
              const Result* previous) {
   const auto begin = Clock::now();
   auto elapsed = [&]() { return std::chrono::duration<double>(Clock::now() - begin).count(); };
+  double time_limit = std::numeric_limits<double>::infinity();
+  if (settings.time_limit > 0) time_limit = settings.time_limit;
+  // 외부 계산의 실패값은 초기값·착지 anchor·새 슬롯 판정에 사용하지 않는다.
+  if (previous && !previous->success) previous = nullptr;
   Feet initial = input.feet;
   try {
     Validate(robot, input, settings);
@@ -2665,18 +2669,21 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
   double preparation_diagnostics = 0.0;
   std::optional<Result> coarse;
   std::array<std::optional<Eigen::Vector3d>, 4> refined;
-  const double preparation_end = settings.time_limit * settings.graduated_budget_fraction;
+  double preparation_end = 0.0;
+  if (settings.graduated_budget_fraction > 0) {
+    preparation_end = time_limit * settings.graduated_budget_fraction;
+  }
   if (prepared && settings.terrain.pipeline_enabled && settings.graduated_initialization &&
       new_slot && elapsed() < preparation_end) {
     const double stage_begin = elapsed();
     Settings warm = settings;
-    warm.time_limit = preparation_end - elapsed();
+    if (std::isfinite(preparation_end)) warm.time_limit = preparation_end - elapsed();
     Result candidate = SolveAttempt(robot, input, warm, previous, nullptr, nullptr,
                                     prepared, TerrainLayer::kVirtualFloor);
     preparation_diagnostics = candidate.foothold_diagnostic_seconds;
     preparation_trace = std::move(candidate.foothold_trace);
     initialization_status = "coarse_fallback:" + candidate.status;
-    if ((candidate.success || candidate.seed_available) && elapsed() < preparation_end) {
+    if ((candidate.success || candidate.initialization_available) && elapsed() < preparation_end) {
       const auto phases = MakeHorizon(input.gait_time, robot.period, robot.duty,
                                      input.gait_hold_duration, input.hold_contacts);
       const auto nominal = NominalFootholds(robot, input, phases);
@@ -2738,7 +2745,9 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
     initialization_status = "direct_initialization_budget";
   }
   Settings final_settings = settings;
-  final_settings.time_limit = std::max(1e-6, settings.time_limit - elapsed());
+  if (settings.time_limit > 0) {
+    final_settings.time_limit = std::max(1e-6, time_limit - elapsed());
+  }
   const Result* initializer = nullptr;
   const std::array<std::optional<Eigen::Vector3d>, 4>* refined_ptr = nullptr;
   if (coarse) { initializer = &*coarse; refined_ptr = &refined; }
@@ -2761,7 +2770,7 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
                                       result.elapsed, result.success}};
   const bool retryable = result.status == "line_search_failed" ||
       result.status == "iteration_limit";
-  if (!result.success && retryable && elapsed() < settings.time_limit) {
+  if (!result.success && retryable && elapsed() < time_limit) {
     // 같은 nominal과 목적함수를 유지하고, 각 다리의 다른 높이 지지면에서 시작한다.
     // 후보별로 남은 시간 안에서 몸통 SQP를 다시 수행한다.
     const auto phases = MakeHorizon(input.gait_time, robot.period, robot.duty,
@@ -2800,8 +2809,10 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
                      [](const auto& a, const auto& b) { return a.first > b.first; });
     for (auto& entry : alternatives) {
       Settings retry = settings;
-      retry.time_limit = settings.time_limit - elapsed();
-      if (retry.time_limit <= 0) break;
+      if (settings.time_limit > 0) {
+        retry.time_limit = time_limit - elapsed();
+        if (retry.time_limit <= 0) break;
+      }
       // 지지면을 바꾸면 선형화도 크게 바뀌므로 5회 RTI 조기 종료를 기다리지 않는다.
       if (retry.realtime_iterations > 0) retry.realtime_iterations = std::max(20, retry.realtime_iterations);
       auto trial = SolveAttempt(robot, input, retry, previous, &entry.second, nullptr, prepared);
@@ -2829,7 +2840,7 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
 }
 
 Vector6 Evaluate(const Result& result, double elapsed, int derivative) {
-  if ((!result.success && !result.seed_available) || result.phases.empty() ||
+  if ((!result.success && !result.initialization_available) || result.phases.empty() ||
       result.coefficients.size() != result.phases.size() || !std::isfinite(elapsed) ||
       derivative < 0 || derivative > 2 || elapsed < 0) throw std::invalid_argument("invalid evaluation");
   const auto& last = result.phases.back();
