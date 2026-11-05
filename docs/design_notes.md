@@ -720,7 +720,7 @@ solve 시각은 최근 시도에 속하며 `solve_started`의 종료 시각 0은
 - `solve_started` / `solve_failed`: 계산 시작 또는 solver의 실패 status. `time_limit`은 해 부재의 증거가 아니다.
 - `publish_deferred`: solve 성공 후 `state_not_fresh_after_solve`,
   `map_not_fresh_after_solve`, `state_reset_during_solve`,
-  `active_plan_changed_after_solve`, `body_handover_missed`, `contact_phase_changed_after_solve` 중 처음 탈락한 조건.
+  `active_plan_changed_after_solve`, `contact_phase_changed_after_solve` 중 처음 탈락한 조건.
 - `published`: 실제 plan publish 호출 반환 직후. 수신부 채택과는 별도 단계다.
 - `state_rejected`: 상태 입력 검증 실패 또는 중복/역순. `received_stamp_ns`는 거부된 입력 시각이다.
 - `reset`: ROS 시각 역행.
@@ -747,8 +747,10 @@ WBC의 80ms 채택 기한은 제거했다. 실제 궤적 horizon 만료·부모�
 `touchdown_resume_delay`는 착지 후 보행 재개 유예만 설정하며 WBC 채택 기한이 아니다.
 실행 YAML의 값은 0.08초이며, 생략·0 이하이면 기존 기본값 0.1 + 2*sample_dt를 사용한다.
 기존 `handover_grace` 설정은 이 이름으로 교체했다. 메시지 handover 시각 필드는 유지한다.
-계획기 완료 후 시작 상태·지도 freshness 재검사와 reference-prefix 인계 마감 제거는
-추가 승인 대기 중이며 현재 코드는 해당 조건을 유지한다.
+계산 완료 후 시작 상태·지도의 나이를 다시 검사하지 않으며 reference-prefix 인계 마감도
+적용하지 않는다. 최신 수신 상태·지도의 freshness는 계속 확인한다. epoch·실행 부모 계획·
+접촉 위상 판정은 유지한다. `planner_retry_test`는 0.7초 된 시작 상태·지도와 경과한
+0/양수 prefix 마감에도 결과를 발행하고, 최신 상태나 지도 자체가 오래되면 거부함을 검증한다.
 계산 빈도가 높아져 CPU와 계획·진단 발행 부하는 증가할 수 있다. 이 변경만으로 착지 품질 회복이나 보행 성공을
 보장하지 않으며, 기존 발행 조건을 통과한 결과만 실행 후보로 공급한다.
 미확인 예정 지지발·입력 freshness 조건은 재시도에도 동일하게 적용한다.

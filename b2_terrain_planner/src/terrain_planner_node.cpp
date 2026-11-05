@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.50
+ * @version 0.0.51
+ * @update 2026-11-05: 계산 시작 snapshot 나이와 prefix 인계 마감에 따른 완료 결과 거부를 제거함.
  * @update 2026-11-05: 기본 계산 시간 제한과 실패 중간값·페널티 재사용 경로를 제거함.
- * @update 2026-11-05: 최신 상태로 성공·실패 후 즉시 재계획하고 동일 상태 재시도를 제거함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -1213,8 +1213,8 @@ class TerrainPlannerNode : public rclcpp::Node {
       reason = "state_reset_during_solve";
     }
     if (publishable) {
-      publishable = Fresh(state.header.stamp, state_max_age_) &&
-                    Fresh(state_->header.stamp, state_max_age_);
+      // 시작 snapshot의 나이를 계산 기한으로 사용하지 않는다. 최신 입력만 확인한다.
+      publishable = Fresh(state_->header.stamp, state_max_age_);
       reason = "state_not_fresh_after_solve";
     }
     if (publishable) {
@@ -1235,16 +1235,8 @@ class TerrainPlannerNode : public rclcpp::Node {
       }
     }
     if (publishable) {
-      publishable = !input.terrain || (Fresh(pending.map_stamp, map_max_age_) &&
-                                      terrain_ && Fresh(map_stamp_, map_max_age_));
+      publishable = !input.terrain || (terrain_ && Fresh(map_stamp_, map_max_age_));
       reason = "map_not_fresh_after_solve";
-    }
-    if (publishable && input.reference_prefix) {
-      publishable = StateBodyTime(*state_) < BodyTime(input) + input.prefix_duration;
-      if (input.prefix_duration == 0) {
-        publishable = state_->gait_paused && state_->gait_time == input.gait_time;
-      }
-      reason = "body_handover_missed";
     }
     // 명령은 계산 입력의 snapshot이다. 새 명령 수신은 성공해 발행을 취소하지 않는다.
     if (!result.success) {

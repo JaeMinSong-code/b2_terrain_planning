@@ -1,9 +1,9 @@
 /**
  * @file planner_retry_test.cpp
  * @brief 지연·실패를 주입해 비동기 재계획과 성공해 보존 및 발행 차단을 검증한다.
- * @version 0.0.22
+ * @version 0.0.23
+ * @update 2026-11-05: 오래된 시작 snapshot·인계 마감 이후 발행과 최신 입력 freshness 보존을 검증함.
  * @update 2026-11-05: 실패 중간값을 버리고 최신 상태에서 직전 성공해만 사용하는 경로를 검증함.
- * @update 2026-11-05: 성공 후 최신 상태 즉시 계산·상태 병합·동일 상태 재시도 제거를 검증함.
  */
 #define B2_TERRAIN_PLANNER_NO_MAIN
 #include "../../src/terrain_planner_node.cpp"
@@ -318,6 +318,75 @@ struct TerrainPlannerRetryTest {
     node.step_swing_.enabled = enabled;
   }
 
+  static void CheckSnapshotCompletion() {
+    TerrainPlannerNode node;
+    node.timer_->cancel();
+    node.require_map_ = false;
+    node.publish_markers_ = false;
+    node.command_.setZero();
+    node.state_max_age_ = .25;
+    node.map_max_age_ = .25;
+    TerrainPlannerNode::State state;
+    state.header.frame_id = "odom";
+    state.base_orientation.w = 1;
+    state.com_position.x = node.nominal_input_.position.x();
+    state.com_position.y = node.nominal_input_.position.y();
+    state.com_position.z = node.nominal_input_.position.z();
+    state.gait_clock_valid = true;
+    state.gait_epoch_ns = 1;
+    state.contact_confirmed.fill(true);
+    state.contact_estimated.fill(true);
+    for (int leg = 0; leg < 4; ++leg) {
+      state.foot_position[leg].x = node.nominal_input_.feet(leg, 0);
+      state.foot_position[leg].y = node.nominal_input_.feet(leg, 1);
+      state.foot_position[leg].z = node.nominal_input_.feet(leg, 2);
+    }
+    auto baseline = Install(node);
+    state.header.stamp = node.now();
+    node.OnState(state);
+    Started(baseline);
+    Finish(node, baseline);
+
+    HeightMap map;
+    map.origin = Eigen::Vector2d::Constant(-1);
+    map.heights = Eigen::MatrixXd::Zero(41, 41);
+    map.variance = Eigen::MatrixXd::Zero(41, 41);
+    map.valid = Eigen::ArrayXXi::Ones(41, 41);
+    node.terrain_ = map;
+    // 시각을 주입해 sleep 없이 오래된 시작 snapshot과 최신 입력을 분리한다.
+    // 앞 두 경우는 0/양수 prefix 마감 경과, 뒤 두 경우는 최신 상태/지도 단절이다.
+    for (int scenario = 0; scenario < 4; ++scenario) {
+      state.gait_time = .01 + .02 * scenario;
+      state.header.stamp = node.now();
+      node.map_stamp_ = node.now();
+      auto attempt = Install(node);
+      node.OnState(state);
+      Started(attempt);
+      const auto old_stamp = node.now() - rclcpp::Duration::from_seconds(.7);
+      node.pending_solve_->state.header.stamp = old_stamp;
+      node.pending_solve_->map_stamp = old_stamp;
+      node.pending_solve_->input.reference_prefix = std::make_shared<Result>(*node.previous_);
+      node.pending_solve_->input.prefix_duration = 0;
+      if (scenario == 1) node.pending_solve_->input.prefix_duration = .001;
+      node.state_->gait_time += .005;
+      Check(!node.Fresh(node.pending_solve_->state.header.stamp, node.state_max_age_) &&
+            !node.Fresh(node.pending_solve_->map_stamp, node.map_max_age_),
+            "test snapshot did not exceed the former age limits");
+      if (scenario == 2) node.state_->header.stamp = old_stamp;
+      if (scenario == 3) node.map_stamp_ = old_stamp;
+      const auto before = node.last_published_stamp_ns_;
+      Finish(node, attempt);
+      Check(!node.solve_future_.valid(), "snapshot test unexpectedly started a second solve");
+      if (scenario < 2) {
+        Check(node.last_published_stamp_ns_ == old_stamp.nanoseconds(),
+              "old start snapshot or prefix deadline blocked publication");
+      } else {
+        Check(node.last_published_stamp_ns_ == before,
+              "stale latest state or map was allowed to publish");
+      }
+    }
+  }
+
   static void Run() {
     TerrainPlannerNode node;
     node.timer_->cancel();
@@ -581,6 +650,7 @@ struct TerrainPlannerRetryTest {
           "rolling replanning postponed gait resume forever");
     Check(node.last_published_stamp_ns_ > before_refresh,
           "estimated contact OFF blocked stance resume refresh");
+    CheckSnapshotCompletion();
     CheckCommandRamp();
     CheckTouchdownStop(node);
     CheckSwingReferenceUpdates(node);
