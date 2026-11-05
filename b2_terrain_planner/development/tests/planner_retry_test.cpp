@@ -1,9 +1,9 @@
 /**
  * @file planner_retry_test.cpp
  * @brief 지연·실패를 주입해 비동기 재계획과 성공해 보존 및 발행 차단을 검증한다.
- * @version 0.0.19
+ * @version 0.0.20
+ * @update 2026-11-05: 완료 타이머 없이 비동기 완료를 전달하는 경로를 검증함.
  * @update 2026-11-04: 단차 회피 스윙의 이륙 전 선택과 이륙 후 지도·설정 변경에도 곡선 보존을 검증함.
- * @update 2026-11-03: 제거한 IK 검증 결과 필드 검사를 정리함.
  */
 #define B2_TERRAIN_PLANNER_NO_MAIN
 #include "../../src/terrain_planner_node.cpp"
@@ -101,7 +101,6 @@ struct TerrainPlannerRetryTest {
   static void CheckCommandRamp() {
     TerrainPlannerNode node;
     node.timer_->cancel();
-    node.completion_timer_->cancel();
     node.command_ << .3, .4, 1.0;
     TerrainPlannerNode::State state;
     state.gait_clock_valid = true;
@@ -405,7 +404,6 @@ struct TerrainPlannerRetryTest {
   static void Run() {
     TerrainPlannerNode node;
     node.timer_->cancel();
-    node.completion_timer_->cancel();
     node.require_map_ = false;
     node.publish_markers_ = false;
     node.state_max_age_ = 10;
@@ -436,8 +434,22 @@ struct TerrainPlannerRetryTest {
     node.OnTimer();
     Started(first);
     Check(!first->had_previous, "first solve unexpectedly had a seed");
-    Finish(node, first);
+    // 재계획 타이머를 취소한 상태에서도 worker 완료 알림만으로 발행해야 한다.
+    rclcpp::executors::SingleThreadedExecutor executor;
+    executor.add_node(node.get_node_base_interface());
+    first->release.set_value();
+    const auto completion_deadline = std::chrono::steady_clock::now() +
+                                     std::chrono::seconds(2);
+    while (node.solve_future_.valid() &&
+           std::chrono::steady_clock::now() < completion_deadline) {
+      executor.spin_once(std::chrono::milliseconds(50));
+    }
+    executor.remove_node(node.get_node_base_interface());
+    Check(!node.solve_future_.valid(), "completion notification was lost");
     Check(node.previous_.has_value() && node.last_publish_ns_ > 0, "initial plan not published");
+    Check(node.completion_dispatch_ns_ >= node.solve_end_ns_ &&
+          node.last_publish_ns_ >= node.completion_dispatch_ns_,
+          "completion timestamps do not separate dispatch and publication");
 
     auto failed = Install(node, false);
     update(.01);

@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.47
+ * @version 0.0.48
+ * @update 2026-11-05: 계산 완료 이벤트로 executor를 깨우고 진단 지도보다 계획을 먼저 발행함.
  * @update 2026-11-05: 원본·보정 지도와 단계별 착지점 진단을 solve_status로 발행함.
- * @update 2026-11-04: 앞/뒤 좌우 발 쌍의 Y 간격에만 근접 지수 비용을 적용함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -16,6 +16,7 @@
 #include "b2_terrain_planner/committed_swing.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <deque>
 #include <cmath>
@@ -42,6 +43,38 @@
 
 namespace {
 using namespace b2_terrain_planner;
+
+// worker는 완료 사실만 알리고 결과 처리는 노드의 기존 직렬 callback에서 실행한다.
+// pending은 wait set 구성 전 발생한 알림도 보존한다.
+class SolveCompletion : public rclcpp::Waitable {
+ public:
+  SolveCompletion(rclcpp::Context::SharedPtr context, std::function<void()> callback)
+      : guard_(std::move(context)), callback_(std::move(callback)) {}
+
+  void Notify() {
+    pending_.store(true);
+    guard_.trigger();
+  }
+
+  size_t get_number_of_ready_guard_conditions() override { return 1; }
+
+  void add_to_wait_set(rcl_wait_set_t* wait_set) override {
+    guard_.add_to_wait_set(wait_set);
+  }
+
+  bool is_ready(rcl_wait_set_t*) override { return pending_.load(); }
+
+  std::shared_ptr<void> take_data() override { return nullptr; }
+
+  void execute(std::shared_ptr<void>&) override {
+    if (pending_.exchange(false)) callback_();
+  }
+
+ private:
+  rclcpp::GuardCondition guard_;
+  std::function<void()> callback_;
+  std::atomic<bool> pending_{false};
+};
 
 // ZYX(yaw,pitch,roll) 쿼터니언 변환.
 Eigen::Vector3d QuatToZyx(const Eigen::Quaterniond& q) {
@@ -185,10 +218,17 @@ class TerrainPlannerNode : public rclcpp::Node {
     timer_ = create_wall_timer(
         std::chrono::duration<double>(1.0 / std::max(1.0, plan_rate_hz_)),
         [this] { OnTimer(); });
-    completion_timer_ = create_wall_timer(
-        std::chrono::milliseconds(2), [this] { CompleteSolve(); });
+    completion_ = std::make_shared<SolveCompletion>(
+        get_node_base_interface()->get_context(), [this] { CompleteSolve(); });
+    get_node_waitables_interface()->add_waitable(completion_, nullptr);
     RCLCPP_INFO(get_logger(), "terrain_planner_node: state=%s map=%s plan=%s rate=%.1fHz",
                 state_topic_.c_str(), map_topic_.c_str(), plan_topic_.c_str(), plan_rate_hz_);
+  }
+
+  ~TerrainPlannerNode() override {
+    // worker는 노드를 참조하지 않는다. 알림 객체 해제 전에 정상 종료를 기다린다.
+    if (solve_worker_.valid()) solve_worker_.wait();
+    get_node_waitables_interface()->remove_waitable(completion_, nullptr);
   }
 
  private:
@@ -400,6 +440,7 @@ class TerrainPlannerNode : public rclcpp::Node {
         << ",\"solve_start_ns\":" << solve_start_ns_
         << ",\"solve_end_ns\":" << solve_end_ns_
         << ",\"last_publish_ns\":" << last_publish_ns_
+        << ",\"completion_dispatch_ns\":" << completion_dispatch_ns_
         << ",\"elapsed\":" << number(result.elapsed)
         << ",\"terrain_processing_seconds\":" << number(result.terrain_processing_seconds)
         << ",\"terrain_initialization_seconds\":" << number(result.terrain_initialization_seconds)
@@ -1139,12 +1180,16 @@ class TerrainPlannerNode : public rclcpp::Node {
     solve_state_stamp_ns_ = stamp_ns;
     solve_start_ns_ = now().nanoseconds();
     solve_end_ns_ = 0;
+    completion_dispatch_ns_ = 0;
     PublishPipelineStatus("solve_started", "none");
     std::optional<Result> seed = previous_;
     if (retry_seed_ && retry_seed_parent_ns_ == state.active_plan_stamp_ns) seed = retry_seed_;
-    solve_future_ = std::async(std::launch::async,
+    std::promise<std::pair<Result, std::int64_t>> completed;
+    solve_future_ = completed.get_future();
+    solve_worker_ = std::async(std::launch::async,
         [robot = robot_, input = std::move(input), settings = settings_,
-         previous = std::move(seed), solver = solver_, clock = get_clock()] {
+         previous = std::move(seed), solver = solver_, clock = get_clock(),
+         completed = std::move(completed), completion = completion_]() mutable {
           Result result;
           try {
             const Result* seed = nullptr;
@@ -1153,13 +1198,16 @@ class TerrainPlannerNode : public rclcpp::Node {
           } catch (const std::exception& error) {
             result.status = std::string("solve_exception: ") + error.what();
           }
-          return std::make_pair(std::move(result), clock->now().nanoseconds());
+          // future를 먼저 ready로 만든 뒤 알린다. 알림 이후 future가 준비되는 경합을 막는다.
+          completed.set_value(std::make_pair(std::move(result), clock->now().nanoseconds()));
+          completion->Notify();
         });
   }
 
   void CompleteSolve() {
     if (!solve_future_.valid() ||
         solve_future_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+    completion_dispatch_ns_ = now().nanoseconds();
     // 시각 역행은 완료 직전에도 검사해 이전 실행의 결과를 채택하지 않는다.
     if (last_clock_ns_ > now().nanoseconds()) OnTimer();
     auto completed = solve_future_.get();
@@ -1169,9 +1217,6 @@ class TerrainPlannerNode : public rclcpp::Node {
     pending_solve_.reset();
     const auto& state = pending.state;
     const auto& input = pending.input;
-    if (input.terrain && pending.generation == generation_) {
-      PublishCorrectedMap(*input.terrain, pending.map_stamp, result.terrain_snapshot.get());
-    }
     bool publishable = result.success;
     const char* reason = "solve_failed";
     if (publishable) {
@@ -1267,6 +1312,10 @@ class TerrainPlannerNode : public rclcpp::Node {
       previous_ = published_plans_.back().body;
       DiscardRetrySeed();
       PublishSolveStatus(result, pending, true, "published");
+    }
+    // 진단 지도는 계획 전송 뒤 발행한다. 실패한 계산의 지도 진단도 보존한다.
+    if (input.terrain && pending.generation == generation_) {
+      PublishCorrectedMap(*input.terrain, pending.map_stamp, result.terrain_snapshot.get());
     }
     // 실패해도 마지막 성공해는 보존한다. Solve 내부가 시간·모델·지형 호환성을 재검사한다.
     // 계산 중 수신한 최신 상태 또는 같은 상태의 제한된 재시도를 즉시 시작한다.
@@ -1466,6 +1515,9 @@ class TerrainPlannerNode : public rclcpp::Node {
   double retry_seed_violation_ = std::numeric_limits<double>::infinity();
   std::function<Result(const Robot&, const Input&, const Settings&, const Result*)> solver_ = Solve;
   std::future<std::pair<Result, std::int64_t>> solve_future_;
+  std::future<void> solve_worker_;
+  std::shared_ptr<SolveCompletion> completion_;
+  std::int64_t completion_dispatch_ns_ = 0;
   std::optional<PendingSolve> pending_solve_;
   std::uint64_t generation_ = 0;
   bool retry_requested_ = false, same_state_retry_used_ = false;
@@ -1502,7 +1554,7 @@ class TerrainPlannerNode : public rclcpp::Node {
   std::int64_t last_publish_ns_ = 0, last_published_stamp_ns_ = 0;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
   bool publish_markers_ = true;
-  rclcpp::TimerBase::SharedPtr timer_, completion_timer_;
+  rclcpp::TimerBase::SharedPtr timer_;
   std::array<SwingReference, 4> swing_references_{};
 
 };

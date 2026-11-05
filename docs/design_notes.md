@@ -657,6 +657,26 @@ QP 행렬을 매 반복 복사하지 않고 단계 기록을 모은 뒤 ROS 스�
 라이브러리 `Settings` 기본값은 OFF이며 ROS 비교 실행에서는 `foothold_diagnostics:=false`로
 끈다. 평지 시뮬 JSON 발행 검증은 기존 parkour 추락의 재현·원인 확정을 대신하지 않는다.
 
+### 계산 완료 알림과 계획 전달
+
+계산 worker는 결과 future를 ready로 만든 뒤 `SolveCompletion` guard condition으로
+기존 ROS executor를 깨운다. 2ms 완료 polling은 사용하지 않는다. 결과 채택·노드 상태
+갱신은 기존 callback group에서 직렬 실행하고, 종료 시 worker를 기다린 뒤 알림을 해제한다.
+보정 지도 진단은 계획 발행 뒤에 수행한다. 실패·보류 결과의 지도 진단도 유지한다.
+계산 제한, 재계획 주기, 기존 발행 조건 및 착지 재개 시각은 변경하지 않는다.
+
+`solve_status.completion_dispatch_ns`는 완료 callback 진입 시각이다. `solve_end_ns`와의
+차이는 완료 알림 대기, `last_publish_ns`와의 차이는 결과 처리·계획 생성·publish 비용이다.
+WBC 수신 로그의 `callback_start_ns`/`submitted_ns` 및 채택 로그의
+`first_evaluated_ns`/`decision_stamp_ns`와 같은 계획 stamp로 연결한다. 최신 상태의
+`control_stamp_ns`를 최초 제어 판정 시각으로 해석하지 않는다.
+
+관련 회귀는 완료 타이머 없이 발행, 기존 재시도·epoch/clock 판정 보존을 검증한다.
+분리된 완료 알림 200회 비교에서 2ms polling→이벤트 방식의 지연은 중앙값
+1.31→0.012ms, 95백분위 1.85→0.16ms, 최대 3.51→1.39ms였다. executor 스레드
+CPU 사용량은 단일 코어 기준 0.69→0.75%였다. 이는 해당 OS 부하에서의 전달 경로
+측정이며 최적화 수렴 시간이나 실제 보행 성공을 검증한 수치가 아니다.
+
 ### 계획 갱신 중단 진단
 
 기본 실행에서는 진단 토픽뿐 아니라 `~/.ros/log/`(`ROS_LOG_DIR` 지정 시 해당 경로)의
