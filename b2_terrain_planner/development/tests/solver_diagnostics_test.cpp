@@ -1,9 +1,9 @@
 /**
  * @file solver_diagnostics_test.cpp
  * @brief snapshot 왕복 재생·상세 진단 불변성·비동기 저장을 검증한다.
- * @version 0.0.3
+ * @version 0.0.4
+ * @update 2026-11-05: 전체 제약 QP의 실행 가능 해·재생 일치와 외부 제약 확장 생략을 검증함.
  * @update 2026-11-05: 재시도 OFF의 기본 시도 보존과 보정 OFF 조합·snapshot 호환을 검증함.
- * @update 2026-11-05: 보정 생략 재생·상세 진단 일치와 이전 snapshot 호환을 검증함.
  */
 #include "b2_terrain_planner/solver_diagnostics.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -159,6 +159,23 @@ void Run(const std::filesystem::path& directory) {
     }
   }
   Check(raw_records > 0, "no unprojected line-search records");
+  auto full = loaded;
+  full.settings.qp_working_set = false;
+  full.settings.line_search_diagnostics = false;
+  SaveSolverSnapshot(path, full);
+  full = LoadSolverSnapshot(path);
+  Check(!full.settings.qp_working_set, "full constraint setting lost");
+  const auto full_result = Solve(full.robot, full.input, full.settings, &*full.previous);
+  Check(full_result.success && full_result.violation <= full.settings.feasibility_tolerance,
+        "full constraint QP did not supply a feasible plan");
+  full.settings.line_search_diagnostics = true;
+  SamePlan(full_result, Solve(full.robot, full.input, full.settings, &*full.previous));
+  for (const auto& attempt : full_result.solver_attempts) {
+    for (const auto& qp : attempt.profile.qp_diagnostics) {
+      Check(qp.working_set_pass == 0 && qp.acceptance_reason != "working_set_expanded",
+            "full constraint QP still expanded external working set");
+    }
+  }
   // prefix·hold·nominal 등 선택 입력도 손실 없이 보존한다. 여기서는 solver 실행과 분리한다.
   loaded.input.reference_prefix = std::make_shared<Result>(*loaded.previous);
   loaded.input.prefix_duration = .08;

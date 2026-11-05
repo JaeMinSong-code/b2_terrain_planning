@@ -1,9 +1,9 @@
 /**
  * @file planner_retry_test.cpp
  * @brief 지연·실패를 주입해 비동기 재계획과 성공해 보존 및 발행 차단을 검증한다.
- * @version 0.0.24
- * @update 2026-11-05: ROS 실험 옵션의 worker 전달과 실패 후 최신 상태 재계획을 검증함.
- * @update 2026-11-05: 오래된 시작 snapshot·인계 마감 이후 발행과 최신 입력 freshness 보존을 검증함.
+ * @version 0.0.26
+ * @update 2026-11-05: 기존 제약 선택 기본값 복구와 두 비교 모드의 worker 전달을 검증함.
+ * @update 2026-11-05: 전체 제약 QP 기본값과 ROS 선택값의 비동기 worker 전달을 검증함.
  */
 #define B2_TERRAIN_PLANNER_NO_MAIN
 #include "../../src/terrain_planner_node.cpp"
@@ -19,6 +19,7 @@ struct TerrainPlannerRetryTest {
     bool had_failed_seed = false;
     bool skip_projection = false;
     bool candidate_retries = true;
+    bool qp_working_set = true;
     double gait_time = -1;
     double body_time = -1;
     double hold_duration = -1;
@@ -51,6 +52,7 @@ struct TerrainPlannerRetryTest {
                             const Result* previous) {
       attempt->skip_projection = settings.skip_line_search_projection;
       attempt->candidate_retries = settings.terrain_candidate_retries;
+      attempt->qp_working_set = settings.qp_working_set;
       attempt->had_previous = previous != nullptr && previous->success;
       attempt->had_failed_seed = previous != nullptr && !previous->success;
       attempt->gait_time = input.gait_time;
@@ -391,9 +393,10 @@ struct TerrainPlannerRetryTest {
     }
   }
 
-  static void CheckSolverExperiment() {
+  static void CheckSolverExperiment(bool working_set) {
     rclcpp::NodeOptions options;
-    options.parameter_overrides({rclcpp::Parameter("line_search_projection", false),
+    options.parameter_overrides({rclcpp::Parameter("qp_working_set", working_set),
+                                 rclcpp::Parameter("line_search_projection", false),
                                  rclcpp::Parameter("terrain.candidate_retries", false),
                                  rclcpp::Parameter("solver_diagnostic_directory", "")});
     TerrainPlannerNode node(options);
@@ -429,8 +432,10 @@ struct TerrainPlannerRetryTest {
     node.OnState(state);
     Finish(node, failed);
     Started(latest);
-    const bool failed_options = failed->skip_projection && !failed->candidate_retries;
-    const bool latest_options = latest->skip_projection && !latest->candidate_retries;
+    const bool failed_options = failed->skip_projection && !failed->candidate_retries &&
+                                failed->qp_working_set == working_set;
+    const bool latest_options = latest->skip_projection && !latest->candidate_retries &&
+                                latest->qp_working_set == working_set;
     const bool fresh_state = latest->gait_time == .02 && !latest->had_previous &&
                              !latest->had_failed_seed;
     // 종료 뒤 자동 시작할 입력을 비워 모의 worker가 대기한 채 남지 않게 한다.
@@ -441,9 +446,11 @@ struct TerrainPlannerRetryTest {
   }
 
   static void Run() {
-    CheckSolverExperiment();
+    CheckSolverExperiment(false);
+    CheckSolverExperiment(true);
     TerrainPlannerNode node;
     node.timer_->cancel();
+    Check(node.settings_.qp_working_set, "online default lost QP constraint selection");
     Check(node.settings_.time_limit == 0, "online default still has a time limit");
     Check(!node.settings_.skip_line_search_projection && node.settings_.terrain_candidate_retries,
           "online defaults changed without experiment options");

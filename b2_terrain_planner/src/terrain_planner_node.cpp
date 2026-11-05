@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.54
- * @update 2026-11-05: 시뮬 비교용 보정·대체 재시도 ROS 옵션과 실제 적용값 진단을 연결함.
- * @update 2026-11-05: 실패·장시간 계산의 재생 입력을 별도 스레드로 저장하고 계측을 발행함.
+ * @version 0.0.56
+ * @update 2026-11-05: 전체 제약 재생의 시간 증가를 확인해 온라인 기본값을 기존 제약 선택으로 복구함.
+ * @update 2026-11-05: 전체 제약 QP를 온라인 기본값으로 연결하고 선택값을 진단에 기록함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -226,9 +226,10 @@ class TerrainPlannerNode : public rclcpp::Node {
     get_node_waitables_interface()->add_waitable(completion_, nullptr);
     RCLCPP_INFO(get_logger(), "terrain_planner_node: state=%s map=%s plan=%s asynchronous, fallback=%.1fHz",
                 state_topic_.c_str(), map_topic_.c_str(), plan_topic_.c_str(), plan_rate_hz_);
-    RCLCPP_INFO(get_logger(), "SQP line_search_projection=%d terrain.candidate_retries=%d",
+    RCLCPP_INFO(get_logger(), "SQP line_search_projection=%d terrain.candidate_retries=%d qp_working_set=%d",
                 static_cast<int>(!settings_.skip_line_search_projection),
-                static_cast<int>(settings_.terrain_candidate_retries));
+                static_cast<int>(settings_.terrain_candidate_retries),
+                static_cast<int>(settings_.qp_working_set));
   }
 
   ~TerrainPlannerNode() override {
@@ -499,6 +500,7 @@ class TerrainPlannerNode : public rclcpp::Node {
     }
     out << "],\"line_search_projection\":" << !settings_.skip_line_search_projection
         << ",\"terrain_candidate_retries\":" << settings_.terrain_candidate_retries
+        << ",\"qp_working_set\":" << settings_.qp_working_set
         << ",\"solver_diagnostic_directory\":" << std::quoted(diagnostic_directory_);
     if (snapshot_writer_) {
       out << ",\"diagnostic_jobs_dropped\":" << snapshot_writer_->dropped()
@@ -654,7 +656,7 @@ class TerrainPlannerNode : public rclcpp::Node {
   void ConfigureSettings() {
     // solve_main --fast-replanning 프리셋 + generate_stairs에서 검증된 실시간 QP 값.
     settings_.qp_reuse = QpReuseMode::kWarmStart;
-    settings_.qp_working_set = true;
+    settings_.qp_working_set = declare_parameter<bool>("qp_working_set", true);
     settings_.structured_equalities = true;
     settings_.block_assembly = true;
     settings_.polynomial_tail = true;

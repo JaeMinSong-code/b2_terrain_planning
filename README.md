@@ -93,6 +93,8 @@ OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 /tmp/b2-terrain-cpu-build/tamols_solve 
 기준 비교도 같은 명령에서 `--no-line-search-projection`만 빼고 실행한다.
 ROS 환경의 설치 라이브러리와 섞이지 않도록 위 `LD_LIBRARY_PATH`를 함께 지정한다.
 `--no-terrain-candidate-retries`를 추가하면 같은 입력의 대체 후보 재시도도 끈다.
+`--full-qp-constraints`를 추가하면 snapshot의 이전 제약 선택 설정을 덮어써 전체 QP
+제약을 OSQP에 전달한다. 옵션을 생략하면 snapshot에 저장된 설정 그대로 재생한다.
 `--trace-line-search`를 함께 지정할 수 있다. 보정 생략은 중간 후보 생성만 바꾸며,
 최종 성공 여부와 전체 시간을 기준 재생과 비교한다.
 
@@ -149,7 +151,7 @@ ros2 run b2_terrain_planner terrain_planner_node --ros-args \
 | `require_map`, `publish_markers` | true, true |
 | `plan_topic`, `marker_topic` | `/terrain_planner/plan`, `/terrain_planner/markers` |
 
-### 4. 시뮬 보행 — 후보 보정·대체 재시도 OFF
+### 4. 시뮬 보행 — 기존 QP 제약 선택, 후보 보정·대체 재시도 OFF
 
 기존 실행을 종료한 뒤 터미널 1에서 시뮬·지도·GUI를 실행한다.
 이 실험은 계획기를 터미널 2에서 실행하므로 `--tamols`를 붙이지 않는다.
@@ -167,14 +169,18 @@ source /opt/ros/humble/setup.bash
 source ~/ros2_ws/install/local_setup.bash
 ros2 run b2_terrain_planner terrain_planner_node --ros-args \
   --params-file ~/ros2_ws/install/b2_terrain_planner/share/b2_terrain_planner/config/terrain_planner_wbc.yaml \
-  -p line_search_projection:=false -p terrain.candidate_retries:=false
+  -p line_search_projection:=false -p terrain.candidate_retries:=false \
+  -p qp_working_set:=true
 ```
 
-시작 로그의 `SQP line_search_projection=0 terrain.candidate_retries=0`을 확인하고
+시작 로그의 `SQP line_search_projection=0 terrain.candidate_retries=0 qp_working_set=1`을 확인하고
 GUI에서 **INIT → HOME 완료 → wbc_control** 순서로 진행한다.
 평지(`--xml flat`)에서는 params 파일을 `terrain_planner_flat.yaml`로 바꾼다.
 옵션은 시작 시 읽는다. 기존 실행 방식으로 돌아갈 때는 실험 계획기를 종료하고
-기존 `--tamols` 명령을 사용한다. 기본값은 두 옵션 모두 true이다.
+기존 `--tamols` 명령을 사용한다. 보정·대체 재시도의 기본값은 모두 true이다.
+QP는 온라인 기본값 `qp_working_set: true`로 기존 제약 선택·추가 방식을 사용한다.
+전체 제약 전달을 비교하려면 `-p qp_working_set:=false`로 실행한다. 이전 실험 명령에
+false를 명시했다면 true로 바꾸고 계획기를 재시작한다.
 
 이번 별도 실행은 자동 rosbag 기록을 시작하지 않으므로, 입력·계산·발행 비교가 필요하면
 보행 전에 터미널 3에서 다음을 실행한다. 종료는 Ctrl+C다.
@@ -188,7 +194,7 @@ ros2 bag record /elevation_mapping_node/elevation_map_raw \
   -o /tmp/b2_sqp_sim_$(date +%Y%m%d_%H%M%S)
 ```
 
-두 기능만 끈 비교이며 저자 solver와 동일한 구현이라는 뜻은 아니다.
+기존 QP 제약 선택과 두 기능 OFF의 비교이며 저자 solver와 동일한 구현이라는 뜻은 아니다.
 오프라인 성공 여부와 실제 보행 결과는 구분한다.
 
 ## 설정
