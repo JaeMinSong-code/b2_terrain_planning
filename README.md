@@ -82,6 +82,19 @@ OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 ros2 run b2_terrain_planner tamols_solv
 진단 YAML은 출력된다. 상세 계측에는 추가 평가 시간이 포함되므로 소요 시간은 기준 재생으로
 판단한다. 원본과 같은 빌드·URDF·BLAS 스레드 설정을 사용한다.
 
+보정 생략 비교는 별도 CPU 빌드에서 실행한다. 온라인 설정과 설치본은 변경하지 않는다.
+
+```bash
+LD_LIBRARY_PATH="/tmp/b2-terrain-cpu-build:${LD_LIBRARY_PATH}" \
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 /tmp/b2-terrain-cpu-build/tamols_solve \
+  --replay "$SQP_SNAPSHOT" --no-line-search-projection > /tmp/sqp_no_projection.yaml
+```
+
+기준 비교도 같은 명령에서 `--no-line-search-projection`만 빼고 실행한다.
+ROS 환경의 설치 라이브러리와 섞이지 않도록 위 `LD_LIBRARY_PATH`를 함께 지정한다.
+`--trace-line-search`를 함께 지정할 수 있다. 보정 생략은 중간 후보 생성만 바꾸며,
+최종 성공 여부와 전체 시간을 기준 재생과 비교한다.
+
 ### 2. elevation map 실행
 
 맵 실행기는 환경변수로 설정하는 단일 스크립트다. 입력 어댑터·맵·선택적 RViz를 실행하며

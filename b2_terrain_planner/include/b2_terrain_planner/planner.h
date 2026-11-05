@@ -1,9 +1,9 @@
 /**
  * @file planner.h
  * @brief 평지·지형 trot의 SQP 입력·출력 및 시간 구간 계획 계약.
- * @version 0.0.39
+ * @version 0.0.40
+ * @update 2026-11-05: 기본 동작을 유지하는 오프라인 후보 보정 생략 설정을 추가함.
  * @update 2026-11-05: 후보별 solver 계측과 오프라인 line-search 진단을 추가함.
- * @update 2026-11-05: SQP 최대 도달거리 축소 여유 설정을 추가함.
  */
 #ifndef B2_TERRAIN_PLANNER_PLANNER_H_
 #define B2_TERRAIN_PLANNER_PLANNER_H_
@@ -87,6 +87,7 @@ std::string QpReuseModeName(QpReuseMode mode);
 struct Settings {
   QpReuseMode qp_reuse = QpReuseMode::kNone;
   bool full_evaluation = false;
+  bool skip_line_search_projection = false;  // 오프라인 비교 전용. 기본 보정은 유지한다.
   bool line_search_diagnostics = false;  // 오프라인 전용: 보정 전 후보를 추가 평가한다.
   bool foothold_diagnostics = false;  // 진단 전용. ROS 기본값은 true.
   bool qp_working_set = false;

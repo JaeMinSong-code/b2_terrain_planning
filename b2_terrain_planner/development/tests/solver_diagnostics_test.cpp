@@ -1,7 +1,8 @@
 /**
  * @file solver_diagnostics_test.cpp
  * @brief snapshot 왕복 재생·상세 진단 불변성·비동기 저장을 검증한다.
- * @version 0.0.1
+ * @version 0.0.2
+ * @update 2026-11-05: 보정 생략 재생·상세 진단 일치와 이전 snapshot 호환을 검증함.
  * @update 2026-11-05: 성공해·확정 착지·지도·ns 정밀도와 실패 후보 계측을 확인함.
  */
 #include "b2_terrain_planner/solver_diagnostics.h"
@@ -90,6 +91,15 @@ void Run(const std::filesystem::path& directory) {
   const auto second = (directory / "roundtrip.yaml").string();
   SaveSolverSnapshot(second, loaded);
   Check(Text(path) == Text(second), "snapshot fields changed during roundtrip");
+  // 추가 설정이 없는 이전 schema 1 파일도 보정을 켠 상태로 읽는다.
+  std::string legacy = Text(path);
+  const auto field = legacy.find("    skip_line_search_projection: false\n");
+  Check(field != std::string::npos, "projection setting missing from snapshot");
+  legacy.erase(field, std::string("    skip_line_search_projection: false\n").size());
+  const auto legacy_path = (directory / "legacy.yaml").string();
+  { std::ofstream stream(legacy_path); stream << legacy; }
+  Check(!LoadSolverSnapshot(legacy_path).settings.skip_line_search_projection,
+        "legacy snapshot disabled projection");
   const auto replay = Solve(loaded.robot, loaded.input, loaded.settings, &*loaded.previous);
   SamePlan(baseline, replay);
   loaded.settings.line_search_diagnostics = true;
@@ -114,6 +124,36 @@ void Run(const std::filesystem::path& directory) {
   for (const auto& attempt : baseline.solver_attempts) {
     for (const auto& trial : attempt.line_search) Check(!trial.before_cost, "online raw evaluation enabled");
   }
+  auto unprojected = loaded;
+  unprojected.settings.skip_line_search_projection = true;
+  unprojected.settings.line_search_diagnostics = false;
+  SaveSolverSnapshot(path, unprojected);
+  unprojected = LoadSolverSnapshot(path);
+  Check(unprojected.settings.skip_line_search_projection, "projection setting lost");
+  const auto raw = Solve(unprojected.robot, unprojected.input, unprojected.settings,
+                         &*unprojected.previous);
+  unprojected.settings.line_search_diagnostics = true;
+  const auto raw_detailed = Solve(unprojected.robot, unprojected.input, unprojected.settings,
+                                  &*unprojected.previous);
+  SamePlan(raw, raw_detailed);
+  int raw_records = 0;
+  for (const auto& attempt : raw_detailed.solver_attempts) {
+    Check(attempt.profile.projection_seconds == 0.0, "projection still executed");
+    for (const auto& trial : attempt.line_search) {
+      if (trial.terrain_domain_error) continue;
+      ++raw_records;
+      Check(trial.correction_norm == 0.0, "raw candidate corrected");
+      Check(trial.before_cost == trial.after_cost &&
+            trial.before_violation == trial.after_violation &&
+            trial.before_scaled_violation == trial.after_scaled_violation,
+            "unprojected evaluation changed");
+      Check(trial.after_cost.has_value() && trial.after_scaled_violation.has_value(),
+            "unprojected candidate missing");
+      const double merit = *trial.after_cost + trial.penalty * *trial.after_scaled_violation;
+      Check(trial.accepted == (merit <= trial.acceptance_bound), "raw acceptance changed");
+    }
+  }
+  Check(raw_records > 0, "no unprojected line-search records");
   // prefix·hold·nominal 등 선택 입력도 손실 없이 보존한다. 여기서는 solver 실행과 분리한다.
   loaded.input.reference_prefix = std::make_shared<Result>(*loaded.previous);
   loaded.input.prefix_duration = .08;

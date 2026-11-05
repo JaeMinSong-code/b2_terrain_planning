@@ -1,9 +1,9 @@
 /**
  * @file solve_main.cpp
  * @brief ROS 없이 단일 설정의 예제 또는 개별 평지·지형 입력을 읽고 몸통 계획을 YAML로 출력한다.
- * @version 0.0.33
+ * @version 0.0.34
+ * @update 2026-11-05: 재생 전용 보정 생략 옵션과 실제 적용 모드 출력을 추가함.
  * @update 2026-11-05: 입력 snapshot의 기준 재생과 상세 line-search 계측 옵션을 추가함.
- * @update 2026-11-04: 앞/뒤 좌우 발 쌍의 Y 간격에만 근접 지수 비용을 적용함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/solver_diagnostics.h"
@@ -476,15 +476,25 @@ int main(int argc, char** argv) {
   std::string warm_path;
   try {
     if (argc >= 3 && std::string(argv[1]) == "--replay") {
-      if (argc > 4 || (argc == 4 && std::string(argv[3]) != "--trace-line-search")) {
-        throw std::invalid_argument("usage: tamols_solve --replay SNAPSHOT [--trace-line-search]");
-      }
       auto snapshot = b2_terrain_planner::LoadSolverSnapshot(argv[2]);
-      if (argc == 4) snapshot.settings.line_search_diagnostics = true;
+      for (int i = 3; i < argc; ++i) {
+        const std::string option = argv[i];
+        if (option == "--trace-line-search") {
+          snapshot.settings.line_search_diagnostics = true;
+        } else if (option == "--no-line-search-projection") {
+          snapshot.settings.skip_line_search_projection = true;
+        } else {
+          throw std::invalid_argument(
+              "usage: tamols_solve --replay SNAPSHOT [--trace-line-search] "
+              "[--no-line-search-projection]");
+        }
+      }
       const b2_terrain_planner::Result* seed = nullptr;
       if (snapshot.previous) seed = &*snapshot.previous;
       auto result = b2_terrain_planner::Solve(snapshot.robot, snapshot.input, snapshot.settings, seed);
       Print(result, true, snapshot.settings, snapshot.robot, snapshot.input);
+      std::cout << "replay_skip_line_search_projection: " << std::boolalpha
+                << snapshot.settings.skip_line_search_projection << '\n';
       std::cout << "\n" << b2_terrain_planner::SolverDiagnosticsYaml(result.solver_attempts) << "\n";
       if (result.success) return 0;
       return 2;
@@ -493,7 +503,8 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
       std::string option = argv[i];
       if (option == "--help") {
-        std::cout << "tamols_solve --replay SNAPSHOT [--trace-line-search]\n"
+        std::cout << "tamols_solve --replay SNAPSHOT [--trace-line-search] "
+                     "[--no-line-search-projection]\n"
                      "tamols_solve [--input YAML] [--speed M/S] [--gait-time S] "
                      "[--time-limit S] [--iterations N] [--fixed-feet] "
                      "[--profile] [--full-evaluation] "

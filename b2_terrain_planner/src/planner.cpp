@@ -1,9 +1,9 @@
 /**
  * @file planner.cpp
  * @brief 접촉 조합별 생성 Jacobian과 지형 비용의 Gauss–Newton QP로 trot을 최적화한다.
- * @version 0.0.51
+ * @version 0.0.52
+ * @update 2026-11-05: 재생 비교용으로 line-search 후보의 반복 제약 보정을 생략할 수 있게 함.
  * @update 2026-11-05: 계산 판단을 유지하며 모든 시도의 QP·보정·탐색 진단을 보존함.
- * @update 2026-11-05: 물리 모델·후보 탐색을 유지하고 SQP 도달거리 상한에만 여유를 적용함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -2545,8 +2545,12 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
         }
         const double projection_before = result.profile.projection_seconds;
         try {
-          trial_x = ProjectConstraints(problem, x + alpha * step, &result.profile, settings,
-                                       &structure_cache, 0, projection_linearization, &chord_cache);
+          if (settings.skip_line_search_projection) {
+            trial_x = x + alpha * step;
+          } else {
+            trial_x = ProjectConstraints(problem, x + alpha * step, &result.profile, settings,
+                                         &structure_cache, 0, projection_linearization, &chord_cache);
+          }
           diagnostic.projection_seconds = result.profile.projection_seconds - projection_before;
           diagnostic.correction_norm = (trial_x - (x + alpha * step)).lpNorm<Eigen::Infinity>();
           candidate = problem.EvaluateAt(trial_x, EvaluationMode::kValues);
