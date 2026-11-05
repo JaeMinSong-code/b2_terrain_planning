@@ -163,7 +163,7 @@ ros2 run b2_terrain_planner terrain_planner_node --ros-args \
 | `require_map`, `publish_markers` | true, true |
 | `plan_topic`, `marker_topic` | `/terrain_planner/plan`, `/terrain_planner/markers` |
 
-### 4. 시뮬 보행 — 기존 QP 제약 선택, 후보 보정·대체 재시도 OFF
+### 4. 시뮬 보행 — QP 선택 제약 목록 재사용, 후보 보정·대체 재시도 OFF
 
 기존 실행을 종료한 뒤 터미널 1에서 시뮬·지도·GUI를 실행한다.
 이 실험은 계획기를 터미널 2에서 실행하므로 `--tamols`를 붙이지 않는다.
@@ -182,15 +182,18 @@ source ~/ros2_ws/install/local_setup.bash
 ros2 run b2_terrain_planner terrain_planner_node --ros-args \
   --params-file ~/ros2_ws/install/b2_terrain_planner/share/b2_terrain_planner/config/terrain_planner_wbc.yaml \
   -p line_search_projection:=false -p terrain.candidate_retries:=false \
-  -p qp_working_set:=true
+  -p qp_working_set:=true -p reuse_qp_working_set:=true
 ```
 
-시작 로그의 `SQP line_search_projection=0 terrain.candidate_retries=0 qp_working_set=1`을 확인하고
+시작 로그의 `line_search_projection=0 terrain.candidate_retries=0 qp_working_set=1`과
+`reuse_qp_working_set=1 reuse_qp_direction=0`을 확인하고
 GUI에서 **INIT → HOME 완료 → wbc_control** 순서로 진행한다.
 평지(`--xml flat`)에서는 params 파일을 `terrain_planner_flat.yaml`로 바꾼다.
 옵션은 시작 시 읽는다. 기존 실행 방식으로 돌아갈 때는 실험 계획기를 종료하고
 기존 `--tamols` 명령을 사용한다. 보정·대체 재시도의 기본값은 모두 true이다.
-QP는 온라인 기본값 `qp_working_set: true`로 기존 제약 선택·추가 방식을 사용한다.
+QP는 온라인 기본값 `qp_working_set: true`, `reuse_qp_working_set: true`로
+같은 SQP 시도 안에서 선택 제약 목록을 재사용한다. QP 방향 재사용은 끈다.
+목록 재사용만 끄고 비교하려면 `-p reuse_qp_working_set:=false`로 재시작한다.
 전체 제약 전달을 비교하려면 `-p qp_working_set:=false`로 실행한다. 이전 실험 명령에
 false를 명시했다면 true로 바꾸고 계획기를 재시작한다.
 
@@ -206,7 +209,7 @@ ros2 bag record /elevation_mapping_node/elevation_map_raw \
   -o /tmp/b2_sqp_sim_$(date +%Y%m%d_%H%M%S)
 ```
 
-기존 QP 제약 선택과 두 기능 OFF의 비교이며 저자 solver와 동일한 구현이라는 뜻은 아니다.
+QP 선택 제약 목록 재사용과 보정·대체 재시도 OFF의 실험이며 저자 solver와 동일한 구현이라는 뜻은 아니다.
 오프라인 성공 여부와 실제 보행 결과는 구분한다.
 
 ## 설정

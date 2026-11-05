@@ -102,6 +102,9 @@ planner:
     plan_rate_hz: 10.0
     # 0은 SQP·QP 계산 시간 제한 없음. 수렴·실패·반복 횟수 종료 조건은 유지한다.
     time_limit: 0.0
+    # 같은 SQP 시도 안에서 선택 제약 목록만 유지한다. QP 방향은 매번 새로 푼다.
+    qp_working_set: true
+    reuse_qp_working_set: true
     # 착지 확인 후 보행 재개 유예. WBC의 계획 채택 기한으로 사용하지 않는다.
     touchdown_resume_delay: 0.08
     # TAMOLS IV/V: 처리 지도와 후보 보정. 원본 지도·관측 마스크는 보존한다.
