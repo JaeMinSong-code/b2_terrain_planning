@@ -1,9 +1,9 @@
 /**
  * @file planner_retry_test.cpp
  * @brief 지연·실패를 주입해 비동기 재계획과 성공해 보존 및 발행 차단을 검증한다.
- * @version 0.0.28
+ * @version 0.0.29
+ * @update 2026-11-10: 발행용 스윙 p/v/a 평가와 stance의 영 미분값을 검증함.
  * @update 2026-11-09: 착지 대기 solve 연속 실패 시 감속 유지 계획 fallback 발행을 검증함.
- * @update 2026-11-05: 선택 제약 목록만 재사용하는 기본값과 설정의 worker 전달을 검증함.
  */
 #define B2_TERRAIN_PLANNER_NO_MAIN
 #include "../../src/terrain_planner_node.cpp"
@@ -288,6 +288,18 @@ struct TerrainPlannerRetryTest {
     const auto committed = node.swing_references_[1];
     Check(committed.shape == SwingReference::Shape::kStepUp,
           "nearby riser did not select rounded swing through node");
+    const auto stance = node.FootAt(plan, measured, 1, 0.0);
+    Check(stance.second && stance.first.velocity.isZero() &&
+          stance.first.acceleration.isZero(), "stance derivatives are not zero");
+    for (double phase : {.1, .25, .5, .9}) {
+      const double time = committed.start + phase * (committed.end - committed.start);
+      const auto expected = committed.SampleKinematics(time);
+      const auto emitted = node.FootAt(plan, measured, 1, time - plan.seed_context.gait_time);
+      Check(!emitted.second && emitted.first.position.isApprox(expected.position) &&
+            emitted.first.velocity.isApprox(expected.velocity) &&
+            emitted.first.acceleration.isApprox(expected.acceleration),
+            "publisher lost analytic swing derivatives");
+    }
     swing_map.heights.setZero();
     swing_map.valid.setZero();
     const bool enabled = node.step_swing_.enabled;

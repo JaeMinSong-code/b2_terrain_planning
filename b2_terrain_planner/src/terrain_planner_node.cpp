@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.60
+ * @version 0.0.61
+ * @update 2026-11-10: 스윙 곡선의 해석 속도·가속도를 위치와 함께 발행해 C2 복원을 지원함.
  * @update 2026-11-09: 착지 대기 중 solve 연속 실패 시 SQP 없이 감속 유지 계획을 공급하는 fallback을 추가함.
- * @update 2026-11-09: 측정속도 보행주기 이동평균을 수집해 nominal capture 보정 입력으로 전달함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -918,8 +918,8 @@ class TerrainPlannerNode : public rclcpp::Node {
     corrected_map_pub_->publish(msg);
   }
 
-  // leg의 time t 발끝 위치(odom)와 접지 여부. 스탠스=정착 위치, 스윙=포물선 arc.
-  std::pair<Eigen::Vector3d, bool> FootAt(const Result& r, const Feet& feet0,
+  // leg의 time t 발끝 p/v/a(odom)와 접지 여부. 스탠스 미분값은 0이다.
+  std::pair<SwingReference::Kinematics, bool> FootAt(const Result& r, const Feet& feet0,
                                           int leg, double t) const {
     Eigen::Vector3d planted = feet0.row(leg).transpose();  // 정착(착지 전) 위치
     const Eigen::Vector3d target = r.footholds.row(leg).transpose();
@@ -932,8 +932,12 @@ class TerrainPlannerNode : public rclcpp::Node {
       if (r.phases[k].landed[leg]) planted = target;
     }
     const auto& phase = r.phases[phase_idx];
-    if (phase.contacts[leg]) return {planted, true};
-    return {swing_references_[leg].Sample(r.seed_context.gait_time + t).first, false};
+    if (phase.contacts[leg]) {
+      SwingReference::Kinematics sample;
+      sample.position = planted;
+      return {sample, true};
+    }
+    return {swing_references_[leg].SampleKinematics(r.seed_context.gait_time + t), false};
   }
 
   void UpdateSwingReferences(const Result& r, const Feet& feet0,
@@ -1535,6 +1539,8 @@ class TerrainPlannerNode : public rclcpp::Node {
     msg.base_pose.resize(n);
     msg.base_twist.resize(n);
     msg.foot_position.resize(static_cast<size_t>(4) * n);
+    msg.foot_velocity.resize(static_cast<size_t>(4) * n);
+    msg.foot_acceleration.resize(static_cast<size_t>(4) * n);
     msg.foot_contact.resize(static_cast<size_t>(4) * n);
     for (int i = 0; i < n; ++i) {
       const double t = std::min(static_cast<double>(i) * sample_dt_, horizon);
@@ -1551,7 +1557,8 @@ class TerrainPlannerNode : public rclcpp::Node {
       for (int leg = 0; leg < 4; ++leg) {
         double foot_time = t;
         if (state.body_clock_valid) foot_time = std::min(t, msg.gait_duration);
-        Eigen::Vector3d foot = feet0.row(leg).transpose();
+        SwingReference::Kinematics foot;
+        foot.position = feet0.row(leg).transpose();
         bool contact = state.contact_confirmed[leg];
         if (!hold_gait) {
           const auto sample = FootAt(foot_plan, feet0, leg, foot_time);
@@ -1559,9 +1566,15 @@ class TerrainPlannerNode : public rclcpp::Node {
           contact = sample.second;
         }
         const size_t fi = static_cast<size_t>(i) * 4 + leg;
-        msg.foot_position[fi].x = foot.x();
-        msg.foot_position[fi].y = foot.y();
-        msg.foot_position[fi].z = foot.z();
+        msg.foot_position[fi].x = foot.position.x();
+        msg.foot_position[fi].y = foot.position.y();
+        msg.foot_position[fi].z = foot.position.z();
+        msg.foot_velocity[fi].x = foot.velocity.x();
+        msg.foot_velocity[fi].y = foot.velocity.y();
+        msg.foot_velocity[fi].z = foot.velocity.z();
+        msg.foot_acceleration[fi].x = foot.acceleration.x();
+        msg.foot_acceleration[fi].y = foot.acceleration.y();
+        msg.foot_acceleration[fi].z = foot.acceleration.z();
         msg.foot_contact[fi] = contact;
       }
     }

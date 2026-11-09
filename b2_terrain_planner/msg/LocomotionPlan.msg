@@ -12,6 +12,10 @@ geometry_msgs/Twist[] base_twist  # CoM 월드 선속도 + 몸통 Euler 변화�
 
 # 발 궤적: 4개 다리 × N 샘플, FL,FR,RL,RR 순으로 평탄화(길이 4*N).
 geometry_msgs/Point[] foot_position  # odom 프레임 foot 링크 원점(구 중심), 지면점 아님
+# 해석 미분값 [m/s], [m/s²]. 수신 측 5차 Hermite 보간용이며 발 가속도 FF 활성화가 아니다.
+# 둘 다 빈 배열이면 위치 전용 legacy 샘플. 새 발행자는 항상 4*N개를 제공한다.
+geometry_msgs/Vector3[] foot_velocity
+geometry_msgs/Vector3[] foot_acceleration
 bool[] foot_contact                  # true=접지(stance), false=스윙
 
 # 발 순서 상수.
