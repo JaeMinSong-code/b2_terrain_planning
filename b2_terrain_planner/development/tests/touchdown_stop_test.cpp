@@ -1,9 +1,9 @@
 /**
  * @file touchdown_stop_test.cpp
  * @brief B2 모델의 착지 대기 목표 속도 감속과 기존 궤적 재사용·연결을 검증한다.
- * @version 0.0.4
- * @update 2026-11-03: 제거한 IK·지형 검증 결과 필드 검사를 정리함.
- * @update 2026-10-29: midstance nominal 비용 설정으로 착지 대기 감속 회귀를 실행함.
+ * @version 0.0.6
+ * @update 2026-11-09: 순수 선회 명령의 yaw-lead nominal 회전(반경 보존·리드 각 범위)을 검증함.
+ * @update 2026-11-09: nominal capture 보정(이동평균−명령, 이득·상한)을 직접 검증함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -88,12 +88,70 @@ void Run() {
   std::cout << "zero-command hold: " << slowed.elapsed << " s, "
             << slowed.iterations << " iterations\n";
 }
+
+void CheckCaptureNominal() {
+  Robot robot;
+  Input input;
+  input.position.z() = robot.height;
+  input.feet = robot.hips;
+  input.command << 0.2, 0.0, 0.0;
+  input.gait_time = 0.0;
+  const auto phases = MakeHorizon(input.gait_time, robot.period, robot.duty);
+  const auto base = NominalFootholds(robot, input, phases, 1.0, 0.12);
+  // 이동평균이 명령과 같으면 보정 없음(기존 nominal 보존).
+  input.average_velocity = Eigen::Vector2d(0.2, 0.0);
+  const auto same = NominalFootholds(robot, input, phases, 1.0, 0.12);
+  Check(base.isApprox(same, 1e-12), "capture shifted nominal with zero velocity error");
+  // 측정이 명령보다 +Y로 흐르면 발도 +Y로 √(h/g)배 이동한다.
+  input.average_velocity = Eigen::Vector2d(0.2, 0.3);
+  const auto shifted = NominalFootholds(robot, input, phases, 1.0, 0.12);
+  const double capture_time = std::sqrt(robot.height / 9.81);
+  const Eigen::Vector2d expected(0.0, capture_time * 0.3);
+  for (int leg = 0; leg < 4; ++leg) {
+    const Eigen::Vector2d delta = (shifted.row(leg) - base.row(leg)).transpose();
+    Check((delta - expected).norm() < 1e-12, "capture shift mismatch");
+  }
+  // 큰 속도 오차는 norm 상한에서 포화한다(과보정 왕복 발진 차단).
+  input.average_velocity = Eigen::Vector2d(0.2, 5.0);
+  const auto capped = NominalFootholds(robot, input, phases, 1.0, 0.12);
+  for (int leg = 0; leg < 4; ++leg) {
+    const Eigen::Vector2d delta = (capped.row(leg) - base.row(leg)).transpose();
+    Check(std::abs(delta.norm() - 0.12) < 1e-12, "capture shift not capped at limit");
+  }
+  // 이득 0이면 이동평균이 있어도 기존 nominal 그대로다.
+  const auto disabled = NominalFootholds(robot, input, phases, 0.0, 0.12);
+  Check(base.isApprox(disabled, 1e-12), "capture active despite zero gain");
+  std::cout << "PASS capture nominal shift, cap, and zero-gain preservation\n";
+
+  // Yaw-lead: 순수 선회 명령은 발을 CoM 기준 같은 반경에서 회전 방향으로
+  // 리드시킨다. 리드 각은 yaw_rate × (touchdown + 0.5·stance) 범위 안이다.
+  Input turning = input;
+  turning.average_velocity.reset();
+  turning.command << 0.0, 0.0, 0.5;
+  Input straight = turning;
+  straight.command.z() = 0.0;
+  const auto led = NominalFootholds(robot, turning, phases, 1.0, 0.18);
+  const auto still = NominalFootholds(robot, straight, phases, 1.0, 0.18);
+  const Eigen::Vector2d com = turning.position.head<2>();
+  const double max_lead = 0.5 * (robot.period + .5 * robot.period * robot.duty);
+  for (int leg = 0; leg < 4; ++leg) {
+    const Eigen::Vector2d a = still.row(leg).transpose() - com;
+    const Eigen::Vector2d b = led.row(leg).transpose() - com;
+    Check(std::abs(a.norm() - b.norm()) < 1e-9, "yaw lead changed the hip radius");
+    const double cross = a.x() * b.y() - a.y() * b.x();
+    const double angle = std::atan2(cross, a.dot(b));
+    Check(angle > 0.05 && angle < max_lead + 1e-9,
+          "yaw lead angle out of range: " + std::to_string(angle));
+  }
+  std::cout << "PASS yaw-lead rotation of nominal footholds\n";
+}
 }  // namespace
 
 int main() {
   try {
     Run();
     std::cout << "PASS touchdown zero-command deceleration, warm start, prefix continuity\n";
+    CheckCaptureNominal();
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

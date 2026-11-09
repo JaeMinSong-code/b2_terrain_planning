@@ -1,9 +1,9 @@
 /**
  * @file planner.h
  * @brief 평지·지형 trot의 SQP 입력·출력 및 시간 구간 계획 계약.
- * @version 0.0.42
+ * @version 0.0.43
+ * @update 2026-11-09: 측정속도 이동평균 입력과 nominal capture 보정 설정을 추가함.
  * @update 2026-11-05: 같은 후보의 QP 방향·선택 제약 재사용 비교 설정과 계측을 추가함.
- * @update 2026-11-05: 후보 보정과 같은 입력의 지형 대체 재시도를 개별 설정으로 관리함.
  */
 #ifndef B2_TERRAIN_PLANNER_PLANNER_H_
 #define B2_TERRAIN_PLANNER_PLANNER_H_
@@ -59,6 +59,9 @@ struct Input {
   std::optional<std::array<bool, 4>> hold_contacts;
   Feet feet = Feet::Zero();
   Eigen::Vector3d command = Eigen::Vector3d::Zero();  // Body vx/vy, yaw rate.
+  // 측정 CoM XY 속도의 보행주기 이동평균(odom 프레임). 명령속도와의 차이를
+  // nominal capture 보정에 사용한다. 없으면 기존 명령속도 투영만 사용한다.
+  std::optional<Eigen::Vector2d> average_velocity;
   double gait_time = 0.0;
   bool has_nominal = false;
   Eigen::Matrix<double, 4, 2, Eigen::RowMajor> nominal =
@@ -111,6 +114,11 @@ struct Settings {
   double nominal_kinematics_weight = 7.0;  // 지지 중간 시각의 식 (33) 비용.
   double vz_weight = 0.0;  // 월드 수직속도 제곱 비용(0=비활성). 지형-인지 기준 도입 전까지 꺼 둔다.
   double foothold_backward_weight = 1.4;  // nominal 뒤쪽 거리 제곱의 추가 비용, 0이면 비활성.
+  // nominal capture 보정: gain·√(h/g)·(v̄−cmd)를 nominal에 가산한다. 0이면 비활성.
+  // v̄는 Input.average_velocity(측정속도 이동평균)이며 없으면 보정하지 않는다.
+  // nominal의 명령속도 투영은 유지한다(capture-command 분리 변형은 2026-10-29 반증).
+  double capture_gain = 0.0;
+  double capture_limit = 0.12;  // 보정 norm 상한 [m]. 폭주 연쇄 차단.
   // 직전 해의 같은 착지 슬롯 foothold와의 거리 제곱 비용(TAMOLS 논문 V-B.6).
   // 인접 solve 간 발 목표 점프를 눌러 commit 결정이 여러 solve의 합의가 되게 한다.
   double previous_foothold_weight = 0.01;  // TAMOLS Table I. 0이면 비활성.
@@ -351,6 +359,10 @@ struct Result {
 std::vector<Phase> MakeHorizon(double time, double period, double duty,
     double hold_duration = 0.0,
     const std::optional<std::array<bool, 4>>& hold_contacts = std::nullopt);
+// 다리별 착지 시각의 명령속도 투영 + capture 보정으로 nominal 착지점을 만든다.
+Eigen::Matrix<double, 4, 2, Eigen::RowMajor> NominalFootholds(
+    const Robot& robot, const Input& input, const std::vector<Phase>& phases,
+    double capture_gain = 0.0, double capture_limit = 0.12);
 // 예측 구간에 포함된 연속 지지 구간마다 중점을 하나 반환한다.
 std::vector<double> StanceMidpoints(const std::vector<Phase>& phases, int leg);
 Result Solve(const Robot& robot, const Input& input, const Settings& settings = {},

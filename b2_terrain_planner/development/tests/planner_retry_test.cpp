@@ -1,9 +1,9 @@
 /**
  * @file planner_retry_test.cpp
  * @brief 지연·실패를 주입해 비동기 재계획과 성공해 보존 및 발행 차단을 검증한다.
- * @version 0.0.27
+ * @version 0.0.28
+ * @update 2026-11-09: 착지 대기 solve 연속 실패 시 감속 유지 계획 fallback 발행을 검증함.
  * @update 2026-11-05: 선택 제약 목록만 재사용하는 기본값과 설정의 worker 전달을 검증함.
- * @update 2026-11-05: 기존 제약 선택 기본값 복구와 두 비교 모드의 worker 전달을 검증함.
  */
 #define B2_TERRAIN_PLANNER_NO_MAIN
 #include "../../src/terrain_planner_node.cpp"
@@ -397,6 +397,83 @@ struct TerrainPlannerRetryTest {
     }
   }
 
+  // 착지 대기(pause) 중 solve 연속 실패로 발행이 정체되면 SQP 없이 감속 유지
+  // 계획을 공급하는지 검증한다. 보행 중 실패에는 발동하지 않아야 한다.
+  static void CheckBrakeFallback() {
+    rclcpp::NodeOptions options;
+    options.parameter_overrides({rclcpp::Parameter("brake_fallback.enabled", true),
+                                 rclcpp::Parameter("brake_fallback.stall_sec", 0.0),
+                                 rclcpp::Parameter("solver_diagnostic_directory", "")});
+    TerrainPlannerNode node(options);
+    node.timer_->cancel();
+    node.require_map_ = false;
+    node.publish_markers_ = false;
+    node.state_max_age_ = 10;
+    node.command_.setZero();
+    TerrainPlannerNode::State state;
+    state.header.frame_id = "odom";
+    state.base_orientation.w = 1;
+    state.com_position.x = node.nominal_input_.position.x();
+    state.com_position.y = node.nominal_input_.position.y();
+    state.com_position.z = node.nominal_input_.position.z();
+    state.gait_clock_valid = true;
+    state.body_clock_valid = true;
+    state.gait_epoch_ns = 1;
+    state.gait_time = .01;
+    state.body_time = 10.0;
+    state.contact_confirmed.fill(true);
+    state.contact_estimated.fill(true);
+    for (int leg = 0; leg < 4; ++leg) {
+      state.foot_position[leg].x = node.nominal_input_.feet(leg, 0);
+      state.foot_position[leg].y = node.nominal_input_.feet(leg, 1);
+      state.foot_position[leg].z = node.nominal_input_.feet(leg, 2);
+    }
+    // 기준 발행: fallback의 stall 계산은 마지막 발행 stamp가 필요하다.
+    auto baseline = Install(node);
+    state.header.stamp = node.now();
+    node.OnState(state);
+    Started(baseline);
+    Finish(node, baseline);
+    const auto published = node.published_plans_.size();
+    Check(published >= 1 && node.last_published_stamp_ns_ > 0, "baseline publish missing");
+    // 보행 중(비pause) 실패: fallback이 발동하면 안 된다.
+    auto walking_failure = Install(node, false);
+    state.gait_time = .03;
+    state.body_time = 10.1;
+    state.header.stamp = node.now();
+    node.OnState(state);
+    Started(walking_failure);
+    Finish(node, walking_failure);
+    Check(node.published_plans_.size() == published, "brake fallback fired while walking");
+    // pause + 실패 + 발행 정체: 감속 유지 계획이 발행돼야 한다.
+    auto paused_failure = Install(node, false);
+    state.gait_time = .05;
+    state.body_time = 10.2;
+    state.gait_paused = true;
+    state.com_velocity.x = .6;
+    state.header.stamp = node.now();
+    node.OnState(state);
+    Started(paused_failure);
+    Finish(node, paused_failure);
+    Check(node.published_plans_.size() == published + 1, "brake fallback plan not published");
+    const Result& brake = node.published_plans_.back().body;
+    Check(brake.status == "brake_fallback" && brake.phases.size() == 1 &&
+              brake.phases.front().duration == node.robot_.period,
+          "brake plan shape mismatch");
+    Check(std::abs(Evaluate(brake, 0.0, 1)[0] - .6) < 1e-9,
+          "brake plan start velocity mismatch");
+    Check(std::abs(Evaluate(brake, node.robot_.period, 1)[0]) < 1e-9,
+          "brake plan did not reach zero velocity at horizon");
+    Check(std::abs(Evaluate(brake, 0.0, 0)[0] - state.com_position.x) < 1e-9,
+          "brake plan start position mismatch");
+    Check(node.previous_ && node.previous_->status != "brake_fallback",
+          "warm start source replaced by the fallback plan");
+    // 종료 뒤 자동 시작한 모의 worker가 대기한 채 남지 않게 입력을 비운다.
+    node.state_.reset();
+    if (node.solve_future_.valid()) node.solve_future_.wait();
+    std::cout << "PASS brake fallback publication on paused solve failures\n";
+  }
+
   static void CheckSolverExperiment(bool working_set, bool reuse_working_set) {
     rclcpp::NodeOptions options;
     options.parameter_overrides({rclcpp::Parameter("qp_working_set", working_set),
@@ -730,6 +807,7 @@ struct TerrainPlannerRetryTest {
     CheckCommandRamp();
     CheckTouchdownStop(node);
     CheckSwingReferenceUpdates(node);
+    CheckBrakeFallback();
 
     Input held_model = node.nominal_input_;
     held_model.gait_time = .4;

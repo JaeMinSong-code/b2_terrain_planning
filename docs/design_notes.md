@@ -396,9 +396,11 @@ RBDL로 FK·CoM·질량·CoM 기준 관성을 계산한다. 관절 순서는 FL/
 
 출력은 상태·시간·제약 위반·모델 정보이며, 성공할 때만 착지점과 구간별 다항식 계수가
 포함된다. 좌표 순서는 CoM XYZ, yaw/pitch/roll(ZYX)이고 계수의 시간 단위는 실제 초다.
-`converged`, `feasible_stalled`, `feasible_realtime_step`은 각각 수치 수렴, 가능한 해에서의
-정체, warm start 이후 제한 반복 갱신을 구분한다. `--time-limit`은 계산 예산이다.
-`--profile`은 시간·QP 상태를 추가 출력한다.
+`converged`, `feasible_stalled`, `feasible_realtime_step`, `feasible_time_limit`은 각각
+수치 수렴, 가능한 해에서의 정체, warm start 이후 제한 반복 갱신, 예산 종료 시의 실행
+가능 반복해 반환을 구분한다. 넷 모두 성공이며 계획을 출력한다. 실패 `infeasible_stalled`는
+최대 페널티에서 3회 연속 위반이 줄지 않아 예산 전에 종료한 경우다.
+`--time-limit`은 계산 예산이다. `--profile`은 시간·QP 상태를 추가 출력한다.
 
 `--warm-start <이전 출력.yaml>`은 현재 B2 상태와 함께 이전 계획을 넘긴다.
 모델·프레임·지형 사용 여부·보행 주기의 호환성을 확인한 뒤 사용한다. 지도 영역 이동이나
@@ -448,7 +450,7 @@ RViz의 Fixed Frame과 연결되는 TF도 같은 좌표 계약에 맞춰야 한�
 | `map_topic` | `/elevation_mapping_node/elevation_map_raw` |
 | `frame` | `odom` — 입력 맵은 기본 `elevation_odom`이므로 실행 시 확인 |
 | `command` | `[0.1, 0.0, 0.0]` |
-| `plan_rate_hz`, `time_limit` | 대기 입력 재확인 10 Hz, 0(계산 시간 제한 없음) |
+| `plan_rate_hz`, `time_limit` | 대기 입력 재확인 10 Hz, ROS 기본 0(제한 없음) — 실행 YAML은 0.1 s 예산 |
 | `touchdown_resume_delay` | 실행 YAML 0.08 s — 착지 확인 후 보행 재개 유예 |
 | `sample_dt`, `swing_height` | 0.02 s, 0.10 m |
 | `require_map`, `publish_markers` | true, true |
@@ -794,6 +796,97 @@ committed swing, config generation, planner retry)를 통과했다. ROS 옵션�
 graduated_initialization true를 parameter service와 시작 로그로 확인하고 정상 종료했다.
 이 확인에서는 상태 입력이나 보행 명령을 보내지 않았다.
 
+### Nominal capture 보정 (측정속도 피드백)
+
+2026-11-09: `NominalFootholds`에 capture 보정을 추가했다. 기존 nominal은 명령속도
+투영만 사용해(`hip + cmd·(touchdown + 0.5·stance)`), 측정 속도가 명령에서 벗어나도
+발 배치가 이를 전혀 반영하지 못했다. 같은 날 보행(17:14)에서 계단 하강 직후 선회 중
+실측 속도 발산(|v|→0.77m/s)에 CoM−지지중심 오프셋이 0.23m까지 단조 누적돼 횡 전도한
+원인이다. 보정식: `nominal += gain·√(h/g)·(v̄ − cmd)`, norm 상한 `capture_limit`.
+
+- `v̄` = 노드가 수집하는 측정 CoM XY 속도의 **보행주기(0.8s) 이동평균**
+  (`Input.average_velocity`). 순간 속도는 트롯 출렁임 aliasing으로 발 배치를
+  요동시키므로 쓰지 않는다. 반주기 이상 기록이 쌓여야 활성화하고, gait epoch
+  리셋 시 기록을 비운다. solve_status JSON에 `average_velocity`로 기록한다.
+- **명령속도 투영은 유지한다.** capture 기준을 명령으로 바꾸거나 두 항을 분리하는
+  변형은 2026-10-28~29 보행에서 모두 더 빨리 전도해 반증됐다(momentum tracking이
+  발을 역방향으로 밀어 역진자 발산). norm 상한은 과보정 왕복 발진(X 서핑)을 막는다.
+- 설정: `capture_gain`(ROS 기본 0=비활성·기존 동작, 실행 YAML 1.0),
+  `capture_limit`(0.12m). CLI·기존 테스트는 기본값으로 영향 없다.
+- Problem nominal·대체 후보·refinement 탐색 중심에 동일하게 적용된다.
+
+검증: `touchdown_stop_test`에 직접 검증 추가(오차 0이면 불변, +Y 오차는 √(h/g)배
++Y 이동, 큰 오차는 상한 포화, gain 0이면 불변). ROS ctest 16개 통과. 보행 미검증.
+
+**Yaw-lead(2026-11-09 추가)**: 기존 nominal은 yaw rate 명령을 버리고(선형 성분만
+현재 yaw로 회전) 힙 오프셋도 현재 yaw로 고정해, 0.5rad/s 선회에서 스텝당
+~0.08–0.12m의 체계적 횡 오차를 만들었다(21:13 런 전도 — 세 번의 전도 모두 선회
+중/직후 발생). nominal은 비용 anchor일 뿐 아니라 발 변수 박스 경계(±0.30)의
+중심이라, 선회 중엔 올바른 착지 위치가 탐색 범위 밖으로 벗어날 수 있었다. 수정:
+힙 오프셋은 지지 중간 시각 lead = touchdown + 0.5·stance의 yaw
+(`yaw + yaw_rate·lead`)로 회전하고, 선형 명령은 호의 중점 방향
+(`yaw + 0.5·yaw_rate·lead`)으로 투영한다(중점 근사, 2차 정확도). yaw_rate 0이면
+기존 식과 동일하다. capture 항의 명령 기준은 현재 yaw를 유지한다.
+`touchdown_stop_test`에 순수 선회 명령의 반경 보존·리드 각 범위 검증을 추가했다.
+
+### 착지 대기 감속 유지 계획 fallback (brake_fallback)
+
+2026-11-09: 착지 대기(pause) 중 재개 solve가 연속 실패하면 공급 공백 동안 몸이
+전진 관성으로 지지중심을 이탈한다(21:37 전도: 접촉 확인은 30ms에 끝났지만 재개
+solve 8연속 time_limit 실패로 gait 764ms 동결, 몸 0.42m 선행 → 전방 전도). 명령
+램프는 이미 pause 중 0으로 감속하지만(0.5m/s²), 극한 상태에서는 명령이 줄어도
+solve가 살아나지 않았다 — "느린 명령 = 쉬운 solve"의 self-delivering 가설이
+깨지는 사례다. 대응: solve 실패 완료 시점에 ① `gait_paused` ② 마지막 발행 후
+`brake_fallback.stall_sec`(0.25s, 상태 stamp 기준) 경과 ③ 확인 지지 ≥2 ④ 상태
+fresh이면, **SQP 없이** 등감속 유지 계획을 합성해 발행한다(`BuildBrakePlan`):
+단일 hold phase(period), 발 = 측정 위치 고정, 접촉 = 확인 지지, 몸통 = 측정
+상태에서 등감속으로 horizon 끝 속도 0 (0.6m/s → 0.75m/s² 수준). 발행 경로는
+기존 `Publish()`를 그대로 사용하므로 WBC 채택 계약(parent/epoch/hold)이 동일하다.
+보행 재개는 여전히 실제 solve가 담당하며, 이 계획은 몸을 세워 다음 solve를 쉽게
+만드는 가교다. `previous_`(warm start)는 마지막 실제 성공해를 유지한다. pipeline
+이벤트 `brake_fallback/published`로 기록한다. ROS 기본 비활성, 실행 YAML이 켠다.
+`planner_retry_test`에 보행 중 실패 비발동·pause 정체 시 발행·감속 다항식
+(시작 속도 유지, horizon 끝 0)·warm start 보존 검증을 추가했다. 보행 미검증.
+
+### 계산 예산 복원과 예산 종료 의미
+
+2026-11-09: 실행 YAML의 `time_limit`을 0(무제한)에서 0.1초로 복원했다. 무제한은
+수렴 불가 입력에서 한 계산이 수 초를 소모해 계획 공급을 막았다(실측: 도달 불가
+확정 착지점 입력이 무제한에서 OSQP maximum iterations로 4.7~18.7초, 0.1초 예산에서
+0.102초 종료). 예산 종료는 실패가 아니라 RTI식 공급 유지다 — 이번 계산을 끊고
+직전 발행 성공해를 유지하며 다음 최신 상태에서 재시작한다. 함께 적용한 solver 변경:
+
+- **예산 종료 시 실행 가능 반복해 반환**: SQP 반복 상단·QP 예산 소진·line search 뒤의
+  모든 시간 종료 지점에서 현재 반복해의 위반이 `feasibility_tolerance` 이하면
+  `feasible_time_limit` 성공으로 그 해를 내보낸다. polish만 남은 계산을 예산 때문에
+  통째로 버리지 않는다. QP가 남은 예산 소진으로 중단된 경우도 `qp_failed`가 아니라
+  시간 종료로 분류한다. 위반이 허용치보다 크면 기존 `time_limit` 실패다.
+- **최대 페널티 시험 보장**: line search 거부 시 페널티를 10배(상한 1e6) 올린 뒤
+  다음 반복에서 올린 값을 실제로 시험한다. 기존에는 1e5에서 거부되면 1e6으로 올려
+  놓고 시험 없이 `line_search_failed`로 종료했다.
+- **빠른 불능 판정**: 위반이 직전 최저의 2배를 넘어 발산하면 페널티를 즉시 올려
+  실행가능성 회복을 우선한다(steering). 최대 페널티에서 3회 연속 위반이 0.1% 이상
+  줄지 않으면 `infeasible_stalled`로 예산 전에 종료한다. 실행 가능 반복해는 불능
+  계수에 포함하지 않는다. 이 판정은 2026-10-25 온라인 로그의 "위반 0.03→3.7 발산,
+  반복당 100ms 영구 실패" 패턴을 겨냥한 방어망이다. QP가 먼저 실패하는 합성 불능
+  입력에서는 발동하지 않을 수 있으며, 그 경우에도 예산이 종료를 보장한다.
+
+warm start 재구성 지점은 수렴해에서 출발해도 위반 ~0.04로 실행 불가능하게 복원된다
+(다항식 export/import 양자화). 따라서 `feasible_time_limit`은 보통 1회 이상 수락된
+반복 이후에 발동하며, 정지 hold처럼 초기 추정이 그대로 실행 가능한 입력에서는 첫
+반복에서도 발동한다. 시작 INFO 로그에 적용 `time_limit`을 기록한다. 실패 또는
+0.1초 이상 계산의 snapshot 저장 기준은 유지하므로 `feasible_time_limit`(성공·경계
+소요)과 `infeasible_stalled`(실패) 모두 진단 파일로 수집된다.
+
+검증: CPU ctest 14개·ROS ctest 16개 통과. `swing_terrain_test`에 정지 hold 극소
+예산의 `feasible_time_limit` 반환(위반 0, 계획 export 포함)과 도달 불가 확정
+착지점의 0.1초 예산 종료(무제한 대비 14.8초→0.102초)를 추가했다. 기존 cold 시작
+극소 예산 시험은 "실행 가능하면 성공, 아니면 time_limit 실패" 계약으로 갱신했다.
+설치 config 3종(`b2_terrain`, `terrain_planner_wbc`, `terrain_planner_flat`)의
+0.1초 반영과 설치 라이브러리의 신규 상태 문자열을 확인했다. 비교 재생 시
+LD_LIBRARY_PATH 앞에 비교 빌드 경로를 명시해야 한다(설치 라이브러리 선점 주의).
+실제 보행은 미검증이다.
+
 ### 계산 완료 알림과 계획 전달
 
 계산 worker는 결과 future를 ready로 만든 뒤 `SolveCompletion` guard condition으로
@@ -876,9 +969,11 @@ Solve는 입력·설정·직전 성공해의 복사본으로 별도 작업에서
 실패 중간값과 SQP 페널티는 다음 상태의 계산에 넘기지 않는다. 마지막으로 발행한 성공해만
 초기값으로 사용하며, 성공해가 없으면 현재 입력으로 초기화한다. 새 계산의 페널티는 기본값
 10에서 시작한다. 같은 Solve 내부의 가상 바닥 초기화·후보 보정 단계는 유지한다.
-실행 YAML과 ROS 기본값의 `time_limit: 0`은 SQP·QP 시간 제한을 해제한다. 양수를 명시하면
-그 예산을 적용하며 음수·비유한 값은 오류다. 수렴·실패·반복 횟수 종료 조건은 유지한다.
-무제한에서는 준비 단계 시간 비율을 적용하지 않고 각 단계의 기존 종료 조건을 사용한다.
+실행 YAML의 `time_limit: 0.1`은 전체 Solve(가상 바닥·본시도·대체 후보 포함)의 벽시계
+예산이다. ROS 파라미터 기본값 0은 제한 해제이며 진단·재생 용도다. 음수·비유한 값은
+오류다. 수렴·실패·반복 횟수 종료 조건은 유지한다. 무제한에서는 준비 단계 시간 비율을
+적용하지 않고 각 단계의 기존 종료 조건을 사용한다. 예산 종료의 의미는 아래
+[계산 예산 복원과 예산 종료 의미](#계산-예산-복원과-예산-종료-의미)를 따른다.
 WBC의 80ms 채택 기한은 제거했다. 실제 궤적 horizon 만료·부모·epoch 판정은 유지한다.
 `touchdown_resume_delay`는 착지 후 보행 재개 유예만 설정하며 WBC 채택 기한이 아니다.
 실행 YAML의 값은 0.08초이며, 생략·0 이하이면 기존 기본값 0.1 + 2*sample_dt를 사용한다.

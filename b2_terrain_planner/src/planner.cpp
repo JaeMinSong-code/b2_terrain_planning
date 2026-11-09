@@ -1,9 +1,9 @@
 /**
  * @file planner.cpp
  * @brief 접촉 조합별 생성 Jacobian과 지형 비용의 Gauss–Newton QP로 trot을 최적화한다.
- * @version 0.0.54
- * @update 2026-11-05: 동일 후보의 일반 QP 방향과 직전 선택 제약을 개별 비교 옵션으로 재사용함.
- * @update 2026-11-05: 초기화와 성공 판정을 유지하며 같은 입력의 대체 후보 재시도만 끌 수 있게 함.
+ * @version 0.0.57
+ * @update 2026-11-09: nominal 힙 오프셋·명령 투영에 yaw rate 리드(착지 시각 자세)를 반영함.
+ * @update 2026-11-09: nominal 착지점에 측정속도 이동평균 기반 capture 보정을 추가함.
  */
 #include "b2_terrain_planner/planner.h"
 #include "b2_terrain_planner/robot_model.h"
@@ -258,32 +258,61 @@ SupportPositions LateralSupport(
   return supports;
 }
 
+}  // namespace
+
+// 헤더 공개 함수: 테스트가 capture 보정을 직접 검증한다.
 Eigen::Matrix<double, 4, 2, Eigen::RowMajor> NominalFootholds(
-    const Robot& robot, const Input& input, const std::vector<Phase>& phases) {
+    const Robot& robot, const Input& input, const std::vector<Phase>& phases,
+    double capture_gain, double capture_limit) {
   if (input.has_nominal) return input.nominal;
   Eigen::Matrix<double, 4, 2, Eigen::RowMajor> nominal;
   Eigen::Vector3d command(input.command.x(), input.command.y(), 0);
   command = Eigen::AngleAxisd(input.position[3], Eigen::Vector3d::UnitZ()) * command;
   // 명령 속도와 착지 시각으로 nominal을 구성하고 최적화에서 착지점을 선택한다.
   const Eigen::Vector2d command_xy = command.head<2>();
+  // Capture 보정: 측정속도 이동평균이 명령에서 벗어난 만큼 역진자 시간상수
+  // √(h/g)를 곱해 발을 "달아나는 몸" 방향으로 이동한다. 명령속도 투영은 그대로
+  // 유지한다 — capture 기준을 명령으로 바꾸거나 둘을 분리하는 변형은 2026-10-29
+  // 보행에서 모두 더 빨리 전도해 반증됐다. norm 상한으로 과보정 왕복 발진을 막는다.
+  Eigen::Vector2d capture = Eigen::Vector2d::Zero();
+  if (capture_gain > 0 && input.average_velocity && input.average_velocity->allFinite()) {
+    const double capture_time = std::sqrt(std::max(0.0, robot.height) / 9.81);
+    capture = capture_gain * capture_time * (*input.average_velocity - command_xy);
+    const double norm = capture.norm();
+    if (norm > capture_limit && norm > 0) capture *= capture_limit / norm;
+  }
+  const double yaw_rate = input.command.z();
   for (int leg = 0; leg < 4; ++leg) {
     double touchdown = robot.period;
     for (const auto& phase : phases) {
       if (phase.landed[leg]) { touchdown = phase.start; break; }
     }
+    // Raibert 센터링: 지지 중간 시각(lead)의 힙 위치 아래에 발을 둔다.
+    const double lead = touchdown + .5 * robot.period * robot.duty;
     Eigen::Vector3d offset = robot.hips.row(leg).transpose();
     if (robot.use_reference_legs) offset = robot.nominal_offsets.row(leg).transpose();
     // 오프셋은 yaw만으로 회전한다(수평 투영). full 자세 회전은 CoM→발 오프셋의
     // z(≈−0.55m) 때문에 roll/pitch 기울기를 0.55m/rad 비율의 수평 이동으로 바꿔,
     // 기운 쪽 반대로 발을 보내는 양성 피드백(기울기 발산)을 만든다.
+    // Yaw-lead: 선회 명령 중 발이 닿는 시점의 몸은 이미 더 돌아 있다. 오프셋은
+    // lead 시각의 yaw로 회전하고, 선형 명령은 호의 중점 방향으로 투영한다(중점
+    // 근사, 2차 정확도). yaw_rate 0이면 기존 식과 동일하다. 현재 yaw 고정 투영은
+    // 0.5 rad/s 선회에서 스텝당 ~0.1 m의 체계적 횡 오차를 만들었다(11-09 전도).
+    const Eigen::Vector3d lead_offset =
+        Eigen::AngleAxisd(input.position[3] + yaw_rate * lead,
+                          Eigen::Vector3d::UnitZ()) * offset;
+    Eigen::Vector3d lead_velocity(input.command.x(), input.command.y(), 0);
+    lead_velocity = Eigen::AngleAxisd(input.position[3] + .5 * yaw_rate * lead,
+                                      Eigen::Vector3d::UnitZ()) * lead_velocity;
     nominal.row(leg) =
-        (input.position.head<3>() +
-         Eigen::AngleAxisd(input.position[3], Eigen::Vector3d::UnitZ()) * offset)
-            .head<2>().transpose() +
-        (command_xy * (touchdown + .5 * robot.period * robot.duty)).transpose();
+        (input.position.head<3>() + lead_offset).head<2>().transpose() +
+        (lead_velocity.head<2>() * lead).transpose() +
+        capture.transpose();
   }
   return nominal;
 }
+
+namespace {
 
 class Problem {
  public:
@@ -292,6 +321,7 @@ class Problem {
           bool block_assembly, bool polynomial_tail,
           double pitch_weight, double nominal_kinematics_weight, double orientation_limit,
           double backward_weight, double vz_weight, double max_reach_margin,
+          double capture_gain = 0.0, double capture_limit = 0.12,
           TerrainLayer terrain_layer = TerrainLayer::kGround)
       : robot_(robot), input_(input), intervals_(intervals),
         phases_(MakeHorizon(input.gait_time, robot.period, robot.duty,
@@ -385,7 +415,7 @@ class Problem {
     if (world_command.head<2>().norm() > 1e-6) {
       direction_ = world_command.head<2>().normalized();
     }
-    nominal_ = NominalFootholds(robot, input, phases_);
+    nominal_ = NominalFootholds(robot, input, phases_, capture_gain, capture_limit);
     for (int leg = 0; leg < 4; ++leg) {
       if (input_.committed_footholds[leg]) {
         nominal_.row(leg) = input_.committed_footholds[leg]->head<2>().transpose();
@@ -2372,7 +2402,8 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
                     settings.block_assembly, settings.polynomial_tail,
                     settings.pitch_weight, settings.nominal_kinematics_weight, settings.orientation_limit,
                     settings.foothold_backward_weight, settings.vz_weight,
-                    settings.max_reach_margin, layer);
+                    settings.max_reach_margin, settings.capture_gain, settings.capture_limit,
+                    layer);
     result.stage = "initialization";
     int replaced_leg = -1;
     if (alternative != nullptr) replaced_leg = alternative->leg;
@@ -2468,6 +2499,20 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
     // elastic QP·다른 후보·다음 Solve로는 이 방향을 전달하지 않는다.
     std::optional<Vector> penalty_retry_step;
     int small_improvements = 0;
+    // 시간 예산 종료 시 현재 반복해가 실행 가능하면 실패 대신 그 해를 반환한다.
+    // 수렴 polish만 남은 계산을 예산 때문에 통째로 버리지 않기 위한 RTI식 종료다.
+    auto finish_time_limit = [&]() {
+      if (result.violation <= settings.feasibility_tolerance) {
+        result.success = true;
+        result.status = "feasible_time_limit";
+      } else {
+        result.status = "time_limit";
+      }
+    };
+    // 빠른 불능 판정: 최대 페널티에서도 위반이 줄지 않으면 예산을 기다리지 않는다.
+    constexpr double kMaxPenalty = 1e6;
+    double best_violation = std::numeric_limits<double>::infinity();
+    int stalled_iterations = 0;
     result.stage = "optimization";
     result.status = "iteration_limit";
     for (int iteration = 0; iteration < settings.max_iterations; ++iteration) {
@@ -2483,7 +2528,24 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
         trace(problem.InitialFootholds(x), "sqp_start", &eval);
       }
       if (elapsed() >= time_limit) {
-        result.status = "time_limit";
+        finish_time_limit();
+        break;
+      }
+      // 위반이 직전 최저 대비 발산하면 페널티를 즉시 올려 실행가능성 회복을
+      // 우선한다(steering). 최대 페널티에서 3회 연속 위반이 줄지 않으면 선형화
+      // 불능으로 보고 시간 예산을 기다리지 않고 종료한다. 실행 가능 반복해
+      // (위반 ≤ 허용치)는 불능 계수에 포함하지 않는다.
+      if (result.violation < best_violation * 0.999) {
+        best_violation = result.violation;
+        stalled_iterations = 0;
+      } else if (result.violation > settings.feasibility_tolerance) {
+        if (penalty >= kMaxPenalty) ++stalled_iterations;
+        if (result.violation > 2 * best_violation + 1e-6) {
+          penalty = std::min(kMaxPenalty, penalty * 10);
+        }
+      }
+      if (stalled_iterations >= 3) {
+        result.status = "infeasible_stalled";
         break;
       }
       Vector scaling = Vector::Ones(eval.values.size());
@@ -2519,7 +2581,12 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
                        &elastic_cache, QpCoordinates{x}, true);
       }
       if (!qp_ok) {
-        result.status = "qp_failed: " + qp_status;
+        if (elapsed() >= time_limit) {
+          // QP가 남은 예산 소진으로 중단된 경우는 QP 실패가 아니라 시간 종료다.
+          finish_time_limit();
+        } else {
+          result.status = "qp_failed: " + qp_status;
+        }
         break;
       }
       const double violation = Violation(eval, Vector::Ones(eval.values.size()));
@@ -2672,6 +2739,11 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
         alpha *= 0.5;
       }
       search_timer.Stop();
+      if (elapsed() >= time_limit) {
+        // line search 도중 예산이 끝나도 수락된 실행 가능 반복해는 버리지 않는다.
+        finish_time_limit();
+        break;
+      }
       if (realtime && accepted && iteration + 1 >= settings.realtime_iterations &&
           accepted_violation <= settings.feasibility_tolerance && elapsed() < time_limit) {
         result.success = true;
@@ -2683,16 +2755,18 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
         result.status = "feasible_stalled";
         break;
       }
+      if (!accepted && penalty >= kMaxPenalty) {
+        // 최대 페널티에서 거부된 경우에만 종료한다. 더 낮은 페널티의 거부는
+        // 페널티를 올린 뒤 다음 반복에서 올린 값을 실제로 시험한다.
+        result.status = "line_search_failed";
+        break;
+      }
       if (!accepted && reduced_direction && settings.reuse_qp_direction) {
         penalty_retry_step = step;
       }
       if (!accepted || slack > 1e-4 ||
           (step.lpNorm<Eigen::Infinity>() < 1e-3 && violation > settings.feasibility_tolerance)) {
-        penalty = std::min(1e6, penalty * 10);
-      }
-      if (!accepted && penalty >= 1e6) {
-        result.status = "line_search_failed";
-        break;
+        penalty = std::min(kMaxPenalty, penalty * 10);
       }
     }
     if (final_trace) {
@@ -2704,7 +2778,8 @@ static Result SolveAttempt(const Robot& robot, const Input& input, const Setting
       last->iteration = final_trace->iteration;
     }
     const bool resumable = result.status == "time_limit" || result.status == "iteration_limit" ||
-                           result.status == "line_search_failed";
+                           result.status == "line_search_failed" ||
+                           result.status == "infeasible_stalled";
     // 가상 바닥의 중간값은 같은 Solve 안의 후보 보정에만 사용한다.
     const bool coarse_initializer = layer == TerrainLayer::kVirtualFloor && resumable && x.allFinite();
     if (result.success || coarse_initializer) {
@@ -2807,7 +2882,8 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
     if ((candidate.success || candidate.initialization_available) && elapsed() < preparation_end) {
       const auto phases = MakeHorizon(input.gait_time, robot.period, robot.duty,
                                      input.gait_hold_duration, input.hold_contacts);
-      const auto nominal = NominalFootholds(robot, input, phases);
+      const auto nominal = NominalFootholds(robot, input, phases,
+                                            settings.capture_gain, settings.capture_limit);
       Eigen::Vector3d velocity(input.command.x(), input.command.y(), 0);
       velocity = Eigen::AngleAxisd(input.position[3], Eigen::Vector3d::UnitZ()) * velocity;
       Eigen::Vector2d direction = Eigen::Vector2d::Zero();
@@ -2899,7 +2975,8 @@ Result Solve(const Robot& robot, const Input& input, const Settings& settings,
     // 후보별로 남은 시간 안에서 몸통 SQP를 다시 수행한다.
     const auto phases = MakeHorizon(input.gait_time, robot.period, robot.duty,
                                    input.gait_hold_duration, input.hold_contacts);
-    const auto nominal = NominalFootholds(robot, input, phases);
+    const auto nominal = NominalFootholds(robot, input, phases,
+                                          settings.capture_gain, settings.capture_limit);
     Eigen::Vector3d command(input.command.x(), input.command.y(), 0);
     command = Eigen::AngleAxisd(input.position[3], Eigen::Vector3d::UnitZ()) * command;
     Eigen::Vector2d direction = Eigen::Vector2d::Zero();

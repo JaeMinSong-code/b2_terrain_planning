@@ -100,11 +100,23 @@ planner:
     command_topic: /robot/locomotion_command
     command_timeout: 0.25
     plan_rate_hz: 10.0
-    # 0은 SQP·QP 계산 시간 제한 없음. 수렴·실패·반복 횟수 종료 조건은 유지한다.
-    time_limit: 0.0
+    # 전체 Solve(가상 바닥·본시도·대체 후보 포함) 벽시계 예산. 초과 시 이번 계산을
+    # 끊고 직전 발행 성공해를 유지하며 다음 최신 상태에서 재시작한다(RTI 방식).
+    # 0은 제한 없음(진단용). 수렴·실패·반복 횟수 종료 조건은 유지한다.
+    time_limit: 0.1
     # 같은 SQP 시도 안에서 선택 제약 목록만 유지한다. QP 방향은 매번 새로 푼다.
     qp_working_set: true
     reuse_qp_working_set: true
+    # nominal capture 보정: gain·√(h/g)·(측정속도 이동평균 − 명령)을 착지점에 가산.
+    # 명령속도 투영은 유지(분리 변형은 2026-10-29 반증). 상한은 과보정 발진 차단.
+    # 0.18 = 속도 오차 ~0.8m/s까지 이론값 미포화(11-09 20:47 런에서 0.12가
+    # vy 오차 0.55m/s에서 포화해 회수량 부족 → 상향). X 전후 발진 재발 감시.
+    capture_gain: 1.0
+    capture_limit: 0.18
+    # 착지 대기 중 solve 연속 실패로 발행이 stall_sec 이상 정체되면 SQP 없이
+    # 등감속 유지 계획을 공급한다(발 고정·확인 지지 유지·horizon 끝 속도 0).
+    brake_fallback.enabled: true
+    brake_fallback.stall_sec: 0.25
     # 착지 확인 후 보행 재개 유예. WBC의 계획 채택 기한으로 사용하지 않는다.
     touchdown_resume_delay: 0.08
     # TAMOLS IV/V: 처리 지도와 후보 보정. 원본 지도·관측 마스크는 보존한다.

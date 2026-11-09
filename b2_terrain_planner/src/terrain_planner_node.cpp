@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.57
- * @update 2026-11-05: 선택 제약 목록만 온라인 기본 재사용하고 설정·재사용 횟수를 진단에 기록함.
- * @update 2026-11-05: 전체 제약 재생의 시간 증가를 확인해 온라인 기본값을 기존 제약 선택으로 복구함.
+ * @version 0.0.60
+ * @update 2026-11-09: 착지 대기 중 solve 연속 실패 시 SQP 없이 감속 유지 계획을 공급하는 fallback을 추가함.
+ * @update 2026-11-09: 측정속도 보행주기 이동평균을 수집해 nominal capture 보정 입력으로 전달함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -227,12 +227,15 @@ class TerrainPlannerNode : public rclcpp::Node {
     RCLCPP_INFO(get_logger(), "terrain_planner_node: state=%s map=%s plan=%s asynchronous, fallback=%.1fHz",
                 state_topic_.c_str(), map_topic_.c_str(), plan_topic_.c_str(), plan_rate_hz_);
     RCLCPP_INFO(get_logger(), "SQP line_search_projection=%d terrain.candidate_retries=%d qp_working_set=%d "
-                "reuse_qp_working_set=%d reuse_qp_direction=%d",
+                "reuse_qp_working_set=%d reuse_qp_direction=%d time_limit=%.3f "
+                "capture_gain=%.2f capture_limit=%.2f brake_fallback=%d/%.2fs",
                 static_cast<int>(!settings_.skip_line_search_projection),
                 static_cast<int>(settings_.terrain_candidate_retries),
                 static_cast<int>(settings_.qp_working_set),
                 static_cast<int>(settings_.reuse_qp_working_set),
-                static_cast<int>(settings_.reuse_qp_direction));
+                static_cast<int>(settings_.reuse_qp_direction),
+                settings_.time_limit, settings_.capture_gain, settings_.capture_limit,
+                static_cast<int>(brake_fallback_enabled_), brake_fallback_stall_sec_);
   }
 
   ~TerrainPlannerNode() override {
@@ -460,7 +463,14 @@ class TerrainPlannerNode : public rclcpp::Node {
         << ",\"gait_hold_duration\":" << number(input.gait_hold_duration)
         << ",\"command\":[" << number(input.command.x()) << ','
         << number(input.command.y()) << ',' << number(input.command.z()) << ']'
-        << ",\"foot_z\":[";
+        << ",\"average_velocity\":";
+    if (input.average_velocity) {
+      out << '[' << number(input.average_velocity->x()) << ','
+          << number(input.average_velocity->y()) << ']';
+    } else {
+      out << "null";
+    }
+    out << ",\"foot_z\":[";
     for (int leg = 0; leg < 4; ++leg) {
       if (leg > 0) out << ',';
       out << number(input.feet(leg, 2));
@@ -679,6 +689,13 @@ class TerrainPlannerNode : public rclcpp::Node {
     settings_.qp_eps_rel = 1e-3;
     settings_.qp_max_iterations = 4000;
     settings_.time_limit = declare_parameter<double>("time_limit", 0.0);
+    // nominal capture 보정. 0이면 기존 명령속도 투영만 사용한다.
+    settings_.capture_gain = declare_parameter<double>("capture_gain", 0.0);
+    settings_.capture_limit = declare_parameter<double>("capture_limit", 0.12);
+    // 착지 대기(pause) 중 solve 연속 실패로 발행이 정체되면 SQP 없이 감속 유지
+    // 계획을 공급한다. 기본 비활성 — 실행 YAML이 켠다.
+    brake_fallback_enabled_ = declare_parameter<bool>("brake_fallback.enabled", false);
+    brake_fallback_stall_sec_ = declare_parameter<double>("brake_fallback.stall_sec", 0.25);
     settings_.skip_line_search_projection =
         !declare_parameter<bool>("line_search_projection", true);
     settings_.terrain_candidate_retries =
@@ -1019,6 +1036,7 @@ class TerrainPlannerNode : public rclcpp::Node {
       hold_anchor_.reset();
       touchdown_stop_ = false;
       swing_references_ = {};
+      velocity_history_.clear();
     }
     bool replan = state_ && state_->gait_paused != msg.gait_paused;
     if (state_ && msg.plan_adoption_status > 1 &&
@@ -1030,6 +1048,15 @@ class TerrainPlannerNode : public rclcpp::Node {
       }
     }
     state_ = msg;
+    // capture 보정용 측정 CoM XY 속도 기록. 보행주기 창 평균으로 트롯 출렁임을
+    // 걸러낸다(순간 속도 사용 금지 — aliasing으로 발 배치가 요동한다).
+    const double stamp_sec = static_cast<double>(stamp) * 1e-9;
+    velocity_history_.emplace_back(stamp_sec,
+        Eigen::Vector2d(msg.com_velocity.x, msg.com_velocity.y));
+    while (!velocity_history_.empty() &&
+           velocity_history_.front().first < stamp_sec - robot_.period) {
+      velocity_history_.pop_front();
+    }
     RememberSupportContacts();
     if (UpdateTouchdownStop(msg)) {
       replan = true;
@@ -1192,6 +1219,15 @@ class TerrainPlannerNode : public rclcpp::Node {
     const double roll_rate = omega_body.x() + std::sin(pitch) * yaw_rate;
     input.velocity << state.com_velocity.x, state.com_velocity.y, state.com_velocity.z,
                       yaw_rate, pitch_rate, roll_rate;
+    // 반주기 이상 쌓인 경우에만 capture 보정을 활성화한다(기립 직후 과도 상태 배제).
+    if (!velocity_history_.empty() &&
+        velocity_history_.back().first - velocity_history_.front().first >=
+            0.5 * robot_.period) {
+      Eigen::Vector2d velocity_sum = Eigen::Vector2d::Zero();
+      for (const auto& sample : velocity_history_) velocity_sum += sample.second;
+      input.average_velocity =
+          velocity_sum / static_cast<double>(velocity_history_.size());
+    }
     for (int leg = 0; leg < 4; ++leg) {
       const auto& foot = state.foot_position[leg];
       input.feet.row(leg) << foot.x, foot.y, foot.z;
@@ -1268,6 +1304,96 @@ class TerrainPlannerNode : public rclcpp::Node {
         });
   }
 
+  // SQP 없이 만드는 감속 유지 계획: 현재 측정 상태에서 등감속으로 horizon 끝
+  // 속도 0, 발은 측정 위치 고정, 접촉은 확인 지지 유지(hold 계약). 보행 재개는
+  // 여전히 실제 solve가 담당하며, 이 계획은 공급 공백 동안 몸만 세운다.
+  static Result BuildBrakePlan(const Robot& robot, const Input& input) {
+    Result plan;
+    Phase phase;
+    phase.start = 0.0;
+    phase.duration = robot.period;
+    phase.contacts = {true, true, true, true};
+    if (input.hold_contacts) phase.contacts = *input.hold_contacts;
+    plan.phases.push_back(phase);
+    Eigen::Matrix<double, 6, 5> coefficients = Eigen::Matrix<double, 6, 5>::Zero();
+    for (int axis = 0; axis < 6; ++axis) {
+      coefficients(axis, 0) = input.position[axis];
+      coefficients(axis, 1) = input.velocity[axis];
+      // v(T) = 0 등감속. 0.6 m/s에서 0.75 m/s² 수준의 완만한 제동이다.
+      coefficients(axis, 2) = -input.velocity[axis] / (2.0 * robot.period);
+    }
+    plan.coefficients.push_back(coefficients);
+    plan.margins.push_back(0.0);
+    plan.footholds = input.feet;
+    plan.success = true;
+    plan.status = "brake_fallback";
+    plan.stage = "complete";
+    plan.seed_context = {input.gait_time, robot.period, robot.duty, input.frame,
+                         RobotSignature(robot), input.terrain.has_value(), input.feet,
+                         TerrainSignature(input.terrain), input.body_time,
+                         input.gait_hold_duration, input.hold_contacts};
+    return plan;
+  }
+
+  // 착지 대기 중 재개 solve가 연속 실패하면 감속 유지 계획을 공급한다. 명령 램프
+  // 감속(self-delivering)만으로는 극한 상태의 solve가 살아나지 않는 사례를 끊는다
+  // (2026-11-09 21:37 전도: 접촉 확인 후 764ms 동결, 몸 0.42m 선행).
+  void MaybePublishBrakeFallback() {
+    if (!brake_fallback_enabled_ || !state_) return;
+    const auto state = *state_;
+    if (!state.gait_clock_valid || !state.body_clock_valid || !state.gait_paused) return;
+    if (!Fresh(state.header.stamp, state_max_age_)) return;
+    if (last_published_stamp_ns_ <= 0) return;
+    const double stall =
+        static_cast<double>(rclcpp::Time(state.header.stamp).nanoseconds() -
+                            last_published_stamp_ns_) * 1e-9;
+    if (stall < brake_fallback_stall_sec_) return;
+    int supports = 0;
+    for (int leg = 0; leg < 4; ++leg) {
+      if (state.contact_confirmed[leg]) ++supports;
+    }
+    if (supports < 2) return;
+    const Eigen::Quaterniond q(state.base_orientation.w, state.base_orientation.x,
+                               state.base_orientation.y, state.base_orientation.z);
+    const Eigen::Vector3d ypr = QuatToZyx(q.normalized());
+    const double pitch = ypr[1], roll = ypr[2];
+    if (std::abs(std::cos(pitch)) < 0.1) return;
+    Input input = nominal_input_;
+    input.frame = frame_;
+    input.command.setZero();
+    input.gait_time = state.gait_time;
+    input.body_time = state.body_time;
+    input.gait_hold_duration = robot_.period;
+    input.hold_contacts = state.contact_confirmed;
+    input.contact_estimated = state.contact_estimated;
+    input.position << state.com_position.x, state.com_position.y, state.com_position.z,
+                      ypr[0], ypr[1], ypr[2];
+    const Eigen::Vector3d omega_body = q.normalized().conjugate() * Eigen::Vector3d(
+        state.base_angular_velocity.x, state.base_angular_velocity.y,
+        state.base_angular_velocity.z);
+    const double yaw_rate = (std::sin(roll) * omega_body.y() +
+                             std::cos(roll) * omega_body.z()) / std::cos(pitch);
+    const double pitch_rate = std::cos(roll) * omega_body.y() -
+                              std::sin(roll) * omega_body.z();
+    const double roll_rate = omega_body.x() + std::sin(pitch) * yaw_rate;
+    input.velocity << state.com_velocity.x, state.com_velocity.y, state.com_velocity.z,
+                      yaw_rate, pitch_rate, roll_rate;
+    for (int leg = 0; leg < 4; ++leg) {
+      const auto& foot = state.foot_position[leg];
+      input.feet.row(leg) << foot.x, foot.y, foot.z;
+    }
+    if (!input.position.allFinite() || !input.velocity.allFinite() ||
+        !input.feet.allFinite()) return;
+    const Result plan = BuildBrakePlan(robot_, input);
+    active_frame_ = state.header.frame_id;
+    Publish(plan, input, state);
+    // previous_(다음 solve warm start)는 마지막 실제 성공해를 유지한다.
+    PublishPipelineStatus("brake_fallback", "published");
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                         "brake fallback plan published after %.0f ms publish stall",
+                         stall * 1000.0);
+  }
+
   void CompleteSolve() {
     if (!solve_future_.valid() ||
         solve_future_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
@@ -1321,6 +1447,8 @@ class TerrainPlannerNode : public rclcpp::Node {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                            "solve failed: %s", result.status.c_str());
       retry_requested_ = true;
+      // 착지 대기 중 실패가 이어져 발행이 정체되면 감속 유지 계획으로 공백을 메운다.
+      MaybePublishBrakeFallback();
     } else if (!publishable) {
       PublishSolveStatus(result, pending, false, reason);
       PublishPipelineStatus("publish_deferred", reason);
@@ -1523,6 +1651,11 @@ class TerrainPlannerNode : public rclcpp::Node {
   double station_keeping_gain_ = 0.5;
   double station_keeping_max_velocity_ = 0.06;
   std::optional<Eigen::Vector2d> hold_anchor_;
+  // capture 보정용 (stamp_sec, CoM XY 속도) 기록. 보행주기 창으로 유지한다.
+  std::deque<std::pair<double, Eigen::Vector2d>> velocity_history_;
+  // 착지 대기 중 solve 연속 실패 시 감속 유지 계획 공급.
+  bool brake_fallback_enabled_ = false;
+  double brake_fallback_stall_sec_ = 0.25;
   std::deque<PublishedPlan> published_plans_;
   std::string command_topic_;
   double command_timeout_ = 0.25;

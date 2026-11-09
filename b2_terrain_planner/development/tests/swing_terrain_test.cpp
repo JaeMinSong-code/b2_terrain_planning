@@ -1,9 +1,9 @@
 /**
  * @file swing_terrain_test.cpp
  * @brief 스윙·지지발의 높이 불일치 허용과 다음 착지점의 지형 검사를 검증한다.
- * @version 0.0.9
+ * @version 0.0.10
+ * @update 2026-11-09: 예산 종료의 실행 가능 반복해 반환과 불능 입력 조기 종료를 검증함.
  * @update 2026-11-05: 시간 제한 0을 허용하고 음수 설정 거부와 기존 유한 예산 진단을 검증함.
- * @update 2026-11-03: 제거한 terrain_validation 결과 필드 검사를 정리함.
  */
 #include "b2_terrain_planner/planner.h"
 
@@ -87,10 +87,81 @@ void Run(double gait_time) {
   auto short_settings = settings;
   short_settings.time_limit = 1e-12;
   const auto timeout = Solve(robot, input, short_settings);
-  Check(!timeout.success && timeout.optimization_started && timeout.status == "time_limit" &&
-            timeout.stage == "optimization",
-        "time limit was not distinguished from pre-optimization rejection");
+  // 예산 종료 계약: 현재 반복해가 실행 가능하면 feasible_time_limit 성공,
+  // 아니면 time_limit 실패다. 어느 쪽이든 최적화 진입은 보장돼야 한다.
+  bool timeout_contract = false;
+  if (!timeout.success && timeout.status == "time_limit" && timeout.stage == "optimization") {
+    timeout_contract = true;
+  }
+  if (timeout.success && timeout.status == "feasible_time_limit") {
+    timeout_contract = true;
+  }
+  Check(timeout_contract && timeout.optimization_started,
+        "time limit was not distinguished from pre-optimization rejection: " + timeout.status);
   std::cout << "PASS gait_time=" << gait_time << " status=" << result.status << '\n';
+}
+
+void CheckFeasibleTimeLimit() {
+  // 정지 hold 입력은 초기 추정 자체가 실행 가능하다(위반 0). 예산을 사실상 0으로
+  // 줄여 첫 반복에서 시간이 끝나도, 실패가 아니라 그 실행 가능 해를 반환해야 한다.
+  // (보행 warm start 재구성 지점은 위반 ~0.04로 원래 실행 불가능이므로 쓰지 않는다.)
+  Robot robot;
+  Settings settings;
+  settings.time_limit = 3.0;
+  settings.sample_intervals = 4;
+  settings.structured_equalities = true;
+  settings.lapack_svd = true;
+  Input input = FlatInput(robot, 0.4);
+  input.command.setZero();
+  input.body_time = 0.8;
+  input.gait_hold_duration = robot.period;
+  input.hold_contacts = std::array<bool, 4>{true, true, true, true};
+  input.contact_estimated = input.hold_contacts;
+  auto short_settings = settings;
+  short_settings.time_limit = 1e-12;
+  const Result kept = Solve(robot, input, short_settings);
+  Check(kept.success && kept.status == "feasible_time_limit",
+        "feasible iterate was discarded at time limit: " + kept.status);
+  Check(kept.violation <= settings.feasibility_tolerance,
+        "feasible_time_limit returned an infeasible plan");
+  Check(!kept.coefficients.empty() && kept.footholds.allFinite(),
+        "feasible_time_limit did not export the plan");
+  Check(kept.stage == "complete", "feasible_time_limit did not complete export");
+  std::cout << "PASS feasible_time_limit violation=" << kept.violation << '\n';
+}
+
+void CheckInfeasibleBudgetedExit() {
+  // 도달 불가능한 확정 착지점은 무제한 예산에서 QP가 수 초씩 소모하며 실패한다
+  // (OSQP maximum iterations). 실행 예산(0.1s)에서는 QP에 남은 예산이 전달되고
+  // 시간 종료가 QP 실패로 둔갑하지 않아야 한다. 어느 실패 경로든 성공을 날조하지
+  // 않고 예산 근방에서 종료하는 것이 계약이다. infeasible_stalled(최대 페널티
+  // 위반 정체)는 온라인 발산 패턴 전용 방어망으로, QP가 먼저 실패하는 이
+  // 합성 입력에서는 요구하지 않는다.
+  Robot robot;
+  Settings settings;
+  settings.time_limit = 0.1;
+  settings.sample_intervals = 4;
+  settings.structured_equalities = true;
+  settings.lapack_svd = true;
+  Input input;
+  input.position.z() = robot.height;
+  input.feet = robot.hips;
+  input.command.x() = 0.1;
+  input.gait_time = 0.6;
+  input.committed_footholds[0] = Eigen::Vector3d(1.5, -1.5, 0.0);
+  const Result infeasible = Solve(robot, input, settings);
+  Check(!infeasible.success, "unreachable committed foothold produced a plan");
+  Check(infeasible.optimization_started, "infeasible input rejected before optimization");
+  const bool bounded_status = infeasible.status == "time_limit" ||
+                              infeasible.status == "infeasible_stalled" ||
+                              infeasible.status == "line_search_failed" ||
+                              infeasible.status.rfind("qp_failed", 0) == 0;
+  Check(bounded_status, "unexpected infeasible exit status: " + infeasible.status);
+  Check(infeasible.elapsed < 1.0,
+        "infeasible input was not bounded by the budget: " +
+            std::to_string(infeasible.elapsed));
+  std::cout << "PASS infeasible budgeted exit status=" << infeasible.status
+            << " elapsed=" << infeasible.elapsed << '\n';
 }
 
 void CheckDelayedContact() {
@@ -183,6 +254,8 @@ int main() {
     CheckDelayedContact();
     CheckSupportHeightOffset();
     CheckUnobservedNeighborhood();
+    CheckFeasibleTimeLimit();
+    CheckInfeasibleBudgetedExit();
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
