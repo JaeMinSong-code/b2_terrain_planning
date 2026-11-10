@@ -204,5 +204,101 @@ class ElevationInputAdapterTest(unittest.TestCase):
             lookup(node, 'robot_center', 'base_link', Time(sec=231), sensor=True)
 
 
+
+class SelfFilterTest(unittest.TestCase):
+    def setUp(self):
+        from elevation_self_filter import FootKinematics, JointHistory
+        model = Path(__file__).resolve().parents[2] / 'model/unitree_b2/b2.urdf'
+        self.kinematics = FootKinematics(model)
+        self.joints = np.tile(np.deg2rad([0., 44.30, -85.94]), (4, 1))
+        self.nominal = self.kinematics.feet(self.joints)
+        self.node = SimpleNamespace(
+            cfg={'self_filter.joint_max_age': .15}, nominal_feet=self.nominal,
+            foot_kinematics=self.kinematics, joint_history=JointHistory(),
+            foot_radius=.032, filter_markers=Mock(), filter_status=Mock())
+        self.node.publish_filter_markers = lambda *args: (
+            adapter.ElevationInputAdapter.publish_filter_markers(self.node, *args))
+
+    def test_urdf_nominal_and_moving_foot_fk(self):
+        np.testing.assert_allclose(self.nominal[0], [.31661149, .19173, -.5120595], atol=1e-7)
+        np.testing.assert_allclose(self.nominal[3], [-.34038851, -.19173, -.5120595], atol=1e-7)
+        moved = self.joints.copy()
+        moved[0, 0] = .5
+        feet = self.kinematics.feet(moved)
+        self.assertGreater(np.linalg.norm(feet[0] - self.nominal[0]), .1)
+        np.testing.assert_allclose(feet[1:], self.nominal[1:])
+
+    def test_measured_appendage_order_and_invalid_array(self):
+        from elevation_self_filter import measured_joints
+        ids = ['leg_fl', 'leg_fr', 'leg_rl', 'leg_rr']
+        message = SimpleNamespace(appendage_ids=ids[::-1], appendage_joint_counts=[3]*4,
+                                  appendage_actual_joints=list(range(12)), jt_pos_enc=[999.]*13)
+        result = measured_joints(message, ids)
+        np.testing.assert_array_equal(result, [[9,10,11], [6,7,8], [3,4,5], [0,1,2]])
+        message.appendage_joint_counts = [3,3,3,4]
+        with self.assertRaises(ValueError):
+            measured_joints(message, ids)
+
+    def test_box_boundaries_swing_foot_and_ground(self):
+        from elevation_self_filter import keep_external_points
+        lower, upper = np.array([-.34,-.19,-.51]), np.array([.32,.19,.17851])
+        foot = np.array([[.6,.3,-.4]])
+        points = np.array([[0,0,0], lower, upper, [0,0,-.55], [0,0,.2],
+                           [.6,.3,-.4], [.61,.3,-.4], [.65,.3,-.4], [.4,0,0]])
+        np.testing.assert_array_equal(
+            keep_external_points(points, lower, upper, foot, .032),
+            [False,False,False,True,True,False,False,True,True])
+
+    def test_joint_time_alignment_and_expiration(self):
+        history = self.node.joint_history
+        history.append(100., self.joints)
+        history.append(100.1, self.joints + .2)
+        np.testing.assert_allclose(history.at(100.05, .15), self.joints + .1)
+        np.testing.assert_allclose(history.at(100.12, .15), self.joints + .2)
+        self.assertIsNone(history.at(99.9, .15))
+        self.assertIsNone(history.at(100.3, .15))
+
+    def test_sensor_rotation_filter_and_marker_geometry(self):
+        from elevation_self_filter import axis_rotation
+        moved = self.joints.copy()
+        moved[0, 0] = .5
+        feet = self.kinematics.feet(moved)
+        self.node.joint_history.append(100., moved)
+        sensor_p = np.array([.34218, 0, .17851])
+        sensor_q = np.array([0., 0., np.sin(.3), np.cos(.3)])
+        body_points = np.array([[0.,0.,0.], feet[0], [1.,1.,-.55]])
+        sensor_points = (body_points - sensor_p) @ axis_rotation([0,0,1], .6)
+        output = adapter.ElevationInputAdapter.filter_self_points(
+            self.node, sensor_points, sensor_p, sensor_q, Time(sec=100))
+        np.testing.assert_allclose(output, sensor_points[2:])
+        markers = self.node.filter_markers.publish.call_args.args[0].markers
+        self.assertEqual(len(markers[0].points), 24)
+        self.assertTrue(all(m.header.frame_id == 'elevation_base' for m in markers))
+        self.assertTrue(all(m.header.stamp == Time(sec=100) for m in markers))
+        self.assertAlmostEqual(markers[1].scale.x, .064)
+        self.assertAlmostEqual(markers[1].pose.position.y, feet[0,1])
+        self.assertIn('measured_feet=4/4', self.node.filter_status.publish.call_args.args[0].data)
+
+    def test_stale_joints_keep_box_and_delete_foot_markers(self):
+        self.node.joint_history.append(99., self.joints)
+        points = np.array([[0.,0.,0.], [1.,1.,-.55]])
+        output = adapter.ElevationInputAdapter.filter_self_points(
+            self.node, points, np.zeros(3), np.array([0.,0.,0.,1.]), Time(sec=100))
+        np.testing.assert_allclose(output, points[1:])
+        markers = self.node.filter_markers.publish.call_args.args[0].markers
+        self.assertTrue(all(m.action == adapter.Marker.DELETE for m in markers[1:]))
+        self.assertIn('measured_feet=0/4', self.node.filter_status.publish.call_args.args[0].data)
+
+    def test_entire_cloud_removed_does_not_publish_empty_map_input(self):
+        helper = ElevationInputAdapterTest()
+        node, _ = helper.fixture()
+        node.cfg['self_filter.enabled'] = True
+        node.filter_self_points = Mock(return_value=np.empty((0,3)))
+        helper.process(node)
+        self.assertEqual(len(node.clouds), 0)
+        node.points_pub.publish.assert_not_called()
+        node.status.assert_called_with('ready: self filter removed all points in cloud')
+
+
 if __name__ == '__main__':
     unittest.main()

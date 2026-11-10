@@ -75,7 +75,8 @@ install(DIRECTORY scripts/ DESTINATION share/${PROJECT_NAME}/scripts USE_SOURCE_
 install(PROGRAMS scripts/elevation_input_adapter.py scripts/elevation_mapping_runner.py
     scripts/flat_elevation_map.py
     DESTINATION lib/${PROJECT_NAME})
-install(FILES scripts/elevation_common.py scripts/b2_elevation_map.py scripts/b2_elevation_kernels.py
+install(FILES scripts/elevation_common.py scripts/elevation_self_filter.py
+    scripts/b2_elevation_map.py scripts/b2_elevation_kernels.py
     DESTINATION lib/${PROJECT_NAME})
 
 include(CTest)

@@ -4,6 +4,7 @@
 from collections import deque
 import time
 import signal
+from pathlib import Path
 
 import numpy as np
 import rclpy
@@ -12,7 +13,9 @@ from rclpy.node import Node
 from rclpy.executors import ExternalShutdownException
 from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from rclpy.time import Time
-from geometry_msgs.msg import TransformStamped
+from ament_index_python.packages import get_package_share_directory
+from geometry_msgs.msg import Point, TransformStamped
+from visualization_msgs.msg import Marker, MarkerArray
 from nav_msgs.msg import Odometry
 from b2_terrain_planner.msg import LocomotionState
 from sensor_msgs.msg import PointCloud2, PointField
@@ -24,6 +27,8 @@ from tf2_ros import Buffer, TransformListener, TransformException
 from elevation_common import (
     Pose, decode_xyz, interpolate, quaternion_product, rotation, unit_quaternion,
 )
+
+from elevation_self_filter import FootKinematics, JointHistory, measured_joints, keep_external_points
 
 
 def seconds(stamp):
@@ -62,6 +67,12 @@ class ElevationInputAdapter(Node):
             'extrinsic_parent': '', 'extrinsic_child': '',
             'extrinsic_child_from_cloud': False,
             'extrinsic_xyz': [0.0, 0.0, 0.0], 'extrinsic_xyzw': [0.0, 0.0, 0.0, 1.0],
+            'self_filter.enabled': False,
+            'self_filter.nominal_joint_deg': [0.0, 44.30, -85.94],
+            'self_filter.foot_radius': 0.032, 'self_filter.foot_padding': 0.0,
+            'self_filter.joint_max_age': 0.15,
+            'self_filter.joint_topic': '/robot_data',
+            'self_filter.appendage_ids': ['leg_fl', 'leg_fr', 'leg_rl', 'leg_rr'],
         }
         self.cfg = {key: self.declare_parameter(key, value).value
                     for key, value in defaults.items()}
@@ -91,7 +102,87 @@ class ElevationInputAdapter(Node):
         self.create_subscription(PointCloud2, self.cfg['cloud_topic'], self.on_cloud, cloud_qos)
         self.create_timer(0.02, self.process)
         self.create_timer(1.0, lambda: self.status_pub.publish(String(data=self.last_status)))
+        self.init_self_filter()
         self.status('waiting: pointcloud, odometry and sensor extrinsic TF')
+
+    def init_self_filter(self):
+        if not self.cfg['self_filter.enabled']:
+            return
+        # RobotToGui는 원본 stamp가 없으므로 실기 수신 시각 모드에서만 사용한다.
+        if not self.cfg['use_receive_time']:
+            raise ValueError('self filter measured joints require receive-time mode')
+        from taskmsgs.msg import RobotToGui
+        model = Path(get_package_share_directory('b2_terrain_planner')) / 'model/unitree_b2/b2.urdf'
+        self.foot_kinematics = FootKinematics(model)
+        nominal = np.tile(np.deg2rad(self.cfg['self_filter.nominal_joint_deg']), (4, 1))
+        self.nominal_feet = self.foot_kinematics.feet(nominal)
+        self.joint_history = JointHistory()
+        self.foot_radius = (self.cfg['self_filter.foot_radius']
+                            + self.cfg['self_filter.foot_padding'])
+        if (self.cfg['self_filter.foot_padding'] < 0 or self.foot_radius <= 0
+                or self.cfg['self_filter.joint_max_age'] <= 0):
+            raise ValueError('invalid self filter radius or joint age')
+        self.filter_markers = self.create_publisher(MarkerArray, '/elevation/self_filter', 1)
+        self.filter_status = self.create_publisher(String, '/elevation/self_filter_status', 1)
+        self.create_subscription(RobotToGui, self.cfg['self_filter.joint_topic'],
+                                 self.on_filter_joints, qos_profile_sensor_data)
+
+    def on_filter_joints(self, msg):
+        try:
+            joints = measured_joints(msg, self.cfg['self_filter.appendage_ids'])
+            self.joint_history.append(self.get_clock().now().nanoseconds * 1e-9, joints)
+        except ValueError as exc:
+            self.get_logger().warning('self filter joints: ' + str(exc), throttle_duration_sec=5.)
+
+    def filter_self_points(self, xyz, sensor_p, sensor_q, stamp):
+        lower = self.nominal_feet.min(axis=0)
+        upper = self.nominal_feet.max(axis=0)
+        upper[2] = sensor_p[2]
+        feet = np.empty((0, 3))
+        joints = self.joint_history.at(seconds(stamp), self.cfg['self_filter.joint_max_age'])
+        if joints is not None:
+            feet = self.foot_kinematics.feet(joints)
+        points_body = xyz @ rotation(sensor_q).T + sensor_p
+        keep = keep_external_points(points_body, lower, upper, feet, self.foot_radius)
+        self.publish_filter_markers(lower, upper, feet, stamp)
+        self.filter_status.publish(String(data=(
+            f'removed={np.count_nonzero(~keep)}/{len(xyz)}; measured_feet={len(feet)}/4')))
+        return xyz[keep]
+
+    def publish_filter_markers(self, lower, upper, feet, stamp):
+        markers = []
+        for index in range(5):
+            marker = Marker()
+            marker.header.stamp = stamp
+            marker.header.frame_id = 'elevation_base'
+            marker.ns = 'self_filter'
+            marker.id = index
+            marker.pose.orientation.w = 1.
+            marker.lifetime = Duration(seconds=0.5).to_msg()
+            if index == 0:
+                marker.type = Marker.LINE_LIST
+                marker.scale.x = .008
+                marker.color.r, marker.color.g, marker.color.a = 1., .65, .9
+                corners = np.array([[x, y, z] for x in (lower[0], upper[0])
+                                    for y in (lower[1], upper[1])
+                                    for z in (lower[2], upper[2])])
+                for a in range(8):
+                    for bit in (1, 2, 4):
+                        b = a ^ bit
+                        if a < b:
+                            for point in (corners[a], corners[b]):
+                                marker.points.append(Point(x=float(point[0]),
+                                                           y=float(point[1]), z=float(point[2])))
+            elif index <= len(feet):
+                marker.type = Marker.SPHERE
+                point = feet[index - 1]
+                marker.pose.position = Point(x=float(point[0]), y=float(point[1]), z=float(point[2]))
+                marker.scale.x = marker.scale.y = marker.scale.z = 2 * self.foot_radius
+                marker.color.r, marker.color.b, marker.color.a = 1., .5, .45
+            else:
+                marker.action = Marker.DELETE
+            markers.append(marker)
+        self.filter_markers.publish(MarkerArray(markers=markers))
 
     def status(self, text):
         if text != self.last_status:
@@ -105,6 +196,8 @@ class ElevationInputAdapter(Node):
         self.last_cloud_stamp = None
         self.last_odom_stamp = None
         self.reset_pending = True
+        if self.cfg.get('self_filter.enabled', False):
+            self.joint_history.samples.clear()
         self.status('reset: ' + reason)
 
     def on_odom(self, msg):
@@ -246,6 +339,13 @@ class ElevationInputAdapter(Node):
                 transform(output_stamp, 'elevation_base', 'elevation_lidar',
                           sensor_p, sensor_q),
             ]))
+            if self.cfg.get('self_filter.enabled', False):
+                xyz = self.filter_self_points(xyz, sensor_p, sensor_q, output_stamp)
+                if not len(xyz):
+                    self.clouds.popleft()
+                    self.last_good = time.monotonic()
+                    self.status('ready: self filter removed all points in cloud')
+                    return
             output = PointCloud2()
             # 보간된 같은 자세와 점군을 동일 시각으로 전달한다.
             output.header.stamp = output_stamp

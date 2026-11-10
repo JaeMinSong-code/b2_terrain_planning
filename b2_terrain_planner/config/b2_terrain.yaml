@@ -15,6 +15,13 @@ input:
     odom_topic: /dog_odom
     # 점군·odom을 로컬 수신 시각으로 정렬하고 점군·TF에도 같은 시각을 쓴다.
     use_receive_time: true
+    # nominal 발 중심→LiDAR 높이 박스 + 측정 관절 FK 발 구. 여유는 기본 0 m.
+    self_filter.enabled: true
+    self_filter.nominal_joint_deg: [0.0, 44.30, -85.94]
+    self_filter.foot_padding: 0.0
+    self_filter.joint_max_age: 0.15
+    self_filter.joint_topic: /robot_data
+    self_filter.appendage_ids: [leg_fl, leg_fr, leg_rl, leg_rr]
     # 실기 지도 시험 가정: 실제 TF가 없을 때만 robot_center를 base_link로 취급한다.
     body_frame_alias: robot_center
     body_frame: base_link

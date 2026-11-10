@@ -58,7 +58,9 @@ def load_configs(path):
     common = _mapping(planner['common'], 'planner.common')
     outputs = {}
     for mode in ('sim', 'real', 'wbc'):
-        parameters = _mapping(inputs[mode], f'input.{mode}')
+        parameters = copy.deepcopy(_mapping(inputs[mode], f'input.{mode}'))
+        if parameters.get('self_filter.enabled', False):
+            parameters['self_filter.foot_radius'] = common['foot_radius']
         outputs[f'elevation_input_{mode}.yaml'] = {
             'elevation_input_adapter': {'ros__parameters': parameters}}
     outputs['elevation_map_sim.yaml'] = {
