@@ -173,6 +173,8 @@ if(NOT B2_TERRAIN_STANDALONE)
             rclcpp std_msgs geometry_msgs nav_msgs grid_map_msgs visualization_msgs)
         target_link_libraries(planner_retry_test tamols_sqp ${cpp_typesupport_target})
         add_test(NAME planner_retry_test COMMAND planner_retry_test)
+        add_test(NAME elevation_input_adapter_test COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/development/tests/elevation_input_adapter_test.py)
         set_tests_properties(planner_retry_test PROPERTIES TIMEOUT 20
             ENVIRONMENT "ROS_DOMAIN_ID=189;ROS_LOCALHOST_ONLY=1;ROS_LOG_DIR=/tmp/planner-retry-test;OPENBLAS_NUM_THREADS=1;OMP_NUM_THREADS=1;LD_LIBRARY_PATH=$<TARGET_FILE_DIR:tamols_sqp>:$ENV{LD_LIBRARY_PATH}")
     endif()

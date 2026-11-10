@@ -13,7 +13,10 @@ input:
   real:
     cloud_topic: /rslidar_points
     odom_topic: /dog_odom
-    # URDF 몸통 기준. Odometry.child_frame_id가 다르면 해당 프레임↔base_link TF 필요.
+    # 센서 원본 시각으로 정렬 후 점군·TF를 동일한 로컬 수신 시각으로 전달한다.
+    use_receive_time: true
+    # 실기 지도 시험 가정: 실제 TF가 없을 때만 robot_center를 base_link로 취급한다.
+    body_frame_alias: robot_center
     body_frame: base_link
     max_odom_gap: 0.3
     max_age: 1.0

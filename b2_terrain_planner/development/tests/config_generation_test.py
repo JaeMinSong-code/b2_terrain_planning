@@ -48,6 +48,9 @@ class ConfigGenerationTest(unittest.TestCase):
         self.assertEqual(sim['cloud_topic'], '/lidar/points')
         self.assertEqual(real['cloud_topic'], '/rslidar_points')
         self.assertNotIn('extrinsic_xyz', sim)
+        self.assertTrue(real['use_receive_time'])
+        self.assertEqual(real['body_frame_alias'], 'robot_center')
+        self.assertNotIn('use_receive_time', sim)
         self.assertEqual(real['extrinsic_xyz'], [0.34218, 0.0, 0.17851])
         wbc = configs['terrain_planner_wbc.yaml'][
             'terrain_planner_node']['ros__parameters']

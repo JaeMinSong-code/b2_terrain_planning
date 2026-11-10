@@ -9,3 +9,6 @@ __pycache__/
 *.log
 .venv/
 .vscode/
+
+# colcon symlink-install의 로컬 빌드 목록
+/symlink_install_manifest.txt
