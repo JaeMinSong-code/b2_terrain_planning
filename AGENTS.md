@@ -61,6 +61,17 @@
 - `pRbLibrary` 변경이 필요하면 제자리에서 수정하고 이 저장소에 함께 커밋한다. 폴더 구조와 공통 제어 계약을 유지하고 소비 패키지의 빌드·입출력·제어 회귀를 확인한다. 기준 원본 커밋은 루트 README에 기록한다.
 - `pRbLibrary` 수정 작업을 시작하기 전에는 반드시 `pRbLibrary/CONVENTIONS.md`를 읽고 운영 원칙과 package glue code 경계를 재확인한다.
 
+## elevation_mapping_cupy 확장 규칙
+- `elevation_mapping_cupy`는 공식 저장소(leggedrobotics) 원본을 **그대로** 둔다. 소스·커널·노드·`parameter.py`를 직접 수정하지 않는다(환경 재현을 위해).
+- B2에 필요한 맵 동작 변경은 원본을 고치지 말고 `b2_terrain_planner/scripts`의 서브클래스/모듈에 담는다.
+  - 맵 로직: `b2_elevation_map.py`의 `B2ElevationMap(ElevationMap)` 서브클래스.
+  - 커널 변형: `b2_elevation_kernels.py`(upstream `map_utils` preamble를 import해 재사용, 원본 커널은 불변).
+  - 노드 동작·발행·파라미터: `elevation_mapping_runner.py`의 `StrictElevationMappingNode(ElevationMappingNode)`.
+- 새 맵 파라미터는 upstream `Parameter`에 필드를 추가하지 말고 노드의 `_set_b2_extension_params`에서 `self.param`에 동적 주입한다.
+- vanilla `__init__`이 호출하는 메서드(`set_param_values_from_ros`, `initialize_elevation_mapping`, `register_publishers`, `register_timers`, `publish_map` 등)를 서브클래스에서 override해 확장을 주입한다. 원본 메서드 본문을 복사해 덮어쓴 경우 upstream API 변경 시 서브클래스만 수동 재동기화한다.
+- upstream 기준 커밋은 `docs/source_manifest.json`의 `cupy_base`로 관리한다. 패치 파일·패치 해시는 유지하지 않는다.
+- upstream API가 바뀌어 서브클래스가 깨지면 upstream을 고치지 말고 서브클래스 override를 갱신한다.
+
 ## 제어 프로파일 네이밍 규칙
 - 목적별 제어 프로파일은 각 로봇 패키지 루트의 `config/profiles/` 하위에 저장한다.
 - `pRbLibrary/config/profiles/`는 active profile 저장소로 사용하지 않는다.

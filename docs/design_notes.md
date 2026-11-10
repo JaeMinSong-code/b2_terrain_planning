@@ -618,12 +618,18 @@ python3 b2_terrain_planner/development/codegen/generate_kernels.py
 
 B2 모델의 기준 커밋·해시는 [모델 출처](../b2_terrain_planner/model/README.md),
 외부 맵 저장소의 기준은 [source_manifest.json](source_manifest.json)에 기록한다.
-외부 CuPy 포크의 발밑 보호·정책 크롭 재현용 패치 파일은 작업 트리에서 제거했다.
-필요하면 삭제 전 커밋 `4490451`의 `patches/elevation_mapping_cupy.patch`에서 확인한다.
-패치 SHA-256은 `source_manifest.json`에 유지한다. 기존 환경에는 적용되어 있으므로
-중복 적용하지 않는다. 새 환경에서는 패치를 Git 이력에서 꺼내 해시를 확인하고,
-기록된 기준 커밋에서 `git apply --check` 후 적용한다.
-다른 로봇 저장소는 별도 요청 없이 수정하거나 동기화하지 않는다.
+`elevation_mapping_cupy`는 공식 원본(`cupy_base` 커밋)을 **수정 없이** 사용한다. 과거에는
+발밑 보호·모서리 보존 융합·정책 크롭을 원본에 직접 패치했으나, 환경 재현을 위해 이 수정들을
+`b2_terrain_planner/scripts`의 서브클래스로 옮겼다.
+- `b2_elevation_map.py` `B2ElevationMap(ElevationMap)`: protection zone(수정1), 모서리 보존
+  커널 교체(수정2), 정책 크롭(수정3), raw 레이어 일괄 복사.
+- `b2_elevation_kernels.py`: upstream `map_utils` preamble를 재사용하는 max-fusion 커널 변형.
+- `elevation_mapping_runner.py` `StrictElevationMappingNode(ElevationMappingNode)`: 확장 파라미터
+  동적 주입(`_set_b2_extension_params`), 맵 주입, 격자 중심 발행, publish_on_update 즉시 발행,
+  정책 크롭 발행, QoS.
+새 환경에서는 패치 없이 원본 `cupy_base`를 체크아웃해 빌드하면 된다. 맵 노드는
+`elevation_mapping_runner.py`(B2 서브클래스)로 실행하며, 원본 `elevation_mapping_node`의
+`main()`은 사용하지 않는다. 다른 로봇 저장소는 별도 요청 없이 수정하거나 동기화하지 않는다.
 
 2026-10-16 공통 상태 토픽 연결 검증: `LocomotionState` 생성과 계획기 빌드,
 실제 ROS 노드 통합 시험(`b2_terrain_planner/development/tests/locomotion_state_ros_test.py`)을 통과했다.

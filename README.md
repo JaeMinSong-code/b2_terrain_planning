@@ -27,6 +27,11 @@ MuJoCo 실행파일은 별도 `b2_deploy_ws`가 소유한다. 이 저장소에�
 - NVIDIA GPU·CUDA·CuPy와 해당 Python 환경, NumPy **1.x** (Humble `cv_bridge` 요구)
 - 실기 유선 LAN 수신에는 선택적으로 `ros-humble-rmw-cyclonedds-cpp`
 
+`elevation_mapping_cupy`는 공식 원본을 **수정 없이** 사용한다. B2 확장(발밑 보호·모서리 보존
+융합·정책 크롭·격자 중심 발행)은 `scripts/`의 서브클래스(`b2_elevation_map.py`,
+`elevation_mapping_runner.py`, `b2_elevation_kernels.py`)로 얹으며, 맵 노드는
+`elevation_mapping_runner.py`로 실행한다.
+
 ## 빌드
 
 ```bash
