@@ -1,9 +1,9 @@
 /**
  * @file terrain_planner_node.cpp
  * @brief elevation map + WBC 상태를 구독해 TAMOLS 계획을 LocomotionPlan으로 발행하는 ROS2 노드.
- * @version 0.0.61
+ * @version 0.0.62
+ * @update 2026-11-10: 발행 메시지의 위치·속도·가속도 벡터 대입을 공통 함수로 정리함.
  * @update 2026-11-10: 스윙 곡선의 해석 속도·가속도를 위치와 함께 발행해 C2 복원을 지원함.
- * @update 2026-11-09: 착지 대기 중 solve 연속 실패 시 SQP 없이 감속 유지 계획을 공급하는 fallback을 추가함.
  *
  * 모든 계산은 odom 프레임에서 수행한다. 발행 궤적(몸통/네 발)은 WBC 추종 모드가 소비한다.
  * 공통 센서 기반 CoM/발 상태를 초기 조건으로 사용하고 입력 만료를 검사한다.
@@ -44,6 +44,13 @@
 #include "b2_terrain_planner/msg/locomotion_state.hpp"
 
 namespace {
+template <typename VectorMessage>
+void AssignVector(const Eigen::Vector3d& value, VectorMessage* message) {
+  message->x = value.x();
+  message->y = value.y();
+  message->z = value.z();
+}
+
 using namespace b2_terrain_planner;
 
 // worker는 완료 사실만 알리고 결과 처리는 노드의 기존 직렬 callback에서 실행한다.
@@ -1566,15 +1573,9 @@ class TerrainPlannerNode : public rclcpp::Node {
           contact = sample.second;
         }
         const size_t fi = static_cast<size_t>(i) * 4 + leg;
-        msg.foot_position[fi].x = foot.position.x();
-        msg.foot_position[fi].y = foot.position.y();
-        msg.foot_position[fi].z = foot.position.z();
-        msg.foot_velocity[fi].x = foot.velocity.x();
-        msg.foot_velocity[fi].y = foot.velocity.y();
-        msg.foot_velocity[fi].z = foot.velocity.z();
-        msg.foot_acceleration[fi].x = foot.acceleration.x();
-        msg.foot_acceleration[fi].y = foot.acceleration.y();
-        msg.foot_acceleration[fi].z = foot.acceleration.z();
+        AssignVector(foot.position, &msg.foot_position[fi]);
+        AssignVector(foot.velocity, &msg.foot_velocity[fi]);
+        AssignVector(foot.acceleration, &msg.foot_acceleration[fi]);
         msg.foot_contact[fi] = contact;
       }
     }
