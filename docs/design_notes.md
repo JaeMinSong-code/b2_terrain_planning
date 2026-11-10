@@ -1466,14 +1466,17 @@ ros2 topic hz /elevation_mapping_node/elevation_map_raw
 ### 실기 자기 점군 필터
 
 `input.real.self_filter.enabled`는 기본 true다. 입력 adapter가 센서 점을 몸통 좌표로
-변환해 nominal 발 사각형부터 LiDAR 원점 높이까지의 박스와 측정 발 구 내부·경계의
+변환해 nominal 발 사각형을 hip 바깥과 상부 장착물까지 확장한 박스와 측정 발 구 내부·경계의
 점을 제외한다. 출력은 남은 점의 원래 센서 좌표를 유지하므로 TF와 지도 입력 계약은 같다.
 기존 `protection_zone`(지도 셀 시간 무효화 방지)과는 별도 기능이다.
 
 - 박스: 패키지 B2 URDF에 `self_filter.nominal_joint_deg: [0, 44.30, -85.94]`를 적용한
   네 발 중심의 X/Y 최소·최대, Z 최솟값을 사용한다. 이는 planner 초기 nominal 관절
-  자세와 같다. 상단은 실제 sensor extrinsic의 Z다. 기본 base_link 범위는 대략
-  X [-0.34039, 0.31661], Y [-0.19173, 0.19173], Z [-0.51206, 0.17851] m이며 여유는 없다.
+  자세와 같다. `self_filter.box_padding_xy: [0.0, 0.08]` m로 앞뒤 범위는 유지하고,
+  좌우 각 8 cm를 확장해 hip 바깥 폭을 포함한다. 상단은 실제 sensor extrinsic의 Z에
+  `self_filter.box_top_padding: 0.05` m를 더해 머리 뒤 안테나 높이에 여유를 둔다.
+  기본 base_link 범위는 대략 X [-0.34039, 0.31661], Y [-0.27173, 0.27173],
+  Z [-0.51206, 0.22851] m다. 하단은 nominal 발 높이를 유지한다.
 - 발: `/robot_data`의 `appendage_ids`, `appendage_joint_counts`, `appendage_actual_joints`를
   ID 순서로 배치한 측정 관절각으로 같은 URDF의 FK를 계산한다. 계획 착지점이나
   quaternion 성분을 포함한 `jt_pos_enc` 배열을 사용하지 않는다. HOME에서도 동작한다.
@@ -1491,7 +1494,11 @@ ros2 topic hz /elevation_mapping_node/elevation_map_raw
 - 원본 시각 sim/WBC 입력 모드에서는 기본 비활성이다. 실기 입력의 수신 시각 모드에만
   stamp 없는 관절 입력을 연결한다. 박스/발 구 안의 실제 장애물 점도 함께 제외된다.
 
-검증: 입력 어댑터/FK/필터 19개와 설정 생성 8개 테스트, 패키지 빌드·설치를 통과했다.
+박스 확장은 입력 어댑터/FK/필터 20개와 설정 생성 8개 시험, 패키지 빌드·설치를 통과했다.
+hip·안테나 표본 제거, 외곽·하단 지면 보존과 표시 경계 일치, 설치본 설정 반영을 확인했다.
+실제 안테나 잔여 점 제거 여부는 확장 설정으로 지도 재시작 후 확인해야 한다.
+
+기존 필터 검증: 입력 어댑터/FK/필터 19개와 설정 생성 8개 테스트, 패키지 빌드·설치를 통과했다.
 기록한 실기 점군·KF와 시험용 관절각을 격리 도메인에서 재생해 지도 27회 발행과 마지막
 유효 셀 3,016개를 확인했다. 샘플 스캔에서 427/41,914개 점 제거, FK 마커 이동과 관절
 입력 중단 후 발 구 해제·몸체 박스 유지도 확인했다. 이 시험은 실제 관절 측정과 LiDAR의

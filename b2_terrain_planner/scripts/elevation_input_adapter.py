@@ -69,6 +69,8 @@ class ElevationInputAdapter(Node):
             'extrinsic_xyz': [0.0, 0.0, 0.0], 'extrinsic_xyzw': [0.0, 0.0, 0.0, 1.0],
             'self_filter.enabled': False,
             'self_filter.nominal_joint_deg': [0.0, 44.30, -85.94],
+            'self_filter.box_padding_xy': [0.0, 0.0],
+            'self_filter.box_top_padding': 0.0,
             'self_filter.foot_radius': 0.032, 'self_filter.foot_padding': 0.0,
             'self_filter.joint_max_age': 0.15,
             'self_filter.joint_topic': '/robot_data',
@@ -116,6 +118,12 @@ class ElevationInputAdapter(Node):
         self.foot_kinematics = FootKinematics(model)
         nominal = np.tile(np.deg2rad(self.cfg['self_filter.nominal_joint_deg']), (4, 1))
         self.nominal_feet = self.foot_kinematics.feet(nominal)
+        padding_xy = np.asarray(self.cfg['self_filter.box_padding_xy'], dtype=float)
+        top_padding = self.cfg['self_filter.box_top_padding']
+        if (padding_xy.shape != (2,) or not np.isfinite(padding_xy).all()
+                or np.any(padding_xy < 0) or not np.isfinite(top_padding)
+                or top_padding < 0):
+            raise ValueError('invalid self filter box padding')
         self.joint_history = JointHistory()
         self.foot_radius = (self.cfg['self_filter.foot_radius']
                             + self.cfg['self_filter.foot_padding'])
@@ -137,7 +145,10 @@ class ElevationInputAdapter(Node):
     def filter_self_points(self, xyz, sensor_p, sensor_q, stamp):
         lower = self.nominal_feet.min(axis=0)
         upper = self.nominal_feet.max(axis=0)
-        upper[2] = sensor_p[2]
+        # hip 바깥과 상부 장착물까지 확장하되 발밑 지면 경계는 유지한다.
+        lower[:2] -= self.cfg['self_filter.box_padding_xy']
+        upper[:2] += self.cfg['self_filter.box_padding_xy']
+        upper[2] = sensor_p[2] + self.cfg['self_filter.box_top_padding']
         feet = np.empty((0, 3))
         joints = self.joint_history.at(seconds(stamp), self.cfg['self_filter.joint_max_age'])
         if joints is not None:

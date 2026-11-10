@@ -15,9 +15,11 @@ input:
     odom_topic: /dog_odom
     # 점군·odom을 로컬 수신 시각으로 정렬하고 점군·TF에도 같은 시각을 쓴다.
     use_receive_time: true
-    # nominal 발 중심→LiDAR 높이 박스 + 측정 관절 FK 발 구. 여유는 기본 0 m.
+    # nominal 발 박스를 hip 바깥까지 넓히고 상단 안테나에 높이 여유를 둔다.
     self_filter.enabled: true
     self_filter.nominal_joint_deg: [0.0, 44.30, -85.94]
+    self_filter.box_padding_xy: [0.0, 0.08]   # 앞뒤 유지, 좌우 각 8 cm
+    self_filter.box_top_padding: 0.05         # LiDAR 원점보다 5 cm 위까지
     self_filter.foot_padding: 0.0
     self_filter.joint_max_age: 0.15
     self_filter.joint_topic: /robot_data

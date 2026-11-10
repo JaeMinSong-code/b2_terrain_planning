@@ -213,7 +213,9 @@ class SelfFilterTest(unittest.TestCase):
         self.joints = np.tile(np.deg2rad([0., 44.30, -85.94]), (4, 1))
         self.nominal = self.kinematics.feet(self.joints)
         self.node = SimpleNamespace(
-            cfg={'self_filter.joint_max_age': .15}, nominal_feet=self.nominal,
+            cfg={'self_filter.joint_max_age': .15,
+                 'self_filter.box_padding_xy': [0., .08],
+                 'self_filter.box_top_padding': .05}, nominal_feet=self.nominal,
             foot_kinematics=self.kinematics, joint_history=JointHistory(),
             foot_radius=.032, filter_markers=Mock(), filter_status=Mock())
         self.node.publish_filter_markers = lambda *args: (
@@ -257,6 +259,25 @@ class SelfFilterTest(unittest.TestCase):
         np.testing.assert_allclose(history.at(100.12, .15), self.joints + .2)
         self.assertIsNone(history.at(99.9, .15))
         self.assertIsNone(history.at(100.3, .15))
+
+    def test_expanded_box_covers_hips_and_antenna_preserves_outside(self):
+        sensor_p = np.array([.34218, 0., .17851])
+        lower = self.nominal.min(axis=0) - np.array([0., .08, 0.])
+        upper = self.nominal.max(axis=0) + np.array([0., .08, 0.])
+        upper[2] = .22851
+        body_points = np.array([
+            [.30, .25, 0.], [-.30, -.25, 0.], [0., 0., .22],
+            lower + 1e-9, upper - 1e-9,
+            [upper[0] + .001, 0., 0.], [0., upper[1] + .001, 0.],
+            [0., 0., upper[2] + .001], [0., 0., lower[2] - .001]])
+        sensor_points = body_points - sensor_p
+        output = adapter.ElevationInputAdapter.filter_self_points(
+            self.node, sensor_points, sensor_p, np.array([0., 0., 0., 1.]), Time(sec=100))
+        np.testing.assert_allclose(output, sensor_points[5:])
+        marker = self.node.filter_markers.publish.call_args.args[0].markers[0]
+        corners = np.array([[p.x, p.y, p.z] for p in marker.points])
+        np.testing.assert_allclose(corners.min(axis=0), lower)
+        np.testing.assert_allclose(corners.max(axis=0), upper)
 
     def test_sensor_rotation_filter_and_marker_geometry(self):
         from elevation_self_filter import axis_rotation

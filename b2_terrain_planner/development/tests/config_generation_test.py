@@ -51,6 +51,8 @@ class ConfigGenerationTest(unittest.TestCase):
         self.assertTrue(real['use_receive_time'])
         self.assertTrue(real['self_filter.enabled'])
         self.assertEqual(real['self_filter.foot_radius'], .032)
+        self.assertEqual(real['self_filter.box_padding_xy'], [0., .08])
+        self.assertEqual(real['self_filter.box_top_padding'], .05)
         self.assertNotIn('self_filter.enabled', sim)
         self.assertEqual(real['body_frame_alias'], 'robot_center')
         self.assertNotIn('use_receive_time', sim)
