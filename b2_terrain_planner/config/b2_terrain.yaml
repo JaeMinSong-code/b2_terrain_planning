@@ -13,7 +13,7 @@ input:
   real:
     cloud_topic: /rslidar_points
     odom_topic: /dog_odom
-    # 센서 원본 시각으로 정렬 후 점군·TF를 동일한 로컬 수신 시각으로 전달한다.
+    # 점군·odom을 로컬 수신 시각으로 정렬하고 점군·TF에도 같은 시각을 쓴다.
     use_receive_time: true
     # 실기 지도 시험 가정: 실제 TF가 없을 때만 robot_center를 base_link로 취급한다.
     body_frame_alias: robot_center

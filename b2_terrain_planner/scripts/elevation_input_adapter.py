@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""원본 시각으로 점군·odom을 정렬하고 격리된 지도 좌표·시각으로 전달한다."""
+"""설정한 원본/수신 시각으로 점군·odom을 정렬해 격리된 지도에 전달한다."""
 
 from collections import deque
 import time
@@ -81,6 +81,7 @@ class ElevationInputAdapter(Node):
         self.clear_future = None
         self.last_status = ''
         self.last_cloud_stamp = None
+        self.last_odom_stamp = None
         self.cloud_frame = None
         self.last_good = time.monotonic()
         self.create_subscription(Odometry, self.cfg['odom_topic'], self.on_odom,
@@ -102,24 +103,32 @@ class ElevationInputAdapter(Node):
         self.poses.clear()
         self.clouds.clear()
         self.last_cloud_stamp = None
+        self.last_odom_stamp = None
         self.reset_pending = True
         self.status('reset: ' + reason)
 
     def on_odom(self, msg):
         try:
-            pose = Pose(seconds(msg.header.stamp), msg.header.frame_id, msg.child_frame_id,
+            source_stamp = seconds(msg.header.stamp)
+            if not np.isfinite(source_stamp) or source_stamp <= 0:
+                raise ValueError("invalid odometry pose/frame/stamp")
+            stamp = source_stamp
+            if self.cfg['use_receive_time']:
+                stamp = self.get_clock().now().nanoseconds * 1e-9
+            pose = Pose(stamp, msg.header.frame_id, msg.child_frame_id,
                         vector(msg.pose.pose.position), quaternion(msg.pose.pose.orientation))
             if self.poses:
                 previous = self.poses[-1]
-                if pose.stamp == previous.stamp:
+                if source_stamp == self.last_odom_stamp or pose.stamp == previous.stamp:
                     return
                 angle = 2 * np.arccos(np.clip(abs(pose.quaternion @ previous.quaternion), 0, 1))
-                if (pose.stamp < previous.stamp
+                if (source_stamp < self.last_odom_stamp or pose.stamp < previous.stamp
                         or (pose.parent, pose.child) != (previous.parent, previous.child)
                         or np.linalg.norm(pose.position - previous.position)
                         > self.cfg['reset_distance'] or angle > self.cfg['reset_angle']):
                     self.reset('odometry discontinuity/frame change')
             self.poses.append(pose)
+            self.last_odom_stamp = source_stamp
             if self.clouds:
                 self.process()
         except ValueError as exc:
@@ -155,7 +164,7 @@ class ElevationInputAdapter(Node):
         if stamp == self.last_cloud_stamp:
             return
         self.last_cloud_stamp = stamp
-        # 원본 메시지 시각은 odom 보간·외부 TF 조회에 그대로 사용한다.
+        # 원본은 보존하고 수신 시각 모드의 정렬·출력에 쓸 로컬 시각을 기록한다.
         self.clouds.append((time.monotonic(), self.get_clock().now().to_msg(), msg))
         self.process()
 
@@ -194,6 +203,8 @@ class ElevationInputAdapter(Node):
             elif self.clear_future.done():
                 try:
                     self.reset_pending = not self.clear_future.result().success
+                    if not self.reset_pending:
+                        self.status('waiting: pointcloud, odometry and sensor extrinsic TF')
                 except Exception as exc:
                     self.status('map reset failed: ' + str(exc))
                 self.clear_future = None
@@ -211,6 +222,7 @@ class ElevationInputAdapter(Node):
                 self.status('dropped: cloud expired since reception')
                 return
             output_stamp = received_stamp
+            stamp = seconds(received_stamp)
         else:
             now = self.get_clock().now().nanoseconds * 1e-9
             if now - stamp > self.cfg['max_age'] or stamp - now > 0.1:
@@ -220,8 +232,8 @@ class ElevationInputAdapter(Node):
         try:
             pose = interpolate(self.poses, stamp, self.cfg['max_odom_gap'])
             body = self.cfg['body_frame'] or pose.child
-            body_p, body_q = self.lookup(pose.child, body, msg.header.stamp)
-            sensor_p, sensor_q = self.lookup(body, msg.header.frame_id, msg.header.stamp,
+            body_p, body_q = self.lookup(pose.child, body, output_stamp)
+            sensor_p, sensor_q = self.lookup(body, msg.header.frame_id, output_stamp,
                                             sensor=True)
             map_body_p = pose.position + rotation(pose.quaternion) @ body_p
             map_body_q = quaternion_product(pose.quaternion, body_q)
@@ -253,6 +265,9 @@ class ElevationInputAdapter(Node):
             if time.monotonic() - received > self.cfg['queue_wait']:
                 self.clouds.popleft()
                 self.status('dropped: ' + str(exc))
+            elif time.monotonic() - self.last_good > self.cfg['max_age']:
+                # 최신 점군이 계속 교체되어도 지속적인 정렬 실패를 숨기지 않는다.
+                self.status('waiting: ' + str(exc))
 
 
 def main():
